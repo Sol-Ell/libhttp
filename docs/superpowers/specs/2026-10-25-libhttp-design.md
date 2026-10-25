@@ -198,23 +198,49 @@ pub struct Reactor { /* epoll fd, slab, timer heap, eventfd, command queue */ }
 pub trait Session {
     fn fd(&self) -> RawFd;
     fn interest(&self) -> Interest;
-    fn on_readable(&mut self) -> Result<()>;
-    fn on_writable(&mut self) -> Result<()>;
-    fn on_timeout(&mut self, now: Instant) -> Result<()>;
+    fn on_readable(&mut self) -> Step;
+    fn on_writable(&mut self) -> Step;
+    fn on_timeout(&mut self, now: Instant) -> Step;
     fn next_deadline(&self) -> Option<Instant>;
+}
+
+pub enum Step {
+    Continue,
+    Register(Box<dyn Session>), // a new fd (accept, proxy upstream)
+    Replace(Box<dyn Session>),  // same fd (upgrade to a tunnel)
+    Close,
 }
 
 impl Reactor {
     pub fn new(config: ReactorConfig) -> io::Result<Self>;
+    pub fn run(self) -> io::Result<()>;
+    pub fn step(&mut self, timeout: Option<Duration>) -> io::Result<()>; // tests
     pub fn register(&mut self, session: Box<dyn Session>) -> ConnId;
-    pub fn run(&mut self) -> io::Result<()>;
-    pub fn handle(&self) -> ReactorHandle; // wake(), post(command)
+    pub fn handle(&self) -> ReactorHandle; // wake(), post(command), shutdown()
 }
 ```
+
+A callback never receives `&mut Reactor`: a session that needs to create, replace, or
+close sessions returns a `Step`, and the reactor applies it after the callback returns.
+That avoids reentrancy and keeps the slab borrow simple. Accept, proxy upstreams, and
+upgrades all fit through `Register`/`Replace`; workers never create sessions, they only
+post data and credit commands through the `eventfd` queue.
+
+The engines keep `Result`-returning methods (`on_readable`, `on_writable`, `on_timeout`)
+because they are simpler to test in memory; a thin library adapter implements `Session`
+for each protocol and maps errors to `Step::Close`. Users do not write that adapter. The
+proxy uses the same adapters, or the engines directly from its own session.
 
 - `epoll` edge-triggered; every readable event drains until `WouldBlock`; every writable
   event flushes until `WouldBlock` or the write queue is empty. `EPOLLRDHUP`/`EPOLLHUP`
   are handled explicitly.
+- `run` loops on `step` until shutdown; `step` is public so tests can drive a reactor
+  without a thread. `ReactorHandle::shutdown` sets an atomic flag and writes the
+  `eventfd`; `run` returns after the current iteration. `Server::run` spawns reactors
+  and workers and joins them; `Server::start` returns a `ServerHandle` with
+  `shutdown`/`join`. `Client` owns one reactor thread and joins it on `shutdown` or
+  drop. With n reactors, each gets the shutdown flag and its own `eventfd`; no data
+  crosses reactors, only the flag.
 - `Token` indexes a slab slot with a generation to prevent stale events after close.
 - A timer heap stores per-connection and per-stream deadlines; `epoll_wait` uses the
   nearest deadline as its timeout, so there is no timer thread.
@@ -256,8 +282,14 @@ UDP socket. The HTTP/3 section defines a separate endpoint/connection integratio
 
 ### 7.3 Buffers
 
-`libringbuf` is the buffer primitive:
+`libringbuf` is used as-is: `as_slice`, `spare_capacity_mut`, `set_len`, and
+`drain(..n)` cover the byte-buffer wrapper, and `drain` is O(1) for `u8`. If a hot path
+later wants a named `advance_front(n)` or a pool primitive inside libringbuf, that is a
+small upstream addition, not a reason to fork or bypass it. The reactor-specific
+`BufferPool` stays in libhttp because its size classes and idle policy are library
+policy.
 
+The buffer primitive:
 - **Write buffers (all protocols):** `RingBuf<u8>`. The spare region is one slice, so
   response heads and body bytes serialize directly into it; the readable region is one
   slice, so `send`/`writev` sees contiguous bytes and consumption is `drain(..n)`.
@@ -273,19 +305,36 @@ UDP socket. The HTTP/3 section defines a separate endpoint/connection integratio
 - **HTTP/3:** `quinn-proto` owns stream buffers and hands out refcounted chunks; the h3
   engine reads them directly.
 
-Sizes: active read buffer 32 KiB, idle read buffer 4 KiB (shrunk when a connection goes
-idle, grown on demand), write buffer 32 KiB, per-stream HTTP/2 header arena bounded by
-the header-list limit. Buffers are pools or per-connection allocations, never
-per-request allocations after warm-up.
+Sizes: active read ring 32 KiB (pool has smaller classes for short heads), write ring
+32 KiB, per-stream HTTP/2 header arena bounded by the header-list limit. Nothing is
+allocated for a connection that is only holding a keep-alive socket open.
+
+**Idle connections hold no rings.** `libringbuf` allocates a memfd and several VMAs per
+buffer; 10k idle connections each holding a read and a write ring would approach
+`vm.max_map_count` and keep pages resident for nothing. A per-reactor `BufferPool`
+keeps rings by size class. A connection takes a read ring when it becomes readable and
+a write ring only when it has output; both return to the pool when it goes idle or
+closes. `Connection<T>` therefore stores `Option<ReadBuffer>`/`Option<WriteBuffer>`;
+`detach` is only meaningful while an exchange is active and moves the rings into the
+tunnel. Engines are constructed with a `BufferPool` handle (a per-reactor `Rc`), so
+accepting a connection allocates no buffer. Idle cost is a slab slot, a timer entry, and
+an fd. Active and slow-header connections hold rings, bounded by the connection limit
+and pool capacity; an empty pool is backpressure on accept/dispatch, not a reason to
+allocate an unbounded number of mappings.
 
 Copies are counted:
 
 - HTTP/1.1 low-level/proxy path: kernel→ring, ring→kernel; no intermediate buffer.
 - HTTP/1.1 worker path: kernel→ring, ring→`Bytes` chunk (one copy to cross threads),
-  worker→response queue→ring, ring→kernel.
-- HTTP/2: kernel→`BytesMut`, split→`Bytes` (no copy) to worker; response→ring→kernel.
+  worker→queue-owned response buffer (one copy), then kernel.
+- HTTP/2: kernel→`BytesMut`, split→`Bytes` (no copy) to worker; response bytes are
+  copied once into queue-owned storage; then kernel.
 - Header bytes: HTTP/1.1 one bounded copy into the arena; HTTP/2/3 decoded once into
-  the arena.
+  the arena. A worker's response header and trailer slices are copied once into
+  queue-owned storage at handoff; the reactor serializes them into the write ring.
+- There is no shared mutable buffer between the reactor and a worker. Every handoff
+  copies once into storage owned by the receiving side; that is the price of keeping
+  the reactor non-blocking without unsafe aliasing.
 
 ### 7.4 Message model
 
@@ -318,7 +367,7 @@ The engine owns its transport and ring buffers and is driven by the reactor.
 ```rust
 pub struct Connection<T: Transport> { /* transport, read ring, write ring, parser, state */ }
 impl<T: Transport> Connection<T> {
-    pub fn new(transport: T, config: Config) -> Self;
+    pub fn new(transport: T, buffers: PoolHandle, config: Config) -> Self;
     pub fn on_readable(&mut self) -> Result<()>;   // recv until WouldBlock, parse
     pub fn on_writable(&mut self) -> Result<()>;   // flush ring until WouldBlock
     pub fn on_timeout(&mut self, now: Instant) -> Result<()>;
@@ -414,11 +463,47 @@ response writes may block on the queues; when the queue is full, the reactor sto
 reading the socket (TCP) or withholds flow-control credit (HTTP/2/3), which is the real
 backpressure. A bounded queue is the only place a worker can wait.
 
+```rust
+impl Request<'_> {
+    pub fn head(&self) -> &RequestHead;
+    pub fn body(&mut self) -> &mut BodyStream<'_>;
+}
+
+impl BodyStream<'_> {
+    pub fn read(&mut self, dst: &mut [u8]) -> Result<usize>;   // blocks on the queue
+    pub fn next_chunk(&mut self) -> Option<DataChunk>;          // zero-copy, h2/h3
+}
+
+impl Response<'_> {
+    pub fn status(&mut self, status: StatusCode);
+    pub fn headers(&mut self, headers: &[Header<'_>]);
+    pub fn content_length(&mut self, len: u64);                 // optional hint
+    pub fn write(&mut self, buf: &[u8]) -> Result<()>;          // blocks when full
+    pub fn finish(self) -> Result<()>;
+    pub fn finish_with_trailers(self, trailers: &[Header<'_>]) -> Result<()>;
+}
+```
+
+The handler never chooses a transfer coding. `content_length(n)` is an optional hint:
+when set, HTTP/1.1 sends that length; when not, HTTP/1.1 streams chunked and HTTP/1.0
+closes; HTTP/2/3 always use DATA. HEAD, 204, 304, and 1xx suppress the body. Trailers
+require chunked/unknown-length framing; declaring a length and then trailers is an
+error. Chunk framing is serialized directly into the ring, so chunked responses do not
+allocate per chunk.
+
+Returning from `handle` without finishing auto-finishes on `Response` drop: nothing
+written means `200` with `Content-Length: 0`; headers or body already written are sent
+as written. A panic maps to a closed connection (HTTP/1.1) or `INTERNAL_ERROR` reset
+(HTTP/2/3). Writing after `finish` is a typed error. Exceeding the server body cap
+before headers produce `413`; after headers it closes (HTTP/1.1) or resets the stream.
+
 - HTTP/1.1: one job per exchange. The reactor parses the head, copies each body chunk
   into a `Bytes` and pushes it to the job; when the job's queue is full, the reactor
-  stops reading that connection. The worker returns headers/chunks/trailers through a
-  bounded command queue; the reactor serializes them and flushes. A slow peer fills the
-  write ring, stops command consumption, and eventually hits the stream deadline.
+  stops reading that connection. The first `BodyStream::read` on an exchange that
+  advertised `100-continue` queues the interim response before it waits. The worker
+  returns headers/chunks/trailers through a bounded command queue; the reactor
+  serializes them and flushes. A slow peer fills the write ring, stops command
+  consumption, and eventually hits the stream deadline.
 - HTTP/2: one job per stream. The reactor delivers `DataChunk`s (refcounted, credit on
   drop) and receives `Responder` commands. Per-stream queues are bounded by the receive
   window and the global cap.
@@ -430,6 +515,18 @@ backpressure. A bounded queue is the only place a worker can wait.
   the handler may finish into a discarded output. Dropping a `Responder` resets the
   stream. A response that cannot flush before `write_timeout` is reset (`CANCEL`), so a
   slow peer cannot pin workers forever.
+- Cancellation is state, not a message. Every exchange owns an
+  `Arc<StreamState>` with an atomic `closed` flag and the condvars for its body and
+  response queues. Reset or close sets the flag, poisons both queues, and notifies both
+  condvars, so a worker parked on a full response queue or an empty body queue wakes
+  and gets `StreamClosed`; there is no separate cancellation channel. The same shared
+  state carries the credit counter: a `DataChunk` drop adds to an atomic, and the
+  reactor is woken through the `eventfd` only when a threshold is crossed or the stream
+  ends — never once per chunk. The reactor drains credit on each loop iteration, so
+  batching does not delay flow control materially.
+- If an HTTP/1.1 handler responds before reading the request body, the reactor drains
+  and discards the remainder up to the body limit, or closes the connection when that
+  is impossible. The connection is reused only if the body is fully drained.
 - A panicking handler is caught: HTTP/1.1 closes the connection, HTTP/2/3 resets the
   stream. Handler execution is not timed out by the library; a stuck handler pins its
   worker, which is why the pool is bounded.
@@ -450,6 +547,9 @@ Reactor(s) + worker pool. No accept thread, no connection thread.
   (`None` = unlimited) enforced by the server, not by the framing layer.
 - Graceful shutdown: stop accepting, stop dispatching, close idle HTTP/1.1, GOAWAY and
   drain HTTP/2, deadline, reset. A cloneable `Shutdown` handle triggers it.
+- `Server::run` is `start` followed by a join. `start` returns a `ServerHandle` whose
+  `shutdown` is idempotent and wakes every reactor; tests can drive one reactor with
+  `Reactor::step` instead of spawning threads.
 - Load shedding and queue policies are configuration, not hidden behavior. The
   high-level server does not expose CONNECT/`101` tunnels in v1; the low-level API
   does, and the proxy uses it.
@@ -461,12 +561,30 @@ Reactor(s) + worker pool. No accept thread, no connection thread.
 - `send` submits a request, then waits on a bounded response channel. The caller blocks
   — it is a synchronous API — but the socket is driven by the reactor and never
   blocked on by the caller.
+- `client::Request` carries an absolute target (scheme, authority, path); there is no
+  base-URL configuration, so one `Client` reaches any origin and HTTP/2 `:scheme`/
+  `:authority`/`:path` derive from it.
+- Name resolution never runs on the reactor. The caller, or a small optional resolver
+  pool, turns the authority into `SocketAddr`s; connect is non-blocking (`EINPROGRESS`)
+  and completes under the reactor. Blocking `getaddrinfo` on the event loop would
+  reintroduce exactly the stall this design removes.
 - HTTP/1.1: a pool of idle connections keyed by origin; one in-flight request per
   connection; the per-origin lock is held only to take/return an idle connection, never
-  across I/O.
+  across I/O. A `Response` owns its head and body stream (channels to the reactor); the
+  connection returns to the pool when the body ends. A response dropped mid-body closes
+  the connection rather than returning it half-drained.
 - HTTP/2: connections are shared and multiplexed; per-stream queues are bounded and the
   reactor withholds credit instead of blocking when a caller is slow; dropping a
   response sends `RST_STREAM(CANCEL)`.
+- Request bodies are either buffered (`Bytes`) via `send`, or streamed via
+  `send_streaming(head)`, which returns a `RequestBodyWriter` and a `PendingResponse`.
+  The writer enqueues chunks and blocks only on the queue; `PendingResponse::wait`
+  blocks until the response head arrives. A streamed request cannot be retried.
+- Responses always stream: `send` returns once the head arrives, and the `Response`
+  owns a `BodyStream` that yields chunks until the end. An HTTP/1.1 connection is pinned
+  for the whole exchange (upload through response body) and returns to the pool only
+  when both are complete; idle timeouts apply only to idle connections. HTTP/2 pins only
+  the stream.
 - No redirects, retries, cookies, or compression. One opt-in stale-connection retry.
 - Connection failures, timeouts, and resets surface as typed errors.
 
@@ -542,17 +660,18 @@ what they share. Production h3 comes after TLS.
 
 ```
 libhttp
-  reactor     { Reactor, ReactorHandle, Session, Interest, ConnId }
+  reactor     { Reactor, ReactorHandle, Session, Step, Interest, ConnId, ReactorConfig }
   transport   { Transport, TcpTransport, TlsTransport, HttpListener, Accepted, Protocol }
-  buffer      { ReadBuffer, WriteBuffer }        // libringbuf wrappers
+  buffer      { ReadBuffer, WriteBuffer, BufferPool, PoolHandle }   // libringbuf wrappers
   message     { Method, StatusCode, Version, HeaderName, Header, Headers,
                 RequestHead, RequestTarget, Body, BodyLength }
   h1          { Connection, Event, DataRef, ResponseWriter, Config }
   h2          { Connection, Event, Events, StreamId, DataChunk, Responder,
                 ResponseWriter, DataStream, ErrorCode, Config }
   h3          { QuicEndpoint, Connection, StreamId, ErrorCode, Config }   // later
-  server      { Server, Handler, Request, Response, ServerConfig, Shutdown }
-  client      { Client, ClientConfig, Request, Response }
+  server      { Server, ServerHandle, Handler, Request, Response, ServerConfig, Shutdown }
+  client      { Client, ClientConfig, Request, Response, BodyStream,
+                RequestBodyWriter, PendingResponse }
   worker      { Pool, PoolConfig, BoundedQueue }
   error       { Error, ProtocolError, ConnectionError, StreamError, Limit, Timeout }
 ```
@@ -564,7 +683,10 @@ Feature flags: `server`, `client`, `reactor` (default), `tls` (later), `h3` (lat
 Targets, all measured and published:
 
 - 10k idle connections of either protocol per reactor thread, with measured RSS.
-  Idle costs a slab slot, a small ring, and a timer entry — not a thread.
+  Idle costs a slab slot, a timer entry, and an fd — no ring buffers, no thread.
+- Ring buffers come from a per-reactor `BufferPool`; the pool's size class and total
+  budget bound VMAs and resident pages for active connections, so 10k idle connections
+  stay under stock `vm.max_map_count`.
 - HTTP/1.1 low-level request: two data syscalls (one `recv`/`recvmsg`, one
   `sendmsg`/`writev`) plus the amortized `epoll_wait`; worker mode adds a bounded queue
   wake, batched where possible.
@@ -605,7 +727,7 @@ libhttp, hyper as its only heavy dependency) runs both behind the same load gene
   | header count | 100 |
   | body (server, optional) | 2 MiB |
   | chunk size | 16 KiB |
-  | read buffer | 32 KiB active / 4 KiB idle |
+  | read buffer | 32 KiB active (4 KiB class), none idle |
   | write buffer | 32 KiB |
   | HTTP/2 frame | 16 KiB |
   | HTTP/2 concurrent streams | 100 |
@@ -643,8 +765,9 @@ measured numbers.
 license, fuzz targets skeleton.
 
 **M1 — Reactor and buffers.** `epoll` loop, slab/tokens, timer heap, `eventfd`
-commands, `TcpTransport`, `ReadBuffer`/`WriteBuffer` over libringbuf, accept session,
-10k idle connection test.
+commands, `Session`/`Step`, `TcpTransport`, `BufferPool`, `ReadBuffer`/`WriteBuffer`
+over libringbuf, accept session. Acceptance: 10k idle connections hold no rings and
+stay under stock `vm.max_map_count`; `step`-driven tests need no threads.
 
 **M2 — HTTP/1.1 engine.** Non-blocking parser/serializer, events, framing rules, limits,
 chunked, trailers, 100-continue, upgrade/CONNECT detach, fuzz; in-memory transport
@@ -652,10 +775,10 @@ tests.
 
 **M3 — HTTP/1.1 server.** Worker pool, body/response queues, dispatch, backpressure,
 timeouts, graceful shutdown. Acceptance: curl/nginx interop, 10k idle, zero allocations
-per request in the worker path, slow-header and slow-body tests.
+per request in the worker path, slow-header and slow-body tests, early-response drain.
 
-**M4 — HTTP/1.1 client.** Reactor-driven pool, streaming responses, cancellation,
-stale-connection retry.
+**M4 — HTTP/1.1 client.** Reactor-driven pool, streaming responses, buffered and
+streamed request bodies, cancellation, stale-connection retry.
 
 **M5 — HTTP/2 engine.** Frames, stream states, HPACK, flow control, settings, errors;
 `h2spec` later with the server.
@@ -680,9 +803,10 @@ HTTP/3 production is after M8; the direction is fixed now, the spike starts earl
 
 ## 13. What is left to the builder
 
-- Ring capacities, buffer pool sizes, shrink/grow policy, and arena sizing.
-- Bounded queue/channel implementation (preallocated, no per-message allocation) and
-  wake batching.
+- Ring capacities, `BufferPool` size classes and total budget, arena sizing, and the
+  idle-take/return policy.
+- Bounded queue/channel implementation (preallocated, no per-message allocation),
+  cancellation notification, and credit-batching thresholds.
 - Worker pool sizing and dispatch/queue policies.
 - Reactor fairness budget and timer granularity.
 - Interned header set and header index layout.
@@ -716,3 +840,16 @@ HTTP/3 production is after M8; the direction is fixed now, the spike starts earl
 13. HTTP/2 push and priority omitted; extended CONNECT out of v1; padding accepted.
 14. TLS after the proxy.
 15. The server body cap is optional policy (`None` = unlimited), not a framing limit.
+16. Session callbacks return `Step` (`Register`/`Replace`/`Close`); no `&mut Reactor`
+    reentrancy, no eventfd wake per accepted connection.
+17. Idle connections hold no ring buffers; a per-reactor `BufferPool` lends them only
+    for active exchanges, keeping 10k idle connections under stock VMA limits.
+18. Cancellation is a shared atomic plus queue condvars, not a control message; credit
+    is batched into an atomic and wakes the reactor on a threshold, not per chunk.
+19. Reactors expose `run` and `step`, `Server::start` returns `ServerHandle`, and
+    `Client` owns/joins one reactor thread; tests drive `step`.
+20. The client streams responses always; request bodies are buffered via `send` or
+    streamed via `send_streaming`/`RequestBodyWriter`/`PendingResponse`; streaming
+    requests are never retried.
+21. `Response` is framing-neutral: `content_length` is only a hint; HTTP/1.1 chunking is
+    the adapter's choice; trailers require unknown length; `Drop` auto-finishes.
