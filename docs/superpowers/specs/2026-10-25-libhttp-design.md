@@ -318,6 +318,7 @@ impl Reactor {
     pub fn step(&mut self, timeout: Option<Duration>) -> io::Result<()>; // tests
     pub fn listen(&mut self, addr: SocketAddr, backlog: u32) -> io::Result<ListenerId>;
     pub fn bind_udp(&mut self, addr: SocketAddr) -> io::Result<SocketId>;
+    pub fn open_file(&mut self, path: &Path) -> io::Result<FileId>; // setup only
     pub fn register(&mut self, session: Box<dyn Session>) -> SessionId;
     pub fn handle(&self) -> ReactorHandle; // wake(), shutdown()
 }
@@ -326,17 +327,19 @@ impl Reactor {
 Read operations do not take a buffer. The driver owns the read-buffer policy: on the
 portable path it takes a `BufMut` from the shard pool; on the io_uring fast path it uses
 a registered provided-buffer ring, so the kernel selects a slot and the completion
-carries it as a `Buf`. This is what lets multishot receive work without handing the
-kernel a per-connection buffer list. A session that needs a bigger class submits the
-hint; the driver may upgrade it.
+carries it as a `Buf`. Rings exist per size class, so the class hint selects one; this
+is what lets multishot receive work without handing the kernel a per-connection buffer
+list. A session that needs a bigger class submits the hint; the driver may upgrade it.
 
 `Io` is the session's only interface to the driver: `submit(Op)`, `close(socket)`,
-`open_file(path) -> FileId`, `open_pipe() -> PipeId`, `timeout(at, id)`, `now()`,
-`wake()`. A session can own several `SocketId`s — that is what makes a proxy and a QUIC
-endpoint expressible in one session without fd-per-session hacks. A session never
-receives `&mut Reactor`; session creation uses `Step::Register`, which the reactor
-applies after the callback. One vtable call per completion is the entire dynamic-dispatch
-cost.
+`open_pipe() -> PipeId`, `timeout(at, id)`, `now()`, `wake()`. File descriptors are
+opened at setup (`Reactor::open_file`) or held by the application's file cache and passed
+to handlers as `FileId`; opening a path on the event loop would be a blocking syscall
+hiding in the hot path, and is not part of `Io`. A session can own several `SocketId`s —
+that is what makes a proxy and a QUIC endpoint expressible in one session without
+fd-per-session hacks. A session never receives `&mut Reactor`; session creation uses
+`Step::Register`, which the reactor applies after the callback. One vtable call per
+completion is the entire dynamic-dispatch cost.
 
 Read/write concurrency:
 
@@ -359,7 +362,8 @@ Read/write concurrency:
   the pool until `SendZcDone`; they emit `SendZcDone` rather than `Written`. TLS and
   anything that needs to transform bytes use normal writes. `SEND_ZC` is opportunistic:
   if the kernel or a backend rejects it, the driver falls back to a normal write with
-  the same buffer accounting.
+  the same buffer accounting. `SEND_ZC` takes a short chain (a frame/head plus payload,
+  at most two iovecs); longer `WriteBufs` chains use `WRITEV`.
 - **Files and proxy:** `SendFile` and `Splice` are io_uring fast-path operations for
   plaintext file bodies and same-shard relay; they fall back to normal writes on other
   backends. They are benchmark-gated, not required for correctness.
@@ -372,10 +376,12 @@ Buffer and close contract:
   as a `Buf`; dropping it queues the slot for re-registration with io_uring. A slot is
   never handed to the kernel again until the userspace `Buf` is gone.
 - `Io::close(socket)` marks the socket closing, rejects new operations, cancels or
-  drains in-flight operations, and waits for provided-buffer slots and zero-copy
-  notifications to return. Once the last one is accounted for, the driver emits
-  `Event::Closed { socket }` and releases the fd/handle. `OpId`s may be reused only after
-  their completion (or after `Closed` for cancelled operations).
+  drains in-flight kernel operations, and waits for zero-copy notification CQEs. It does
+  not wait for a `Buf` already handed to a worker: that buffer is gone from the kernel,
+  and its block returns to the pool when the last handle drops, even after the session
+  is gone. Once kernel work is accounted for, the driver emits `Event::Closed { socket }`
+  and releases the fd/handle. `OpId`s may be reused only after their completion (or
+  after `Closed` for cancelled operations).
 - `Step::Close` closes every socket the session declared in `sockets()`, cancels or
   drains operations the same way, and delivers no further events to that session. The
   reactor drops the returned buffers only after cancellation is accounted for.
@@ -462,11 +468,14 @@ impl WriteBufs {
 }
 ```
 
-- A `Buf` is immutable and `Send`. With a single owner, the block moves without any
-  atomic operation and without a refcount allocation; the first split or clone
-  transitions it to an atomically refcounted shared state. Ranges are O(1). The last
-  drop returns the block through the owning shard's deferred return queue, so a worker
-  does not take a global lock or free into a contended allocator.
+- A `Buf` is immutable, `Send`, and deliberately **not `Sync`**: a handle is owned by
+  one thread at a time, which is what makes the unique fast path sound. Shared handles
+  are moved independently (or created by an explicit split); there is no concurrent
+  `&Buf` from two threads. With a single owner, the block moves without any atomic
+  operation and without a refcount allocation; the first split or clone transitions it
+  to an atomically refcounted shared state. Ranges are O(1). The last drop returns the
+  block through the owning shard's deferred return queue, so a worker does not take a
+  global lock or free into a contended allocator.
 - A `BufMut` is uniquely owned, taken from the pool, and either frozen for writing or
   filled by a read completion. Read into uninitialized spare capacity and the
   unique→shared transition are the only unsafe operations; they are encapsulated,
@@ -592,9 +601,12 @@ pub struct Credit { pub stream: StreamId, pub bytes: u32 }
 - HTTP/1.1: the degenerate stream maps its outbound queue capacity to a `Window`; TCP is
   the real limiter, so "credit" is "space in the write queue" and releases on write
   completion. Receive backpressure is stopping read submissions.
-- `Response::write` and `BodyWriter::write` block on the same credit path for every
-  protocol. The worker API does not learn a protocol-specific flow-control type, and the
-  proxy can relay credit without special cases.
+- `Response::write` and the body writer block on a bounded per-stream queue whose free
+  capacity is governed by the same credit. The reactor owns the `Window`; the worker
+  never touches it and never takes a lock or atomic on the normal write path. HTTP/2/3
+  drain the queue only when stream/connection credit permits; HTTP/1.1 drains it as the
+  socket accepts bytes. The worker sees one backpressure contract, and the proxy can
+  relay credit without special cases.
 - A closed or reset stream wakes every waiter with `WindowError::Closed`; this is the
   same cancellation path used for body reads.
 
@@ -684,6 +696,11 @@ reactor supplies UDP datagram completions and timers; `h3::Engine` supplies HTTP
   completions feed `Endpoint`/`Connection`; `poll_transmit` output becomes `SendTo`
   completions; `poll_timeout` becomes a `Timeout` op. No networking code in quinn is
   used; the reactor owns the socket.
+- QUIC transport: `quinn-proto` owns loss recovery, congestion control, pacing, and
+  stream state; the reactor owns the UDP socket and its completions. The Linux fast path
+  batches transmits (`sendmmsg`/`UDP_SEGMENT` GSO) and receives GRO batches where the
+  kernel supports them; other platforms batch as far as their UDP stack allows. This is
+  an I/O optimization, not a second QUIC implementation.
 - h3 control plane: control stream with SETTINGS and GOAWAY; QPACK encoder and decoder
   unidirectional streams; MAX_PUSH_ID/CANCEL_PUSH rejected/ignored (push is not
   implemented).
@@ -740,7 +757,9 @@ impl Response<'_> {
 
 `send_file` is an optimization, not a semantic change: HTTP/1.1 plaintext can use
 `SENDFILE` after the head; HTTP/2/3 and TLS fall back to reading the file into pooled
-`Buf`s and normal writes. The response body is still exactly `len` bytes.
+`Buf`s and normal writes. The response body is still exactly `len` bytes. The `FileId`
+comes from a preopened file cache or other application setup, not from opening a path on
+the reactor thread; the handler holds it as part of its own state.
 
 The handler never chooses a transfer coding. `content_length(n)` is an optional hint:
 when set, HTTP/1.1 sends that length; when not, HTTP/1.1 streams chunked and HTTP/1.0
@@ -762,6 +781,10 @@ before headers produces `413`; after headers it closes (HTTP/1.1) or resets the 
 - HTTP/2: one job per stream. `DataChunk` is a `Buf` plus stream id and credit; drop
   batches credit back to the reactor.
 - HTTP/3: one job per request stream, same shape over QUIC stream chunks.
+- Worker writes block on a bounded per-stream response queue whose free capacity is the
+  worker-visible credit. The reactor maps that capacity to the shared `Window` and
+  drains only when the protocol permits; no shared flow-control object is touched by a
+  handler.
 - Worker topology is configurable. The default is one shared bounded pool across
   reactors, because handlers may block on databases and a global queue keeps a stalled
   shard from idling other cores. The alternative is one pool per shard with CPU
@@ -808,7 +831,8 @@ thread.
 - HTTP/3: QUIC connections live in the endpoint session; per-request jobs.
 - Limits: connections, per-IP, concurrent streams, body size, header size, request
   deadlines, idle and write deadlines. `body (server)` is optional (`None` = unlimited),
-  enforced by the server, not the framing layer.
+  enforced by the server, not the framing layer. Static files are served from a
+  preopened `FileCache`; opening paths on the event loop is not allowed.
 - Graceful shutdown: stop accepting, stop dispatching, close idle HTTP/1.1, GOAWAY and
   drain HTTP/2, GOAWAY and drain HTTP/3, deadline, reset. A cloneable `Shutdown` handle
   triggers it; `Server::start` returns `ServerHandle` with `shutdown`/`join`; `run` is
@@ -876,7 +900,8 @@ libhttp
   h2          { Engine, Event, Events, StreamId, DataChunk, Responder,
                 ResponseWriter, DataStream, ErrorCode, Config }
   h3          { Engine, QuicEndpoint, StreamId, ErrorCode, Config }
-  server      { Server, ServerHandle, Handler, Request, Response, ServerConfig, Shutdown }
+  server      { Server, ServerHandle, Handler, Request, Response, ServerConfig,
+                Shutdown, FileCache }
   client      { Client, ClientConfig, Request, Response, BodyStream,
                 RequestBodyWriter, PendingResponse }
   worker      { WorkerPool, WorkerTopology, BoundedQueue }
