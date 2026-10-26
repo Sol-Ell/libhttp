@@ -40,6 +40,20 @@ The public API never exposes a quinn type, and every copy above is counted in §
 ## 3. The demultiplexer
 
 ```rust
+pub struct EndpointConfig {
+    pub max_field_section_size: usize,   // advertised to peers
+    pub datagrams: bool,                 // send SETTINGS_H3_DATAGRAM = 1
+    pub stream_receive_window: u32,      // per-stream reservation
+    pub receive_window: u64,             // must be >= the sum of stream windows
+}
+
+#[non_exhaustive]
+pub enum Error {
+    Conn(ConnError),          // anything the envelope reports
+    Datagram,                 // malformed or unsupported datagram at the endpoint
+    UnknownConnection,        // a handle the endpoint does not know
+}
+
 pub struct Endpoint { /* quinn endpoint + our per-connection map */ }
 impl Endpoint {
     pub fn new(udp: UdpId, config: EndpointConfig) -> Result<Endpoint, Error>;
