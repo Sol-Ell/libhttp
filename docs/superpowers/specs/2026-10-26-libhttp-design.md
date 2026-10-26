@@ -216,7 +216,7 @@ The application never sees a file descriptor. It cannot register its own socket 
 Closing is two operations, because graceful and abrupt are different things:
 
 - `drv.close(conn)` — abort. The socket is removed, the connection's timers are purged, its credit sink is marked closed, and one `Closed` event is delivered. It does not drop storage the application still holds; it cannot, and force-reclaiming it would mean a refcount underflow when the application's copy finally drops.
-- `drv.finish(conn)` — graceful. The connection is asked for its final output (`close_notify`, h2 GOAWAY); the application writes it and calls `drv.shutdown_write(conn)` only after `Event::Drained` (§6.5). The socket stays readable until the peer closes or its drain deadline fires.
+- `conn.finish()` — graceful, and on the connection object rather than the driver. It queues `close_notify`/GOAWAY; the application writes until `Event::Drained`, then calls `drv.shutdown_write(conn)`. The socket stays readable until the peer closes or its drain deadline fires. The driver cannot compute `Drained`: only the application knows whether it still holds the tail of a partial send.
 
 It is **not** true that nothing outlives a connection. A body chunk can outlive its socket — the proxy can be holding one when the connection resets — so a chunk's credit destination is an `Arc<CreditSink>` carrying the connection's generation and a closed flag, never a bare `ConnId`. A late drop credits a sink that knows it is dead, rather than a connection that has been freed and whose slot may have been reused. That is one atomic on the `Arc` per cross-thread drop, and the honest version of "the application's own call is the only thing in flight".
 
@@ -252,7 +252,6 @@ enum Io {
     Readable(ConnId),
     HalfClose(ConnId),                      // peer finished writing; we may still write
     Writable(ConnId),
-    Drained(ConnId),                        // finish()'s output is fully in the kernel
     Timer(ConnId, TimerKind),               // carries the connection: no app-side mirror of the heap
     Closed(ConnId, CloseReason),            // exactly once, always the last event for that id
     Datagram(UdpId),
