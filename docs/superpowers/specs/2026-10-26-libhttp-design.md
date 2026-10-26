@@ -161,7 +161,7 @@ This is the only open decision.
 
 ## 9. Risks
 
-**AFD.** The Windows backend depends on an internal NT interface. A startup self-test verifies semantics before use and selects the `WSAPoll`+`ConnectEx` fallback on any mismatch, so an AFD that is unavailable or wrong **at startup** costs performance, not correctness. The residual risk the fallback does not cover is a semantic change **after** startup: nothing detects that, and it would be a correctness failure. The Windows gate numbers are scoped to AFD-present for that reason, and §17's self-test is the only mitigation.
+**AFD.** The Windows backend depends on an internal NT interface. A startup self-test verifies semantics before use and selects the `WSAPoll`+`ConnectEx` fallback on any mismatch, so an AFD that is unavailable or wrong **at startup** costs performance, not correctness. The residual risk the fallback does not cover is a semantic change **after** startup: nothing detects that, and it would be a correctness failure. The Windows gate numbers are scoped to AFD-present for that reason, and the transport's startup self-test (§6.1 there) is the only mitigation.
 
 **QPACK.** The dynamic table is deferred to M5 so that a compression bug cannot be confused with an interop bug between two QUIC stacks.
 
@@ -184,7 +184,7 @@ This is the only open decision.
 | 2 | Arming, backpressure, close, drain | Transport §4.2, §4.4, §4.6; graceful drain is `conn` |
 | 3 | Buffer ownership and budget | Transport §5, §7 |
 | 4 | Worker model | `dispatch` |
-| 5 | Fast-path scope | Transport §6.3, §6 milestones M4 |
+| 5 | Fast-path scope | Transport §6.2; milestones M4 |
 | 6 | QUIC backend and budget | `h3` |
 | 7 | TLS integration and order | `tls`; M2 |
 | 8 | File bodies | M4; **no contract written yet** — file bodies are unsupported until one exists |

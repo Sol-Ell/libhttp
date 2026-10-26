@@ -67,6 +67,8 @@ pub struct Datagram<'a>    { pub bytes: &'a mut [u8], pub len: usize,
 pub struct OutDatagram<'a> { pub bytes: &'a [u8],
                              pub peer: std::net::SocketAddr, pub ecn: Option<Ecn> }
 pub struct Ecn(pub u8);
+
+pub enum BackendPath { Epoll, Kqueue, Afd, WsaPoll }
 ```
 
 `Datagram.len` and `.ecn` are **outputs** and are ignored on entry; `peer` is ignored and overwritten. `OutDatagram.ecn` is ignored where the platform does not support ECN (§4.7, Appendix).
@@ -83,7 +85,7 @@ impl Driver {
     pub fn listen(&mut self, addr: SocketAddr) -> Result<ListenerId, Error>;
     pub fn local_addr(&self, l: ListenerId) -> Result<SocketAddr, Error>;
     pub fn unlisten(&mut self, l: ListenerId);
-    pub fn connect(&mut self, addr: SocketAddr) -> Result<ConnId, Error>;
+    pub fn connect(&mut self, addr: SocketAddr, timeout: Duration) -> Result<ConnId, Error>;
     pub fn accept(&mut self, l: ListenerId) -> Result<Option<(ConnId, SocketAddr)>, Error>;
     pub fn activate(&mut self, c: ConnId) -> Result<(), Error>;
     pub fn interest(&mut self, c: ConnId, i: Interest) -> Result<(), Error>;
@@ -175,6 +177,8 @@ The pause exists because a full pool with READ armed is a busy loop on a level-t
 
 `ECONNABORTED` from `accept` is retried internally and never surfaced. `EMFILE`/`ENFILE` is `Error::Io`; the connection is not accepted and the listener keeps reporting `Acceptable`, so the application can back off and retry. `unlisten` closes the listener; queued `Acceptable` events for it are filtered.
 
+**Connect is bounded.** `connect` arms its own deadline for `timeout`; when it elapses the driver closes the socket and delivers `ConnectFailed(c, TimedOut)`. There is no unbounded connect, and a connecting id reports `NotActivated` for `recv` and `Error::HalfClosed` for `send` until it completes.
+
 ### 4.4 EOF latch
 
 The first `Read::Eof` on a connection sets a read-shut latch. The driver reports `HalfClose` once and stops reporting `Readable` for that id, because a FIN'd socket is readable forever. The latch is cleared only by `activate`, which is the application saying it wants reads again — and since a FIN'd socket has no more data, calling `activate` after `HalfClose` and without a new write is pointless; the contract permits it and documents that it re-reports `Eof` once. The spin cannot recur because the latch is only cleared on an explicit call.
@@ -189,7 +193,7 @@ The first `Read::Eof` on a connection sets a read-shut latch. The driver reports
 - `Partial(n)` — `n` bytes written. The caller drops the first `n` bytes of the chain and retries the rest when `Writable` arrives.
 - `WouldBlock` — nothing written, not an error.
 
-The driver holds no output queue; a short write is the application's to resume. Write interest is the application's too — the driver never flips it (§4.2).
+The driver holds no output queue; a short write is the application's to resume. Outside §4.2's three cases the driver never touches the mask: in particular a `Partial` or a `WouldBlock` does not turn WRITE on by itself — the application does, because only it knows whether it has more to send.
 
 `shutdown_write(c)` is `shutdown(SHUT_WR)` on Unix and `shutdown(SD_SEND)` on Windows. It is legal only when the caller has no partial chain outstanding, and the driver cannot detect a violation; that is why it is a precondition, not a check. Calling it twice is a no-op. `send` after it returns `Error::HalfClosed`.
 
@@ -200,6 +204,8 @@ The driver holds no output queue; a short write is the application's to resume. 
 ### 4.6 Close
 
 `close(c)` — abort. Remove the socket, purge every timer slot, mark the credit sink closed (not freed), deliver one `Closed(ConnId, Local)`. It does not free storage the application holds; force-reclaiming would underflow the refcount when the application's copy drops.
+
+**Who produces each `CloseReason`.** `Local` — `close`. `Peer` — EOF on a connection whose write side is already shut down, which is the graceful ending and the only one that is. `PeerReset` — RST. `Io(code)` — any other socket error while reading or writing. A clean EOF with the write side still open is `HalfClose`, not `Peer`, because the connection is still writable; `Peer` arises when the application has already called `shutdown_write` and the peer then finishes.
 
 `Closed` is delivered exactly once and is the last event an id ever produces. Any event queued for it in the same batch — including a `Writable` or a `Timer` that preceded the close — is filtered before delivery.
 
@@ -305,6 +311,13 @@ impl CreditSink {
     pub fn credit(&self, stream: u64, bytes: u32);   // sendable from any thread
     pub fn drain(&self) -> CreditBatch;               // pump thread
     pub fn is_closed(&self) -> bool;
+}
+
+pub struct CreditBatch { /* (stream, bytes) pairs; no allocation after warm-up */ }
+impl CreditBatch {
+    pub fn iter(&self) -> impl Iterator<Item = (u64, u32)> + '_;
+    pub fn is_empty(&self) -> bool;
+    pub fn clear(&mut self);
 }
 ```
 
