@@ -19,7 +19,7 @@
 
 | Feature | Rule |
 |---|---|
-| Push | We send `SETTINGS_ENABLE_PUSH = 0`. Only a **client** may send that setting: a server receiving it, or a client receiving a value other than 0, is `PROTOCOL_ERROR`. A `PUSH_PROMISE` is `PROTOCOL_ERROR`, but only once our 0 has been acknowledged — before the SETTINGS arrives, a peer that has not yet seen it may legally push, and killing the connection on that race is a bug |
+| Push | A client sends `SETTINGS_ENABLE_PUSH = 0`, which is the normal request and must be honoured. A **server** must not send that setting, and a client that receives it — or receives any value other than 0 — treats it as `PROTOCOL_ERROR` (RFC 9113 §6.5.2). A `PUSH_PROMISE` is `PROTOCOL_ERROR`, but only once our 0 has been acknowledged: before the peer has seen the setting it may legally push, and killing the connection on that race is a bug |
 | Priority | `PRIORITY` frames and `HEADERS` priority fields are parsed and discarded; the frame is legal in every stream state |
 | Extended CONNECT | not advertised; the request is refused |
 | `101` | impossible |
@@ -43,8 +43,8 @@ The connection preface is the 24-byte client string; `conn`'s `Detect` committed
 | idle | `HEADERS`, `PRIORITY`; anything else `PROTOCOL_ERROR` |
 | open | all |
 | half-closed (remote) | everything except `DATA`/`HEADERS`; those are `STREAM_CLOSED` |
-| half-closed (local) | `WINDOW_UPDATE`, `RST_STREAM`, `PRIORITY` |
-| closed | `PRIORITY`; `WINDOW_UPDATE`/`RST_STREAM` briefly after the transition; **everything else must be minimally processed**, and `DATA` is a stream error `STREAM_CLOSED` |
+| half-closed (local) | all — we closed our send side, not our receive side |
+| closed | `PRIORITY`; `WINDOW_UPDATE` and `RST_STREAM` only in the short window after the transition; everything else is **minimally processed** (HPACK decoded), never skipped. `DATA` is a stream error — `RST_STREAM` is barred there — and it still counts toward the connection flow-control window (RFC 9113 §5.1) |
 
 "Minimally processed" is not "ignored": a `HEADERS` on a stream we just reset must still be HPACK-decoded, because the dynamic table is connection state and skipping one block desynchronises every later one. That obligation applies to refused streams too (§4).
 
@@ -115,7 +115,7 @@ Two-phase, the same shape as h3. `Conn::stop_accepting` sends GOAWAY with `last_
 
 `Drained` follows `conn` §6.5's three conditions, which this document does not restate. A GOAWAY that overtakes a response body truncates the streams it acknowledges; that is the trap the two-phase form exists to avoid.
 
-A peer GOAWAY is `Event::GoAway`; streams above `last_stream` never ran and are retryable (`proxy` §6).
+A peer GOAWAY is `Event::GoAway`; streams above `last_stream` never ran and are retryable (`proxy` §6). A GOAWAY whose `last_stream` is the maximum id asks us to stop opening without rejecting anything: that is `Event::StopAccepting`, not an error, and it is the signal the relay's no-new-streams rule consumes.
 
 ---
 

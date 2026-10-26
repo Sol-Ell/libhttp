@@ -205,6 +205,7 @@ impl Conn {
     pub fn send_end(&mut self, stream: StreamId) -> Result<(), ConnError>;
     pub fn send_trailers(&mut self, stream: StreamId, head: Head) -> Result<(), ConnError>;
     pub fn send_datagram(&mut self, flow: StreamId, data: Chunk) -> Result<(), ConnError>;  // h3 only
+    pub fn max_datagram_size(&mut self, flow: StreamId) -> Option<usize>;      // h3 only
     pub fn reset(&mut self, stream: StreamId, code: u64) -> Result<(), ConnError>;
     pub fn goaway(&mut self, last_stream: StreamId, code: u64);
     pub fn stop_accepting(&mut self);                                          // first GOAWAY
@@ -241,11 +242,9 @@ impl Conn {
         -> Result<Conn, ConnError>;
     pub fn start(&mut self) -> Result<(), ConnError>;
     pub fn feed(&mut self, bytes: Chunk) -> Result<(), ConnError>;
-    pub fn feed_datagram(&mut self, bytes: Chunk) -> Result<(), ConnError>;   // h3 only
     pub fn feed_eof(&mut self) -> Result<(), ConnError>;
     pub fn poll(&mut self) -> Option<Event>;
     pub fn output(&mut self) -> Option<Chunk>;
-    pub fn output_datagram(&mut self) -> Option<Chunk>;                       // h3 only
     pub fn finish(&mut self);
     pub fn on_closed(&mut self, reason: CloseReason) -> Result<(), ConnError>;
     pub fn tick(&mut self) -> Result<(), ConnError>;
@@ -269,11 +268,11 @@ impl Conn {
 
 `feed` decrypts if TLS is present and hands plaintext to the engine. It never calls back into the application and never yields events; parsing output is drained by `poll`. `feed_eof` hands end-of-input to TLS first, then the engine — that ordering is what separates a clean `close_notify` from a truncated close (`tls` §3.4).
 
-`feed_datagram` is the QUIC input path; `feed` is an error on a QUIC connection, and `feed_datagram` on TCP likewise.
+On a QUIC connection the packet path belongs to `h3::Endpoint` (`h3` §3): it feeds datagrams into the connection and takes packets out through internal calls. There is no public `feed_datagram`/`output_datagram` on `Conn`, because two public owners for one packet path is how a packet gets sent twice. `feed` on a QUIC connection is `ConnError::Config`.
 
 ### 6.4 poll, output, and the admission rule
 
-`poll` yields events in the order §3 guarantees. `output` yields framed, encrypted bytes ready for the transport's `send`; `output_datagram` is the QUIC equivalent.
+`poll` yields events in the order §3 guarantees. `output` yields framed, encrypted bytes ready for the transport's `send`. On QUIC the equivalent is `h3::Endpoint::output_datagram`.
 
 `output` is not one FIFO, and without this rule the design deadlocks:
 
@@ -320,6 +319,7 @@ pub enum ConnError {
     StreamMismatch,                   // Body.stream != the stream named by send_data
     StreamRefused,                    // the peer will not accept this kind of stream
     DatagramTooLarge,
+    DatagramsUnsupported,            // the peer did not advertise RFC 9221 support
     Closed,                           // the connection is already gone
 }
 
@@ -337,7 +337,7 @@ Fatality, which is the part callers branch on:
 | `Protocol`, `Tls`, `Config` | the connection is dead |
 | `Transport(Error::Io)`, `Transport(Error::StaleId)`, `Closed` | the connection is dead |
 | `Transport(Error::Exhausted)` | transient: the pool is full, stop reading and retry |
-| `StreamDone`, `StreamMismatch`, `StreamRefused`, `DatagramTooLarge` | the stream (or the datagram) is refused; the connection survives |
+| `StreamDone`, `StreamMismatch`, `StreamRefused`, `DatagramTooLarge`, `DatagramsUnsupported` | the stream (or the datagram) is refused; the connection survives |
 
 h1's "response body written after End" aborts the stream; it closes the connection only because the response was already on the wire, and that is `h1`'s decision, not this variant's fatality.
 
@@ -352,6 +352,8 @@ pub mod codes {
     pub const INTERNAL_ERROR: u64 = 0x2;         // h2
     pub const H3_REQUEST_REJECTED: u64 = 0x10b;  // h3
     pub const H3_REQUEST_CANCELLED: u64 = 0x10c; // h3
+    pub const CONNECT_ERROR: u64 = 0xa;          // h2
+    pub const H3_CONNECT_ERROR: u64 = 0x10f;      // h3
 }
 ```
 

@@ -119,7 +119,7 @@ Because capacity is zero, the peer must not insert entries or send encoder instr
 
 - Field sections are parsed in full: Required Insert Count, Base, the representation prefixes, Huffman, and the static table (99 entries). With capacity zero the required insert count is always 0; a peer that sends a dynamic reference is `QPACK_DECOMPRESSION_FAILED`.
 - The encoder emits indexed-name or literal-name field lines with Huffman where shorter. No inserts, no duplicates, no dynamic references.
-- **The encoder and decoder streams carry nothing in v1, in both directions.** We never insert, so we never owe a Section Acknowledgement, and we never receive one we must act on. The streams exist because RFC 9114 makes them critical, not because v1 has anything to put on them. An instruction arriving on the peer's QPACK encoder stream is `QPACK_ENCODER_STREAM_ERROR`; one on its decoder stream is likewise an error, because it acknowledges an insertion that never happened.
+- **The encoder and decoder streams carry nothing in v1, in both directions.** We never insert, so we never owe a Section Acknowledgement, and we never receive one we must act on. The streams exist because RFC 9114 makes them critical, not because v1 has anything to put on them. An instruction arriving on the peer's QPACK encoder stream is `QPACK_ENCODER_STREAM_ERROR`. On its decoder stream, a Section Acknowledgment is impossible (we never insert) and is an error, but a **Stream Cancellation is legal** — RFC 9204 §2.2.2.2 lets a decoder send one, and with capacity zero it is a permitted no-op that must not kill the connection.
 
 That asymmetry with h2's HPACK is deliberate: HPACK blocks arrive in order on the connection, so its dynamic table needs no per-block accounting; QPACK's do not, which is why its table is deferred and HPACK's is not.
 
@@ -147,7 +147,7 @@ A send-stream write returns `Blocked` at the stream or connection send limit and
 
 **Two-phase GOAWAY, the same shape as h2.** `Conn::stop_accepting` sends a GOAWAY with the maximum stream id (2^62 − 4), which asks the peer to stop opening without rejecting anything. `Conn::finish` requests the drain; the final GOAWAY, carrying the last accepted id, is emitted only when every accepted stream is terminal or the `Drain` deadline fires. `Drained` then follows `conn` §6.5's three conditions — this document does not restate them, because a weaker local version is how the FIN gets ahead of `close_notify`. Condition 2 is observable here because the endpoint owns the transmit queue: it calls `Conn::poll` only after `poll_transmit` returned `None`, so a `Drained` the engine emits cannot precede the last packet.
 
-A peer GOAWAY is `Event::GoAway`; requests above its id were rejected and are safe to retry. `H3_REQUEST_REJECTED` is used only for admission refusal and above-GOAWAY requests, never for a stream that ran.
+A peer GOAWAY is `Event::GoAway`; requests above its id were rejected and are safe to retry. A GOAWAY carrying the maximum id asks us to stop opening without rejecting anything: `Event::StopAccepting`, not an error. `H3_REQUEST_REJECTED` is used only for admission refusal and above-GOAWAY requests, never for a stream that ran.
 
 Plain `CONNECT` is opened with `StreamKind::Connect` (`conn` §5): `:method = CONNECT`, no `:scheme`/`:path`, extended CONNECT not advertised. A failed tunnel is `H3_CONNECT_ERROR`. The stream becomes a `Tunnel`, and its half-close is `END_STREAM` on that stream.
 
