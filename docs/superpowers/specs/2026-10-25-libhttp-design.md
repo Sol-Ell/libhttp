@@ -1,6 +1,6 @@
 # libhttp — Design
 
-**Status:** draft for approval (revision 3). Nothing is implemented yet.
+**Status:** draft for approval (revision 4). Nothing is implemented yet.
 **Date:** 2026-10-26.
 **Scope:** HTTP/1.1, HTTP/2, and HTTP/3 in one non-blocking, completion-driven Rust
 library for Linux, macOS/BSD, and Windows.
@@ -180,12 +180,15 @@ connection targets and portability.
 implementation quality: undocumented unsafe and missed trivial optimizations. We are not
 going to wrap it and inherit that.
 
-**Chosen: pooled, refcounted `Buf`/`BufMut` owned by libhttp.** A `BufMut` is a unique
-buffer taken from a per-reactor pool, handed to a read completion, and frozen into a
-`Buf`. A `Buf` is an atomically refcounted allocation plus a `(start, end)` range;
-splitting or slicing is O(1) and never copies. `Buf` is `Send`, so body chunks cross to
-workers without a copy. `BufMut` serializes responses and is frozen for a write
-completion. The last `Buf` drop returns the allocation to the pool.
+**Chosen: pooled `Buf`/`BufMut` with a unique-ownership fast path.** A `BufMut` is a
+unique buffer taken from a per-shard pool, handed to a read completion, and frozen into
+a `Buf`. A `Buf` is a pooled block plus a `(start, end)` range; splitting or slicing is
+O(1) and never copies. While a block has exactly one `Buf`, ownership moves without
+atomics; the first split or clone transitions it to atomically refcounted shared state.
+`Buf` is `Send`, so body chunks cross to workers without a copy. Blocks return to the
+pool through a shard-local deferred return queue, so a worker's drop does not take a
+global lock or free under contention. `BufMut` serializes responses and is frozen for a
+write completion.
 
 Performance argument:
 
@@ -193,11 +196,13 @@ Performance argument:
 - Zero-copy split for HTTP/2 DATA, HTTP/1.1 body chunks, and worker handoff.
 - No mmap, no memfd, no VMAs, no `vm.max_map_count` concern; works identically on all
   three platforms.
-- Pool reuse makes the data allocation a pointer pop. `Arc` adds one small refcount-
-  header allocation per frozen buffer; it is measured, and an intrusive refcount can
-  replace it later without changing the `Buf` API.
-- The only new unsafe is the read-into-spare slice, which is small, documented, tested
-  under Miri, and fuzzed at the buffer level.
+- The common case — one owner, moved across a boundary — has no atomic operations and
+  no per-freeze allocation. Atomics are paid only when a read is actually split between
+  consumers, which is the case they exist for.
+- Per-shard deferred returns keep the pool hot and avoid lock contention on the handler
+  path; the alternative (a global `Arc`-based pool) is benchmarked against this one.
+- The new unsafe is limited to the read-into-spare slice and the refcount state
+  transition; both are documented, Miri-tested, and fuzzed at the buffer level.
 
 If profiling later shows a faster shape, the `Buf` API hides the representation; the
 engines never depend on it being an allocation. But the ring is not that shape for
@@ -264,14 +269,20 @@ see a socket. That is the whole concurrency model.
 pub struct Reactor { /* driver, slab, sessions, timer heap, command queue */ }
 pub struct SocketId(u32);
 pub struct ListenerId(u32);
+pub struct FileId(u32);
+pub struct PipeId(u32);
 pub struct OpId(u64);
+pub enum BufClass { Small4K, Default16K, Large64K }
+pub enum WriteMode { Normal, ZeroCopy }
 
 pub enum Op {
     Accept { listener: ListenerId, id: OpId },
     Connect { addr: SocketAddr, id: OpId },
-    Read { socket: SocketId, buf: BufMut, id: OpId },
-    Write { socket: SocketId, bufs: WriteBufs, id: OpId },
-    RecvFrom { socket: SocketId, buf: BufMut, id: OpId },
+    Read { socket: SocketId, class: BufClass, id: OpId },
+    Write { socket: SocketId, bufs: WriteBufs, mode: WriteMode, id: OpId },
+    SendFile { socket: SocketId, file: FileId, offset: u64, len: u64, id: OpId },
+    Splice { socket: SocketId, pipe: PipeId, len: usize, id: OpId },
+    RecvFrom { socket: SocketId, class: BufClass, id: OpId },
     SendTo { socket: SocketId, buf: Buf, addr: SocketAddr, id: OpId },
     Timeout { at: Instant, id: OpId },
 }
@@ -280,7 +291,10 @@ pub enum Event {
     Accepted { id: OpId, socket: SocketId, peer: SocketAddr },
     Connected { id: OpId, socket: SocketId },
     Read { id: OpId, buf: Buf },                // len is the received length
-    Written { id: OpId, bufs: WriteBufs, n: usize }, // bufs is the unwritten remainder
+    Written { id: OpId, bufs: WriteBufs, n: usize }, // normal write remainder
+    SendZcDone { id: OpId },                    // zero-copy buffers released
+    SendFileDone { id: OpId, n: u64 },
+    SpliceDone { id: OpId, n: usize },
     Datagram { id: OpId, buf: Buf, from: SocketAddr },
     TimedOut { id: OpId },
     Closed { socket: SocketId },
@@ -309,32 +323,59 @@ impl Reactor {
 }
 ```
 
-`Io` is the session's only interface to the driver: `submit(Op)`, `close(socket)`,
-`timeout(at, id)`, `now()`, `wake()`. A session can own several `SocketId`s — that is
-what makes a proxy and a QUIC endpoint expressible in one session without fd-per-session
-hacks. A session never receives `&mut Reactor`; session creation uses `Step::Register`,
-which the reactor applies after the callback. One vtable call per completion is the
-entire dynamic-dispatch cost.
+Read operations do not take a buffer. The driver owns the read-buffer policy: on the
+portable path it takes a `BufMut` from the shard pool; on the io_uring fast path it uses
+a registered provided-buffer ring, so the kernel selects a slot and the completion
+carries it as a `Buf`. This is what lets multishot receive work without handing the
+kernel a per-connection buffer list. A session that needs a bigger class submits the
+hint; the driver may upgrade it.
 
-At most one read and one write operation are in flight per stream socket. This is a
-contract, not an implementation detail: multishot recv and provided-buffer rings are
-explicitly out of v1 because they break one-buffer-per-completion and let the kernel
-choose buffers. Batching of submissions/completions and multishot accept are in. A write
-takes a `WriteBufs` chain, so a frame header and a zero-copy payload are one vectored
-write; the session queues the next chain when the completion arrives. This preserves
-write ordering, bounds buffers, and makes partial writes and backpressure explicit.
-Datagram sockets may have several `SendTo` operations in flight because datagram order
-is not part of the contract.
+`Io` is the session's only interface to the driver: `submit(Op)`, `close(socket)`,
+`open_file(path) -> FileId`, `open_pipe() -> PipeId`, `timeout(at, id)`, `now()`,
+`wake()`. A session can own several `SocketId`s — that is what makes a proxy and a QUIC
+endpoint expressible in one session without fd-per-session hacks. A session never
+receives `&mut Reactor`; session creation uses `Step::Register`, which the reactor
+applies after the callback. One vtable call per completion is the entire dynamic-dispatch
+cost.
+
+Read/write concurrency:
+
+- **Fast path (io_uring):** multishot `RECV` with provided buffers and multishot
+  `ACCEPT`; a socket may deliver an arbitrary number of `Read` completions per arm. A
+  multishot operation's `OpId` stays live across all of its completions; it can be
+  reused only after the arm is cancelled or the socket closes. The session consumes
+  completions in order; backpressure is the number of free provided-buffer slots plus
+  its bounded engine queues. When slots run out, the driver stops re-arming reads and
+  TCP/QUIC flow control takes over. Per-connection in-flight read and zero-copy write
+  budgets keep one socket from consuming the shard's whole slot pool or notification
+  budget.
+- **Portable path (epoll/kqueue/IOCP and io_uring fallback):** one outstanding read and
+  one outstanding write per stream socket, re-armed only after the previous completion.
+  This keeps the fallback simple and is still completion-shaped to the session.
+- **Writes:** normal writes are serialized per stream socket, with a `WriteBufs` chain
+  (header + payload) sent by `WRITEV`/`WSASend`/`writev`, and emit `Written` with the
+  unwritten remainder. Zero-copy writes (`SEND_ZC`) may have several chains in flight;
+  ordering is the kernel's submission order, and a chain's buffers are not returned to
+  the pool until `SendZcDone`; they emit `SendZcDone` rather than `Written`. TLS and
+  anything that needs to transform bytes use normal writes. `SEND_ZC` is opportunistic:
+  if the kernel or a backend rejects it, the driver falls back to a normal write with
+  the same buffer accounting.
+- **Files and proxy:** `SendFile` and `Splice` are io_uring fast-path operations for
+  plaintext file bodies and same-shard relay; they fall back to normal writes on other
+  backends. They are benchmark-gated, not required for correctness.
 
 Buffer and close contract:
 
 - The driver keeps every submitted `Buf`/`BufMut` alive until its completion and returns
   it exactly once. A session must not touch a submitted buffer.
-- `Io::close(socket)` marks the socket closing, rejects new operations, and cancels or
-  drains in-flight operations. Each pending buffer comes back through its completion;
-  once the last one is accounted for, the driver emits `Event::Closed { socket }` and
-  releases the fd/handle. `OpId`s may be reused only after their completion (or after
-  `Closed` for cancelled operations).
+- Provided-buffer slots are owned by the shard's pool. A completion transfers the slot
+  as a `Buf`; dropping it queues the slot for re-registration with io_uring. A slot is
+  never handed to the kernel again until the userspace `Buf` is gone.
+- `Io::close(socket)` marks the socket closing, rejects new operations, cancels or
+  drains in-flight operations, and waits for provided-buffer slots and zero-copy
+  notifications to return. Once the last one is accounted for, the driver emits
+  `Event::Closed { socket }` and releases the fd/handle. `OpId`s may be reused only after
+  their completion (or after `Closed` for cancelled operations).
 - `Step::Close` closes every socket the session declared in `sockets()`, cancels or
   drains operations the same way, and delivers no further events to that session. The
   reactor drops the returned buffers only after cancellation is accounted for.
@@ -346,22 +387,24 @@ Buffer and close contract:
 
 Datagram operations (`RecvFrom`/`SendTo`) exist for QUIC and are first-class, not an
 afterthought. `Timeout` is a completion, so timers use the same path as I/O and there is
-no timer thread. An idle connection keeps one small read completion armed (4 KiB class)
-so data wakes it without a readiness syscall; the completion returns the buffer with
-data, which the engine consumes like any other read. That is the completion-native way
-to wait, and it behaves the same on every platform.
+no timer thread. On the fast path an idle connection holds no data buffer: provided
+buffers are only consumed when data arrives. On the portable path it keeps one small
+(4 KiB class) read completion armed; the completion returns the buffer with data.
 
-- **io_uring (Linux):** single-shot accept, recv/send, connect, recvmsg/sendmsg,
-  timeouts; batching of submissions and completions; multishot accept; registered files
-  are an optimization behind the same `Op` API.
+- **io_uring (Linux, primary):** `SINGLE_ISSUER|COOP_TASKRUN|DEFER_TASKRUN`; multishot
+  accept and recv with provided-buffer rings; `SEND_ZC` and its notification CQEs;
+  `SENDFILE`/`SPLICE`; batched submission/completion; timeouts; `SQPOLL` opt-in and
+  benchmark-gated. Each fast-path feature is probed at startup (multishot recv 5.19+,
+  `SEND_ZC` 6.0+); a missing feature falls back operation by operation to the portable
+  path, never to a broken half-fast state.
 - **epoll fallback (Linux):** used only when io_uring cannot be initialized (older
   kernel, seccomp, container policy). Readiness emulates a completion by performing the
-  requested operation; edge-triggered and drain-until-`WouldBlock`.
+  requested operation; edge-triggered and drain-until-`WouldBlock`; one op per direction.
 - **kqueue (macOS/BSD):** `EVFILT_READ`/`EVFILT_WRITE`, `EVFILT_USER` for wakeups, and
-  the poll timeout for timers; readiness emulates completions.
+  the poll timeout for timers; readiness emulates completions; one op per direction.
 - **IOCP (Windows):** overlapped `WSARecv`/`WSASend`/`AcceptEx`/`ConnectEx`,
   `GetQueuedCompletionStatusEx`, `PostQueuedCompletionStatus` for wakeups; native
-  completions.
+  completions; `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` where it helps.
 
 `ReactorConfig` chooses `Auto`, `IoUring`, or `Epoll` on Linux; `Auto` probes io_uring
 at startup and falls back only on failure. No runtime choice is hidden from the user;
@@ -393,11 +436,11 @@ certificate loading.
 ### 7.3 Buffers
 
 ```rust
-pub struct Buf { /* Arc<BufInner> + start/end */ }
+pub struct Buf { /* pooled block + start/end; unique or shared */ }
 pub struct BufMut { /* Vec<u8> + PoolHandle */ }
 pub struct WriteBufs { /* inline 8 Bufs + overflow Vec */ }
-pub struct Pool { /* size classes, free lists */ }
-pub struct PoolHandle(/* Arc<Pool> */);
+pub struct Pool { /* size classes, free lists, deferred returns */ }
+pub struct PoolHandle(/* shard pool + return queue */);
 
 impl Buf {
     pub fn split_at(self, at: usize) -> (Buf, Buf);
@@ -419,26 +462,28 @@ impl WriteBufs {
 }
 ```
 
-- A `Buf` is immutable and `Send`; cloning/splitting is an atomic refcount bump and an
-  O(1) range change. The last drop returns the allocation to the pool. One small
-  refcount-header allocation per frozen buffer is accepted and measured; replacing it
-  with an intrusive refcount is an optimization, not an API change.
+- A `Buf` is immutable and `Send`. With a single owner, the block moves without any
+  atomic operation and without a refcount allocation; the first split or clone
+  transitions it to an atomically refcounted shared state. Ranges are O(1). The last
+  drop returns the block through the owning shard's deferred return queue, so a worker
+  does not take a global lock or free into a contended allocator.
 - A `BufMut` is uniquely owned, taken from the pool, and either frozen for writing or
-  filled by a read completion. Read into uninitialized spare capacity is the only unsafe
-  operation; it is encapsulated, documented, and Miri/fuzzed.
+  filled by a read completion. Read into uninitialized spare capacity and the
+  unique→shared transition are the only unsafe operations; they are encapsulated,
+  documented, Miri-tested, and fuzzed.
+- Pools are per shard, with size classes (64 B, 1 KiB, 4, 16, 32, 64 KiB; larger bodies
+  chain buffers). Deferred returns are drained at the top of the shard loop. An empty
+  pool is backpressure on accept/read submission, not a reason to allocate unbounded
+  memory.
 - `WriteBufs` is a small inline chain of immutable `Buf`s (8 inline, overflow into a
   `Vec`). Frame headers and response heads are small pooled `Buf`s (64-byte class)
   chained in front of zero-copy payload `Buf`s; the driver writes them with
   `IORING_OP_WRITEV`, `WSASend`, or `writev`. There is no all-output coalescing copy.
   A partial write consumes the written prefix and returns the remainder for resubmission.
-- Pools are per reactor, with size classes (64 B, 1 KiB, 4, 16, 32, 64 KiB; larger
-  bodies chain buffers). Workers return buffers through the pool's thread-safe free
-  list; a lock per buffer is acceptable at these sizes and is measured.
-- Idle connections keep one small (4 KiB class) read completion armed; the buffer is
-  returned to the pool when the completion arrives or the connection closes. A write
-  takes a buffer only when there is output. This is the completion-native wait on every
-  platform. An empty pool is backpressure on accept/read submission, not a reason to
-  allocate unbounded memory.
+- Idle connections follow the backend: on the io_uring fast path a multishot read is
+  armed and no per-connection data buffer is held (provided-buffer slots are consumed
+  only when data arrives); on the portable path one 4 KiB read completion is armed and
+  returned on completion or close. A write takes a buffer only when there is output.
 - Header arenas are separate, per exchange, and bounded by the header limit.
 
 Copies and lifetimes:
@@ -486,7 +531,7 @@ Copies and lifetimes:
   with the exchange. Nothing in an `OwnedHead` points into a buffer the reactor will
   refill.
 
-### 7.5 Header codecs
+### 7.5 Shared codecs and flow control
 
 `HeaderCodec` is the abstraction that pays for HTTP/3:
 
@@ -524,6 +569,34 @@ pub trait HeaderCodec {
   block, not per header.
 - A discarded block is still decoded to keep the table in sync, or the connection
   closes.
+
+**Credit and windows.** Flow control is one concept, not three: an application write
+consumes credit, and credit is released when the peer or the transport accepts more.
+
+```rust
+pub struct Window { /* i64 remaining, upper bound, waiters */ }
+impl Window {
+    pub fn acquire(&mut self, bytes: u32) -> Result<u32, WindowError>;
+    pub fn release(&mut self, bytes: u32);
+    pub fn available(&self) -> u32;
+}
+
+pub struct Credit { pub stream: StreamId, pub bytes: u32 }
+```
+
+- HTTP/2: a stream's writable credit is `min(stream_window, connection_window)`; a
+  `WINDOW_UPDATE` releases both. Receive credit is released when the consumer drops a
+  `DataChunk`, not when the parser parses.
+- HTTP/3: the engine asks quinn for writable stream capacity and maps it to the same
+  `Window`; QUIC stream and connection windows remain the authority.
+- HTTP/1.1: the degenerate stream maps its outbound queue capacity to a `Window`; TCP is
+  the real limiter, so "credit" is "space in the write queue" and releases on write
+  completion. Receive backpressure is stopping read submissions.
+- `Response::write` and `BodyWriter::write` block on the same credit path for every
+  protocol. The worker API does not learn a protocol-specific flow-control type, and the
+  proxy can relay credit without special cases.
+- A closed or reset stream wakes every waiter with `WindowError::Closed`; this is the
+  same cancellation path used for body reads.
 
 ### 7.6 HTTP/1.1 engine
 
@@ -659,10 +732,15 @@ impl Response<'_> {
     pub fn headers(&mut self, headers: &[Header<'_>]);
     pub fn content_length(&mut self, len: u64);          // optional hint
     pub fn write(&mut self, buf: &[u8]) -> Result<()>;
+    pub fn send_file(&mut self, file: FileId, offset: u64, len: u64) -> Result<()>;
     pub fn finish(self) -> Result<()>;
     pub fn finish_with_trailers(self, trailers: &[Header<'_>]) -> Result<()>;
 }
 ```
+
+`send_file` is an optimization, not a semantic change: HTTP/1.1 plaintext can use
+`SENDFILE` after the head; HTTP/2/3 and TLS fall back to reading the file into pooled
+`Buf`s and normal writes. The response body is still exactly `len` bytes.
 
 The handler never chooses a transfer coding. `content_length(n)` is an optional hint:
 when set, HTTP/1.1 sends that length; when not, HTTP/1.1 streams chunked and HTTP/1.0
@@ -684,9 +762,13 @@ before headers produces `413`; after headers it closes (HTTP/1.1) or resets the 
 - HTTP/2: one job per stream. `DataChunk` is a `Buf` plus stream id and credit; drop
   batches credit back to the reactor.
 - HTTP/3: one job per request stream, same shape over QUIC stream chunks.
-- The pool is shared and bounded. When the dispatch queue is full, HTTP/2/3 streams are
-  refused with `REFUSED_STREAM`; HTTP/1.1 stops dispatching under a request deadline;
-  optional `503` shedding.
+- Worker topology is configurable. The default is one shared bounded pool across
+  reactors, because handlers may block on databases and a global queue keeps a stalled
+  shard from idling other cores. The alternative is one pool per shard with CPU
+  affinity, so the job, its buffers, and the connection state stay on one core; it is
+  selected by configuration and settled by the benchmark, not by ideology. When the
+  dispatch queue is full, HTTP/2/3 streams are refused with `REFUSED_STREAM`; HTTP/1.1
+  stops dispatching under a request deadline; optional `503` shedding.
 - Cancellation is an `Arc<StreamState>` atomic plus queue condvars; reset/close poisons
   both queues and wakes a worker parked on a full response queue or empty body queue.
   Credit is accumulated in an atomic and the reactor is woken on a threshold or stream
@@ -708,7 +790,8 @@ before headers produces `413`; after headers it closes (HTTP/1.1) or resets the 
 
 ### 7.10 Server
 
-Reactors + worker pool. No accept thread, no connection thread.
+Reactors + worker pool (shared or per-shard, §7.9). No accept thread, no connection
+thread.
 
 - Listener session submits `Accept`; completed sockets are registered with a server
   session. Backend differences (multishot accept on io_uring, `AcceptEx` on Windows,
@@ -767,7 +850,8 @@ no worker pool:
   blocking.
 - HTTP/1.1↔HTTP/1.1, HTTP/1.1↔HTTP/2, HTTP/2↔HTTP/2. HTTP/2 streams map 1:1; DATA is
   forwarded as zero-copy `Buf` slices; client credit is released only after the
-  upstream write completes; trailers, RST_STREAM, and GOAWAY propagate.
+  upstream write completes; trailers, RST_STREAM, and GOAWAY propagate. Same-shard
+  plaintext relay may use `Splice`; otherwise it forwards `Buf`s.
 - CONNECT/`101`: both engines detach into tunnel state and the session pumps opaque
   bytes. HTTP/2 uses plain CONNECT (`:authority` only); extended CONNECT is out of v1.
 - Strip `Connection`-named fields, regenerate `Host` from an absolute target, forward
@@ -781,11 +865,13 @@ no worker pool:
 ```
 libhttp
   reactor     { Reactor, ReactorHandle, Session, Step, Io, Op, Event,
-                SocketId, ListenerId, OpId, ReactorConfig, Backend }
+                SocketId, ListenerId, FileId, PipeId, OpId, BufClass, WriteMode,
+                ReactorConfig, Backend }
   buffer      { Buf, BufMut, WriteBufs, Pool, PoolHandle }
   message     { Method, StatusCode, Version, HeaderName, HeaderValue, Header, Headers,
                 RequestHead, RequestTarget, Body, BodyLength }
   codec       { HeaderCodec, Decode, FieldSection, FieldBlock }   // h2/h3 shared
+  flow        { Credit, Window, WindowError }                     // h1/h2/h3 shared
   h1          { Engine, Event, ResponseWriter, Config }
   h2          { Engine, Event, Events, StreamId, DataChunk, Responder,
                 ResponseWriter, DataStream, ErrorCode, Config }
@@ -793,7 +879,7 @@ libhttp
   server      { Server, ServerHandle, Handler, Request, Response, ServerConfig, Shutdown }
   client      { Client, ClientConfig, Request, Response, BodyStream,
                 RequestBodyWriter, PendingResponse }
-  worker      { WorkerPool, BoundedQueue }
+  worker      { WorkerPool, WorkerTopology, BoundedQueue }
   error       { Error, ProtocolError, ConnectionError, StreamError, Limit, Timeout }
 ```
 
@@ -805,32 +891,41 @@ epoll, macOS/BSD kqueue, Windows IOCP.
 
 Targets, measured and published:
 
-- 10k idle connections of any protocol per reactor thread: slab slot + timer + socket +
-  one 4 KiB read buffer (≈ 40 MiB of pooled data), no thread, no readiness rearm.
-- Linux: io_uring path; one submission/completion per data operation, batched;
-  no readiness rearm. Epoll fallback measured separately.
-- Windows: IOCP overlapped operations; no readiness emulation on the primary path.
+- 10k idle connections of any protocol per reactor thread: slab slot + timer + socket,
+  no thread. On the io_uring fast path no per-connection data buffer is held (provided
+  buffers are consumed only when data arrives); the portable path holds one 4 KiB read
+  buffer per idle connection (≈ 40 MiB of pooled data for 10k).
+- Linux fast path: multishot receive with provided buffers, `SEND_ZC` for large
+  zero-copy writes, `SENDFILE`/`SPLICE` for plaintext files and relay, and one batched
+  `io_uring_enter` per loop iteration. Portable fallback: one submission/completion per
+  data operation, measured separately. The fast path must beat the portable path on the
+  published benchmark or it is not enabled by default.
+- Windows: IOCP overlapped operations; native completions, no readiness emulation.
 - macOS/BSD: kqueue with completion emulation; measured honestly.
-- HTTP/1.1 low-level request: one `Read` completion, one `Write` completion, plus
-  amortized submission; no intermediate copy of body bytes.
+- HTTP/1.1 low-level request: on the fast path a multishot read can deliver several
+  buffers per arm; a write is one `WriteBufs` chain, one `WRITEV`/`SEND_ZC`; no
+  intermediate copy of body bytes.
 - HTTP/1.1 worker path: zero-copy body `Buf`s to the worker; response bytes copied once
-  into a pooled `Buf`; header arena from a pool; no per-request heap allocation for
-  heads, arenas, or queues after warm-up (the per-buffer refcount header is counted and
-  measured separately).
+  into a pooled `Buf`; header arena from a pool; no per-request heap allocation on the
+  unique-owner path after warm-up. Shared-buffer transitions and their refcount are
+  counted separately.
 - HTTP/2: zero-copy DATA `Buf` slices; stream credit released on consumption;
   connection credit against a bounded aggregate buffer; no unbounded write queue.
 - HTTP/3: one copy from quinn's chunk to `Buf` at the adapter; zero-copy thereafter;
   QUIC flow control is the backpressure.
-- Copies: kernel→`Buf`, `Buf`→kernel; TLS adds its boundary copies; HTTP/1.1 headers one
-  bounded copy into the arena; h2/h3 headers decoded once.
+- Copies: kernel→`Buf`, `Buf`→kernel; `SEND_ZC`/`SENDFILE`/`SPLICE` remove the outbound
+  user copy for their cases; TLS adds its boundary copies; HTTP/1.1 headers one bounded
+  copy into the arena; h2/h3 headers decoded once.
 - Linux performance gate, measured on a fixed host with the CPU model, kernel, rustc,
   and hyper version recorded: 1 KiB responses, keep-alive, concurrency 64 and 512, 30 s
   runs. Throughput at least 90% of hyper (tokio multi-thread, same cores), p50 at most
   1.10×, p99 at most 1.25×. Missing the gate is a release blocker that triggers profiling
-  of the worker handoff and buffer path; it is not deferred to the end. Windows/macOS
-  numbers are published separately, not extrapolated, and are report-only in v1.
-- 10k idle connections: ≤ 100 MiB resident excluding kernel socket memory (≈ 40 MiB of
-  pooled 4 KiB read buffers plus slab/timers), measured.
+  of the worker handoff, buffer path, and fast-path submission; it is not deferred to the
+  end. Windows/macOS numbers are published separately, not extrapolated, and are
+  report-only in v1.
+- 10k idle connections: ≤ 100 MiB resident excluding kernel socket memory (fast path
+  holds no per-connection data buffer; portable path ≈ 40 MiB of pooled 4 KiB reads plus
+  slab/timers), measured.
 
 Harness: `criterion` for parsers, buffers, HPACK/QPACK, and codec microbenchmarks;
 `oha`/`wrk2` for end-to-end; `strace -c`/ETW for syscalls; a counting allocator; `perf`;
@@ -859,7 +954,7 @@ stood up in M1 and wired into the M3/M5 acceptance gates, not left for the end.
   | header count | 100 |
   | body (server, optional) | 2 MiB |
   | chunk size | 16 KiB |
-  | read buffer | 16 KiB class (8/16/32/64 available) |
+  | read buffer | 4 KiB idle (portable), 16 KiB default; classes 4/16/32/64 KiB |
   | write buffer | 32 KiB |
   | HTTP/2 frame | 16 KiB |
   | HTTP/2 concurrent streams | 100 |
@@ -872,11 +967,12 @@ stood up in M1 and wired into the M3/M5 acceptance gates, not left for the end.
   | HTTP/3 concurrent streams | 100 |
   | timeouts (header/body/idle/write) | 10s / 30s / 60s / 30s |
 
-- Unsafe is confined to the OS backends, the buffer read-into-spare path, and the QUIC
-  adapter; all documented with safety comments. `unsafe_op_in_unsafe_fn` denied,
-  `missing_docs` warned.
-- io_uring is probed, never assumed; if it is unavailable or disabled, the epoll backend
-  runs and reports that choice.
+- Unsafe is confined to the OS backends, the buffer read-into-spare and unique/shared
+  refcount transition, and the QUIC adapter; all documented with safety comments.
+  `unsafe_op_in_unsafe_fn` denied, `missing_docs` warned.
+- io_uring is probed, never assumed; the fast-path features are probed individually and
+  fall back operation by operation; if io_uring is unavailable or disabled, the epoll
+  backend runs and reports that choice.
 - No global mutable state; threads exist only as configured reactors, workers, and the
   client driver. No logging by default; counters exposed as a snapshot.
 
@@ -892,6 +988,7 @@ src/
   buffer/     Buf, BufMut, WriteBufs, Pool
   message/    typed heads, headers, targets
   codec/      hpack, qpack, HeaderCodec
+  flow/       Credit, Window
   h1/ h2/ h3/ engines and events
   server/ client/ worker/
 ```
@@ -899,7 +996,9 @@ src/
 Dependencies:
 
 - `libc` (Unix), `windows-sys` (Windows): OS surface.
-- `io-uring`: Linux SQ/CQ; hand-rolling it would be worse code.
+- `io-uring`: Linux SQ/CQ; hand-rolling it would be worse code. A thin in-crate layer
+  fills the gaps the crate leaves (zero-copy notification matching, provided-buffer
+  re-registration) without forking the crate.
 - `rustls` + platform verifier: TLS for HTTP/1.1 and HTTP/2; QUIC uses rustls through
   quinn-proto.
 - `quinn-proto` (feature `h3`): QUIC transport; HTTP/3 framing and QPACK are ours.
@@ -914,30 +1013,36 @@ philosophy, limits, guarantees, platform matrix, and measured numbers.
 ## 12. Milestones
 
 **M0 — Scaffold and buffers.** Crate, cross-platform CI (Linux, macOS, Windows),
-`Buf`/`BufMut`/`WriteBufs`/`Pool`, Miri and fuzz tests, benches, license.
+`Buf`/`BufMut`/`WriteBufs`/`Pool` with the unique fast path and shard-local returns,
+Miri and fuzz tests, benches, license.
 
 **M1 — Completion driver and Linux reactor.** `Op`/`Event`/`Io`/`Session`, io_uring
-backend, epoll fallback, timer heap, wake, accept/connect/read/write/datagrams, close
-and cancel draining, 10k idle connection test, forced-backend tests, and the
-comparative benchmark harness.
+portable path, epoll fallback, timer heap, wake, accept/connect/read/write/datagrams,
+close and cancel draining, 10k idle connection test, forced-backend tests, the
+comparative harness, and the provided-buffer/multishot skeleton exercised by an echo
+session.
 
 **M2 — HTTP/1.1 engine.** Sans-io parser/serializer over `Buf`, events, framing rules,
 limits, chunked, trailers, 100-continue, upgrade/CONNECT detach, fuzz; in-memory tests.
 
 **M3 — HTTP/1.1 server and client.** Worker pool, body/response queues, dispatch,
-backpressure, timeouts, graceful shutdown, client pool and streaming. Acceptance:
-curl/nginx interop, 10k idle, zero allocations per request after warm-up, slow-header
-and slow-body tests, and the Linux performance gate.
+backpressure, credit, timeouts, graceful shutdown, client pool and streaming.
+Acceptance: curl/nginx interop, 10k idle, zero allocations per request after warm-up,
+slow-header and slow-body tests, and the Linux performance gate.
 
-**M4 — HTTP/2 engine.** Frames across buffers, stream states, HPACK, flow control,
-settings, errors; in-memory tests.
+**M4 — io_uring fast path.** Multishot recv with provided buffers and multishot accept
+in production use; `SEND_ZC` with notification CQEs; `SENDFILE`/`SPLICE` for plaintext
+files and relay; `SQPOLL` opt-in behind a benchmark gate; fallback to the portable path
+on any unsupported operation. Acceptance: fast-path and portable-path parity tests, the
+fast path beats the portable path on the published benchmarks, and no buffer is reused
+before its notification.
 
-**M5 — HTTP/2 server/client and proxy.** Per-stream jobs, responder channels, credit,
+**M5 — HTTP/2 engine.** Frames across buffers, stream states, HPACK, the shared
+credit/window core, settings, errors; in-memory tests.
+
+**M6 — HTTP/2 server/client and proxy.** Per-stream jobs, responder channels, credit,
 shutdown, h2c prior knowledge and H1/H2 `Both` sniffing; plain h2 CONNECT; h2spec/h2load;
 proxy h1↔h1/h1↔h2/h2↔h2 with CONNECT; performance gate repeated under h2.
-
-**M6 — macOS/BSD and Windows backends.** kqueue and IOCP drivers, socket differences,
-cross-platform end-to-end tests, platform benchmarks.
 
 **M7 — TLS.** rustls for HTTP/1.1 and HTTP/2, ALPN, certificate config, `close_notify`,
 TLS benchmarks.
@@ -945,20 +1050,29 @@ TLS benchmarks.
 **M8 — HTTP/3.** quinn-proto integration, QPACK, h3 framing, endpoint, server/client,
 interop, benchmarks; h3 proxy.
 
+**M9 — macOS/BSD and Windows backends, hardening.** kqueue and IOCP drivers, socket
+differences, cross-platform end-to-end tests, platform benchmarks, h3 proxy parity, and
+the final performance report.
+
 **H0 — QUIC/h3 spike (parallel from M1).** Drive quinn-proto from our datagram
 completions on loopback, prototype QPACK static-table decode and h3 frames, verify the
 `Buf` boundary and timer integration.
 
 ## 13. What is left to the builder
 
-- `Buf` pool internals, size classes, refcount/allocator strategy, and free-list
-  contention tuning.
-- io_uring submission batching, multishot accept, and registered files; the one-read/
-  one-write-per-socket contract stays fixed in v1 (no multishot recv or provided-buffer
-  rings). Epoll emulation details; kqueue/IOCP specifics; close/cancel/drain mechanics.
-- `WriteBufs` chain limits and the partial-write resubmission policy.
+- `Buf` pool internals, size classes, the unique/shared refcount state machine,
+  shard-local return queues, and the provided-buffer slot mapping.
+- io_uring fast path: multishot recv/accept, provided-buffer ring sizing and
+  re-registration, `SEND_ZC` notification lifetimes, `SENDFILE`/`SPLICE` fallbacks,
+  `SQPOLL` gating, and batch sizing; the portable one-op path remains the correctness
+  fallback. Epoll/kqueue/IOCP specifics and close/cancel/drain mechanics.
+- The shared `Window`/`Credit` core: h1 queue-capacity mapping, h2 stream/connection
+  composition, h3 QUIC-capacity bridging, and wakeup batching.
+- `WriteBufs` chain limits and the partial-write, zero-copy, and file-send resubmission
+  policies.
 - Queue/channel implementation (preallocated), wake batching, credit thresholds.
-- Worker pool sizing and dispatch policies.
+- Worker topology: shared pool versus per-shard pools with affinity; pool sizing and
+  dispatch policies.
 - Header intern set and index layout; HPACK/QPACK encoder strategies.
 - QUIC adapter scope, quinn-proto version, h3 configuration; measure the h3 boundary
   copy, and do not fork quinn-proto in v1.
@@ -972,9 +1086,10 @@ completions on loopback, prototype QPACK static-table decode and h3 frames, veri
    and IOCP; no mio.
 3. No blocking socket I/O, no thread-per-connection, no async.
 4. The driver owns sockets; a session can own several sockets; engines are sans-io.
-5. `Buf`/`BufMut` are our pooled refcounted buffers; no `bytes` types in our public API
-   or buffer core, no `libringbuf`. Ring buffers are the slower shape for completion
-   I/O.
+5. `Buf`/`BufMut` are our pooled buffers with a unique-ownership fast path (no atomics
+   or refcount allocation until a block is actually shared) and shard-local deferred
+   returns; no `bytes` types in our public API or buffer core, no `libringbuf`. Ring
+   buffers are the slower shape for completion I/O.
 6. QUIC transport is `quinn-proto`; h3 framing/QPACK ours; its internal `bytes` stays
    behind the adapter.
 7. `HeaderCodec` is the one new abstraction that exists for h3 and pays immediately.
@@ -991,23 +1106,39 @@ completions on loopback, prototype QPACK static-table decode and h3 frames, veri
 15. All major platforms are first-class: Linux, macOS/BSD, Windows, with cross-platform
     CI from M0.
 16. Writes take a `WriteBufs` chain and use `WRITEV`/`WSASend`/`writev`; frame headers
-    and payloads are one vectored write, so forwarded DATA stays zero-copy.
-17. Close is deferred: pending buffers return through their completions, `Closed`
-    marks completion, and `OpId`s are reusable only after completion.
+    and payloads are one vectored write, so forwarded DATA stays zero-copy. `SEND_ZC`,
+    `SENDFILE`, and `SPLICE` extend this path without a userspace copy.
+17. Close is deferred: pending buffers return through their completions, provided-buffer
+    slots and zero-copy notifications are accounted for, `Closed` marks completion, and
+    `OpId`s are reusable only after completion.
 18. `Session::sockets()` declares ownership at registration; a connected socket is
     mapped to the submitting session when it completes.
 19. Worker body reads carry the body deadline and return a typed timeout; a slowloris
     can pin a worker for at most that deadline, bounded further by per-IP limits.
-20. One read and one write per stream socket is a fixed contract in v1; no multishot
-    recv or provided-buffer rings.
+20. The io_uring fast path uses multishot recv with provided buffers, multishot accept,
+    `SEND_ZC`, and `SENDFILE`/`SPLICE`, and may deliver multiple read completions per
+    arm; the portable path keeps one read/write per stream socket. Both are first-class
+    in v1, with the portable path as the correctness fallback.
 21. QPACK blocked sections are owned and retained by the codec, bounded by the blocked-
     stream setting; `Decode::Blocked` plus `resume` is the API.
 22. A plaintext listener can serve `H1`, `H2PriorKnown`, or `Both`; `Both` sniffs the
     24-byte preface from buffered `Buf`s. HTTP/2 CONNECT is plain CONNECT, not RFC 8441.
 23. The Linux performance gate is explicit: ≥90% of hyper throughput, p50 ≤1.10×,
-    p99 ≤1.25× for 1 KiB responses at concurrency 64/512 on a fixed host.
+    p99 ≤1.25× for 1 KiB responses at concurrency 64/512 on a fixed host. The io_uring
+    fast path must beat the portable path on the published benchmark or it is not the
+    default.
 24. Headers are concrete types (`HeaderName`, `HeaderValue`, `Header`, `Headers`); no
     per-field trait object. Traits remain at the codec/session/handler boundaries.
 25. No fork of `quinn-proto` in v1; the h3 boundary copy is measured. `bytes` trait
     definitions may be used if interop demands, but its buffer implementations stay out
     of our core.
+26. Flow control is one `Credit`/`Window` core: h2 composes stream+connection windows,
+    h3 bridges QUIC capacity, h1 maps send-queue capacity; `Response::write` blocks on
+    the same path for every protocol.
+27. Worker topology is configurable: shared pool (default, for blocking handlers) or
+    per-shard pools with affinity; the benchmark decides.
+28. TLS and HTTP/3 are moved ahead of the macOS/Windows backends: TLS M7, h3 M8,
+    platform backends and final hardening M9.
+29. io_uring fast paths are in v1, not deferred: multishot recv/provided buffers,
+    multishot accept, `SEND_ZC`, `SENDFILE`/`SPLICE`, with a portable fallback and a
+    benchmark gate before enabling the fast path by default.
