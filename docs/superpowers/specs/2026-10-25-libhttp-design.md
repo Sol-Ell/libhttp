@@ -106,7 +106,9 @@ Dependencies must earn their place on measured value:
 - A thread per connection, however simple.
 - Readiness where completion is available and faster.
 - A dependency that does not buy measured performance, portability, or correctness.
-- A trait object on the per-header or per-byte path.
+- A trait object per field or per byte where a concrete type, or one block-level call,
+  would do. Headers are concrete types; traits are welcome at boundaries (reactor
+  session, codec, handler), not per-field dispatch.
 - An abstraction added only for a protocol that is not implemented yet. HTTP/3 is in
   scope now, so abstractions that pay for it (completion I/O, `Buf`, `HeaderCodec`) are
   in scope too.
@@ -213,6 +215,16 @@ BoringSSL (a second TLS stack next to rustls) and a cmake/NASM build, and its h3
 would tempt delegation of the part we want to own. Hand-written QUIC is a separate
 project, not a milestone. `quinn-proto`'s internal use of `bytes` is isolated in the h3
 adapter; our public API and our buffers never expose it.
+
+Forking `quinn-proto` to replace `Bytes`/`BytesMut` with our `Buf` is rejected for v1.
+Its buffer types are used in packet assembly, retransmission, and stream reassembly;
+replacing them means maintaining a fork of a large, security-sensitive protocol stack
+and reimplementing the `Buf`/`BufMut` semantics it relies on. The boundary copy is one
+`memcpy` per received h3 chunk, measured against QUIC crypto and packet processing. If
+it shows up in profiles, the order is: optimize the adapter's pooled copy, propose a
+generic buffer boundary upstream, and fork only as a last resort with a measured win.
+`bytes` trait definitions may be used if an interop need appears; its `Bytes`/`BytesMut`
+implementations stay out of our core.
 
 ## 7. Architecture
 
@@ -449,9 +461,18 @@ Copies and lifetimes:
 
 - `HeaderName<'a>`: `Known(HeaderId)` for the standard set plus common extension names,
   `Custom(&'a [u8])` otherwise; comparison by ID, then case-insensitive bytes.
-- `Headers`: ordered field lines preserved exactly, duplicates included, with a
-  case-insensitive lookup index (default 32 inline slots). Nothing is merged into a
-  map; `Set-Cookie` is never combined.
+- `HeaderValue<'a>`: a newtype over the field-value bytes, with `as_bytes`, `Deref`, and
+  typed accessors where the field has a defined grammar (`content_length()`,
+  `content_type()`, ...). Field values are octets, not `str`; no UTF-8 validation.
+- `Header<'a> { name: HeaderName<'a>, value: HeaderValue<'a> }` and `Headers`: ordered
+  field lines preserved exactly, duplicates included, with a case-insensitive lookup
+  index (default 32 inline slots). Nothing is merged into a map; `Set-Cookie` is never
+  combined.
+- Headers are types, not trait objects. `HeaderName`, `HeaderValue`, `Header`, and
+  `Headers` are concrete; there is no `Box<dyn Header>`. A trait would have no
+  behavioral variation to dispatch to, and per-field dispatch would cost more than the
+  lookup. Traits appear at the field-section/codec boundary (`HeaderCodec`, one call per
+  block) and at the reactor handler boundary, where they buy something.
 - `Method`, `StatusCode`, `Version`, `RequestTarget<'a>` as before.
 - `BodyLength { None, Fixed(u64), Chunked, UntilClose, Tunnel }` for HTTP/1.1;
   trailers are a separate end-of-body field set, never merged.
@@ -498,7 +519,9 @@ pub trait HeaderCodec {
   instructions, blocked-stream limits, Huffman. The h3 engine feeds control-stream bytes
   to `control` and drains `take_control_output` into QUIC unidirectional streams.
 - One call per field block, not per field. The field model and arena are shared; the
-  wire format and table state are not.
+  wire format and table state are not. An engine may hold its codec as
+  `Box<dyn HeaderCodec>` or as a concrete type; either way the dynamic dispatch is per
+  block, not per header.
 - A discarded block is still decoded to keep the table in sync, or the connection
   closes.
 
@@ -760,7 +783,7 @@ libhttp
   reactor     { Reactor, ReactorHandle, Session, Step, Io, Op, Event,
                 SocketId, ListenerId, OpId, ReactorConfig, Backend }
   buffer      { Buf, BufMut, WriteBufs, Pool, PoolHandle }
-  message     { Method, StatusCode, Version, HeaderName, Header, Headers,
+  message     { Method, StatusCode, Version, HeaderName, HeaderValue, Header, Headers,
                 RequestHead, RequestTarget, Body, BodyLength }
   codec       { HeaderCodec, Decode, FieldSection, FieldBlock }   // h2/h3 shared
   h1          { Engine, Event, ResponseWriter, Config }
@@ -937,7 +960,8 @@ completions on loopback, prototype QPACK static-table decode and h3 frames, veri
 - Queue/channel implementation (preallocated), wake batching, credit thresholds.
 - Worker pool sizing and dispatch policies.
 - Header intern set and index layout; HPACK/QPACK encoder strategies.
-- QUIC adapter scope, quinn-proto version, h3 configuration.
+- QUIC adapter scope, quinn-proto version, h3 configuration; measure the h3 boundary
+  copy, and do not fork quinn-proto in v1.
 - TLS adapter details (cert loading, ALPN failure policy).
 - Test corpus curation, h2spec/h2load/quic-interop invocations, platform CI matrix.
 
@@ -982,3 +1006,8 @@ completions on loopback, prototype QPACK static-table decode and h3 frames, veri
     24-byte preface from buffered `Buf`s. HTTP/2 CONNECT is plain CONNECT, not RFC 8441.
 23. The Linux performance gate is explicit: ≥90% of hyper throughput, p50 ≤1.10×,
     p99 ≤1.25× for 1 KiB responses at concurrency 64/512 on a fixed host.
+24. Headers are concrete types (`HeaderName`, `HeaderValue`, `Header`, `Headers`); no
+    per-field trait object. Traits remain at the codec/session/handler boundaries.
+25. No fork of `quinn-proto` in v1; the h3 boundary copy is measured. `bytes` trait
+    definitions may be used if interop demands, but its buffer implementations stay out
+    of our core.
