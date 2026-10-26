@@ -80,8 +80,8 @@ Dependencies point down only. The transport does not know what HTTP is; protocol
 | `2026-10-26-libhttp-conn-design.md` | `Conn` envelope, typed model, event vocabulary, send API, protocol selection, `finish`/`Drained`, `tick`/`arm` | written, for verification |
 | `2026-10-26-libhttp-tls-design.md` | rustls config, ALPN, `close_notify`, buffer limits, copy cost | written, for verification |
 | `2026-10-26-libhttp-dispatch-design.md` | workers, queues, caps, deadlines, cancellation, wakes | written, for verification |
-| `libhttp-h1-design` | parser, serializer, framing, smuggling, pipelines, tunnels | pending |
-| `libhttp-h2-design` | frames, HPACK, flow control, streams, settings | pending |
+| `libhttp-h1-design` | parser, serializer, framing, smuggling, pipelines, tunnels | written, for verification |
+| `libhttp-h2-design` | frames, HPACK, flow control, streams, settings | written, for verification |
 | `libhttp-h3-design` | QUIC boundary, framing, QPACK, endpoint demux | pending |
 | `libhttp-proxy-design` | the relay, and the proof the public API is sufficient | pending |
 
