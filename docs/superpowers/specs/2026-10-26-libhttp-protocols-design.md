@@ -115,10 +115,11 @@ Smuggling defenses (all are errors, not "best effort"):
 The client parser enforces the same framing rules for responses: status line, header validation,
 1xx interception (`100` ignored after body send; `103` ignored), chunked decoding, trailers,
 `Content-Length` mismatch → error, no body for `HEAD`/`204`/`304`, and no `101`/CONNECT. Request
-serialization uses `Content-Length` for buffered bodies and chunked for `send_with` streaming.
+serialization uses `Content-Length` for buffered bodies and chunked for streaming bodies
+(`start_streaming`/`send_with`).
 
-**Typed headers.** The client parses the raw response head, then decodes typed headers on the calling
-thread before returning `ClientResponse`; `ClientBuilder::register_header::<T>()` registers application
+**Typed headers.** The client parses the raw response head, then decodes typed headers on the
+`ClientCall::wait`/`try_wait` thread or the `on_complete` executor thread before returning `ClientResponse`; `ClientBuilder::register_header::<T>()` registers application
 types. Unknown fields stay raw. The same `Header`/`HeaderRef`/`HeaderValue` contracts as the server
 apply.
 
@@ -179,7 +180,9 @@ and framed by the reactor, exactly like a handler-produced response.
 ### 3.4 Server and client behavior
 
 - Client: `SETTINGS_ENABLE_PUSH = 0`, our `SETTINGS_MAX_CONCURRENT_STREAMS` is the configured value;
-  the peer's limit is respected; one connection per authority (no certificate-based coalescing).
+  the peer's limit is respected; up to `PoolConfig::max_h2_connections_per_host` connections per
+  authority, opened only when the existing connections are at their stream limit; no
+  certificate-based coalescing.
 - Server: no push, no priority scheduling, extended CONNECT rejected, `MAX_CONCURRENT_STREAMS`
   advertised as configured; streams over the cap are refused, not queued.
 - HTTP/2 and HTTP/3 requests carry `:authority`, not necessarily `Host`.
@@ -190,8 +193,8 @@ and framed by the reactor, exactly like a handler-produced response.
   final HEADERS with `END_STREAM`, no pseudo-headers.
 - Unread request body: after the response, reset the stream (`RST_STREAM(CANCEL)`, h3
   `RESET_STREAM`/`STOP_SENDING`) immediately and keep the connection; no drain is attempted.
-- Client response bodies: stream DATA is pulled by the worker; dropping a response before EOF resets
-  the stream.
+- Client response bodies: stream DATA is pulled by the caller (`wait`/`try_wait`) or the
+  `on_complete` executor thread; dropping a response before EOF resets the stream.
 - 1xx: `100` interim responses are allowed before the final response; the client core consumes them
   (and sends its body after the first `100` only when it chose to wait, which v1 does not) and never
   exposes a 1xx as a `ClientResponse`. There is exactly one final response.
@@ -264,8 +267,9 @@ against a pinned quiche h3 server on the same host.
 ### 4.4 Client
 
 HTTPS requests use HTTP/3 only when `ClientBuilder::http3(true)` is set and the `http3` feature is
-compiled; there is no Alt-Svc lookup, no Happy Eyeballs, no 0-RTT and no fallback. Plaintext never
-uses h3. One QUIC connection per authority, multiplexed up to our advertised stream limit. Dropping a
+compiled; there is no Alt-Svc lookup, no 0-RTT and no TCP fallback. Plaintext never uses h3. Up to
+`PoolConfig::max_h3_connections_per_host` QUIC connections per authority, each multiplexed up to the
+peer's advertised stream limit; address selection uses the client's Happy Eyeballs policy. Dropping a
 response resets its stream; the connection stays.
 
 ---

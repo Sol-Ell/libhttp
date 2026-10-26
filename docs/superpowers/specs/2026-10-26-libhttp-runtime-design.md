@@ -177,8 +177,8 @@ per frame. Inside the reactor, the parser and engine use the unique-owner path w
 ### 4.2 Head storage and `HeaderMap`
 
 The reactor parses and validates the raw head (framing fields, name/value syntax, limits). Typed
-header decoding runs **when the exchange is handed to the handler or caller**, on the worker or
-calling thread, not on the reactor; a queued exchange therefore holds only its raw head. This keeps
+header decoding runs **when the exchange is handed to the handler or caller**, on the worker, the
+`ClientCall::wait`/`try_wait` thread, or the `on_complete` executor thread, not on the reactor; a queued exchange therefore holds only its raw head. This keeps
 the reactor's work bounded and keeps typed-header allocation off the I/O path.
 
 `Request`/`ClientResponse` own one refcounted head block plus a `HeaderMap`. The map is an ordered
@@ -321,9 +321,10 @@ the exchange under its lock, wakes the worker, and the worker returns that outco
 invents a timeout for an exchange the reactor still considers live; there is no second timer
 authority and no race at the deadline instant.
 
-The one exception is the client's wait for a pool slot, which has no reactor-owned exchange yet: the
-caller waits on the pool queue with `PoolConfig::queue_timeout` (caller-owned). Once an exchange
-exists, the reactor owns its deadlines again.
+The client call queue is reactor-owned too: `Client::start` enqueues a `ClientCall` and
+`PoolConfig::queue_timeout` is a normal reactor deadline. `ClientCall::wait` is a caller-owned wait
+with an optional `wait_timeout`; it does not own connection deadlines. Once a call is matched to a
+connection, the reactor owns its deadlines.
 
 Timer resolution is the backend's: millisecond on epoll/IOCP, kernel-tick on kqueue. Sub-millisecond
 precision is not promised. QUIC's 1 ms timer granularity is respected but not exceeded.

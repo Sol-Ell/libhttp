@@ -78,7 +78,7 @@ benchmark harness rather than into the type system.
 - Reverse proxy; public low-level API (driver/session/completion/socket-table types).
 - CONNECT tunnels, `101 Switching Protocols`, WebSocket/Upgrade, extended CONNECT (RFC 8441).
 - HTTP/2 push and priority; HTTP/3 push and HTTP datagrams.
-- HTTP/3 0-RTT, connection migration, Alt-Svc, Happy Eyeballs.
+- HTTP/3 0-RTT, connection migration, Alt-Svc. Happy Eyeballs is in the client's scope.
 - A file-bodied-response API (`Response::file`); handlers stream files themselves.
 - io_uring, multishot recv/accept, provided buffers, `SEND_ZC`, `sendfile`/`splice`,
   `MSG_ZEROCOPY`, Windows RIO/IoRing, kTLS, large-pages tuning.
@@ -191,7 +191,7 @@ are builder discretion; signatures and semantics are the contract.
 |---|---|
 | `libhttp` | `Method`, `StatusCode`, `Version`, `HeaderName`, `HeaderValue`, `HeaderRef`, `HeaderMap`, `Header`, `HeaderError`, `Timeouts`, `Target`, `Uri`, `header`, `Error`, `TimeoutKind`, `ProtocolError`, `ProtocolErrorKind`, `TlsError` |
 | `libhttp::server` | `Server`, `ServerBuilder`, `ServerHandle`, `Handler`, `Request`, `Response`, `DeferredRequest`, `DeferredResponse`, `BodyReader`, `BodyWriter`, `BodyChunk`, `Limits`, `Stats`, and a `Timeouts` re-export |
-| `libhttp::client` | `Client`, `ClientBuilder`, `ClientRequest`, `ClientResponse`, `PoolConfig`; uses the root `Timeouts` |
+| `libhttp::client` | `Client`, `ClientBuilder`, `ClientHandle`, `ClientCall`, `CancelHandle`, `Executor`, `ClientRequest`, `ClientResponse`, `ClientStats`, `PoolConfig`; uses the root `Timeouts` |
 | `libhttp::tls` | `TlsServerConfig`, `TlsClientConfig` (PEM/roots/ALPN/client-auth); rustls types stay internal in v1 |
 
 ### 6.2 Server and handler
@@ -563,7 +563,7 @@ pub enum Error {
 }
 pub enum TimeoutKind {
     Connect, TlsHandshake, HeaderRead, BodyIdle, ReadStall, WriteStall, KeepAlive, PoolQueue,
-    Total, Deferred,
+    Total, Deferred, Wait,
 }
 pub struct ProtocolError;   // version() + kind(); stable classification, not a wire dump
 pub enum ProtocolErrorKind { MalformedMessage, Framing, HeaderCompression, FlowControl,
@@ -577,28 +577,41 @@ an invalid outgoing value to `500`/reset. Application `decode`/`encode` implemen
 library boundaries under `catch_unwind`: a panic in either is a `400` on input and a `500`/reset on
 output, never a dead worker or reactor. On a deferred application thread the library cannot catch an
 application `encode` panic; that thread unwinds, drops its handles, and the deferred drop rule applies
-(`500` if possible, otherwise reset/close). No `Box<dyn Error>` on the request path. `Overloaded` means the client pool queue is full, or no parking/write capacity is
+(`500` if possible, otherwise reset/close). No `Box<dyn Error>` on the request path. `Overloaded` means the client call queue is full, or no parking/write capacity is
 available under the worker or per-connection caps. `on_error(Arc<dyn Fn(&Error) + Send + Sync>)` on the server/client builders observes
 reactor-level errors (protocol, timeout, reset); handler return values are the handler's own to log.
-The hook runs on the observing thread and must not block. `Stats` is a cheap relaxed-atomic snapshot
+The hook runs on the observing thread and must not block or call `shutdown`/`shutdown_with_deadline`
+(it would self-join the reactor). `Stats` is a cheap relaxed-atomic snapshot
 (connections, requests, failures, timeouts, resets, overflows, detached exchanges, queue depths,
 bytes); there is no
 public per-operation cost API.
 
 ### 6.6 Client (summary)
 
-`Client` is `Clone + Send + Sync`, owns its reactors and pool, and blocks the caller per request.
-`send` takes a buffered body; `send_with` streams one. Protocol selection is explicit: `http1`,
-`http2`, `h2c` (prior knowledge), `http3` (opt-in, no Alt-Svc/fallback). Pool key is
-`(scheme, host, port, ALPN)`; no certificate coalescing. Requests and responses use typed headers
-through the same `Header` trait (`ClientRequest::set(ContentType::json())`,
+`Client` is `Clone + Send + Sync` and owns its reactors, resolver threads and pool. It has two
+surfaces: `start`/`start_streaming` return a `ClientCall` without blocking on DNS, connect, pool
+capacity or stream capacity; `send`/`send_with` are the blocking convenience wrappers
+(`start(...).wait()`). `ClientCall` supports `wait`, `try_wait`, `wait_timeout`, `cancel_handle`,
+`body` for streaming upload, and `on_complete(Arc<dyn Executor>, callback)`; the executor is supplied by
+the application and is the only place a completion callback runs. There is no async runtime, no
+`Future`/`Waker`, and no library-owned executor. `ClientHandle` provides `shutdown`,
+`shutdown_with_deadline` and `stats`; calls hold the client alive, and the last handle joins the
+reactors (resolver threads detach at shutdown).
+
+Protocol selection is explicit: `http1`, `http2`, `h2c` (prior knowledge), `http3` (opt-in, no
+Alt-Svc/fallback). Pool key is `(scheme, host, port, ALPN)`; no certificate coalescing. h1 opens up
+to 8 connections per host, h2/h3 up to 2, then queues; the pool is capped at 1,024 connections
+and 256 idle globally, in-flight calls at 4,096, buffered queued-body bytes at 64 MiB, and the call
+queue at 1,024. A 9/9 review pass fixed the Arc executor, DNS-cancel, refcounted-handle, atomic
+completion, resolver-mailbox and global-bound issues.
+`start` returns `Overloaded` only when the queue is full; a queued call times out with
+`Timeout(PoolQueue)`. DNS runs on bounded resolver threads with a 60 s cache and Happy Eyeballs
+(250 ms stagger), never on the caller or a reactor. One retry only for a reused connection, before
+response bytes, idempotent method, replayable body. Requests and responses use typed headers through
+the same `Header` trait (`ClientRequest::set(ContentType::json())`,
 `ClientResponse::headers().get::<ContentType>()`), with raw `header`/`header_value` for custom fields
-and `ClientBuilder::register_header::<T>()` for incoming extension types. `ClientBuilder::timeouts(Timeouts)` sets
-the client-side timeouts; header limits are the fixed protocol defaults, not configurable in v1.
-When no slot is free, the caller waits in a bounded queue: full queue → `Overloaded`,
-`queue_timeout` → `Timeout(PoolQueue)`. DNS resolution
-happens on the calling thread, not a reactor. One retry only for a reused connection, before response
-bytes, idempotent method, replayable body. No redirects, cookies, compression, or CONNECT. Full
+and `ClientBuilder::register_header::<T>()` for incoming extension types. Header limits are the fixed
+protocol defaults, not configurable in v1. No redirects, cookies, compression, or CONNECT. Full
 contract in the [client design](2026-10-26-libhttp-client-design.md).
 
 ### 6.7 TLS configuration
@@ -860,3 +873,20 @@ and the performance gates (§8).
   scope; rewrote h3 accounting as pull-limiting; scoped limit reactions by protocol; defined early
   final responses; replaced the global-cap stall with a low-water reset; made FreeBSD a CI gate; and
   fixed the remaining cross-reference, feature-guard and dependency issues.
+
+- **2026-10-26 (fresh review closure):** verified 12/12 typed-header/deferred fixes and 6/6
+  cross-document consistency fixes. Hardened `Header` with `Send + Sync`; replaced stored
+  `HeaderRef` with spans over a map-owned head block; admitted the per-field drop/encode vtable and
+  narrowed `get_raw`/`iter_raw` to raw entries; charged typed-header arenas to the connection and
+  global caps; made defer's success transfer ownership; specified the server-wide atomic reservation,
+  `Canceled`, and refcounted post-`run` handles; unified deferred timeout as `Timeout(Deferred)` at
+  60 s; counted detached exchanges as open; enforced `MULTIPLE` on input and synthesised h2/h3
+  `Host`; replaced `const NAME` with `fn name()`; made `encode` fallible and caught codec panics;
+  moved `Timeouts` to the crate root.
+- **2026-10-26 (client rework):** replaced the blocking-only client with a two-surface design:
+  `start`/`start_streaming` + `ClientCall` (`wait`, `try_wait`, `wait_timeout`, `on_complete`,
+  `cancel_handle`, streaming `body`) plus `send`/`send_with` convenience wrappers. Added
+  `ClientHandle` shutdown/stats, `CancelHandle`, an explicit application `Executor` for completion
+  callbacks, `Timeout(Wait)`, bounded resolver threads with Happy Eyeballs, and configurable h1/h2/h3
+  connection caps (8/2/2). The call queue is 1,024 with a 30 s timeout; no async runtime,
+  `Future`/`Waker` or library-owned executor.
