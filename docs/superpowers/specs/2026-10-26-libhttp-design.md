@@ -77,6 +77,7 @@ Dependencies point down only. The transport does not know what HTTP is; protocol
 | Document | Owns | Status |
 |---|---|---|
 | `2026-10-26-libhttp-transport-design.md` | sockets, readiness, interest, timers, ids, datagrams, chunk pool, credit sinks, close/half-close | written, for verification |
+| `libhttp-conn-design` | `Conn`: `feed`/`feed_eof`/`poll`/`output`/`finish`/`Drained`, protocol selection, `tick`/`arm` | pending |
 | `libhttp-tls-design` | rustls integration, ALPN, `close_notify` | pending |
 | `libhttp-h1-design` | parser, serializer, framing, smuggling, pipelines, tunnels | pending |
 | `libhttp-h2-design` | frames, HPACK, flow control, streams, settings | pending |
@@ -112,16 +113,13 @@ Gate 3 (M3) is correctness-gated: interop against an independent implementation.
 
 ### Memory budget the gates report
 
-| State | Target | Dominant term |
-|---|---|---|
-| Idle h1, no partial head | ≤ 1 KiB | connection state; the transport retains no chunk |
-| Partial request head | one 17 KiB class chunk | a 16 KiB read lands in the second class |
-| Idle h2 | ≤ 12 KiB | two HPACK tables, 4 KiB each |
-| Idle h3 | ≤ 32 KiB, to be confirmed against configured quinn windows | transport loss-recovery and crypto state |
-| TLS | 48 KiB configured (16 + 16 + 16) | `received_plaintext` 16 KiB is outside `set_buffer_limit`; the two sendable buffers are 16 KiB each once configured, 64 KiB by default |
-| Chunk pool | ≤ 64 MiB per shard | at 8 shards this is 512 MiB and the largest single line item |
+Per-state targets live where the state is owned: the transport states the connection and pool rows (transport §7), `h2` will own the HPACK tables, `tls` the buffer limits, `h3` the transport state. The umbrella states only the totals the gate publishes, because a blended figure hides the largest term:
 
-At 10k connections: ~10 MiB (h1), ~120 MiB (h2), ~320 MiB (h3) before TLS; the TLS term is 480 MiB on top of whichever applies. The gate publishes TLS-on and TLS-off separately, because a blended figure hides the largest term.
+- 10k connections, TLS off: ~10 MiB (h1), ~120 MiB (h2), ~320 MiB (h3).
+- 10k connections, TLS on: add the configured TLS term (48 KiB each) to whichever applies.
+- Chunk pool: 64 MiB per shard, so 512 MiB at 8 shards — larger than either total, and reported separately.
+
+Each row is a target its owning document states and the gate reports; none is a claim about a measurement that has not happened.
 
 ---
 
@@ -163,7 +161,7 @@ This is the only open decision.
 
 ## 9. Risks
 
-**AFD.** The Windows backend depends on an internal NT interface. A startup self-test verifies semantics before use, the `WSAPoll`+`ConnectEx` fallback preserves correctness, and Gate 1's Windows entry is scoped to AFD-present with the fallback measured on its own terms. If AFD disappears, correctness holds and the Windows performance claim does not.
+**AFD.** The Windows backend depends on an internal NT interface. A startup self-test verifies semantics before use and selects the `WSAPoll`+`ConnectEx` fallback on any mismatch, so an AFD that is unavailable or wrong **at startup** costs performance, not correctness. The residual risk the fallback does not cover is a semantic change **after** startup: nothing detects that, and it would be a correctness failure. The Windows gate numbers are scoped to AFD-present for that reason, and §17's self-test is the only mitigation.
 
 **QPACK.** The dynamic table is deferred to M5 so that a compression bug cannot be confused with an interop bug between two QUIC stacks.
 
@@ -183,13 +181,13 @@ This is the only open decision.
 | # | Question | Answer |
 |---|---|---|
 | 1 | I/O model across platforms | Transport §4.1, §6 |
-| 2 | Arming, backpressure, close, drain | Transport §4.2, §4.3, §4.5 |
+| 2 | Arming, backpressure, close, drain | Transport §4.2, §4.4, §4.6; graceful drain is `conn` |
 | 3 | Buffer ownership and budget | Transport §5, §7 |
 | 4 | Worker model | `dispatch` |
 | 5 | Fast-path scope | Transport §6.3, §6 milestones M4 |
 | 6 | QUIC backend and budget | `h3` |
 | 7 | TLS integration and order | `tls`; M2 |
-| 8 | File bodies | M4; contract pending in `transport` §6.3 |
+| 8 | File bodies | M4; **no contract written yet** — file bodies are unsupported until one exists |
 | 9 | Half-close and tunnels | Transport §4.5; `proxy` |
 | 10 | Socket ownership | Transport §3, §4.8 |
 | 11 | Performance gate | §6 above |
