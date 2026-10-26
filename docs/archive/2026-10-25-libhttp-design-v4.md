@@ -1,6 +1,11 @@
-# libhttp — Design
+# libhttp — Design (SUPERSEDED)
 
-**Status:** draft for approval (revision 4). Nothing is implemented yet.
+> **Archived. Do not use this as the basis for the clean-room design.**
+> Revision 4 accumulated assumptions and has known fast-path, lifetime, and portability
+> flaws raised by fresh review. The new starting point is
+> `docs/superpowers/specs/2026-10-26-libhttp-requirements.md`.
+
+**Status:** archived / superseded. Nothing was implemented.
 **Date:** 2026-10-26.
 **Scope:** HTTP/1.1, HTTP/2, and HTTP/3 in one non-blocking, completion-driven Rust
 library for Linux, macOS/BSD, and Windows.
@@ -287,23 +292,22 @@ pub enum Op {
     Timeout { at: Instant, id: OpId },
 }
 
-pub enum Event {
-    Accepted { id: OpId, socket: SocketId, peer: SocketAddr },
+pub enum Completion {
+    Accepted { id: OpId, socket: SocketId, peer: SocketAddr, more: bool },
     Connected { id: OpId, socket: SocketId },
-    Read { id: OpId, buf: Buf },                // len is the received length
-    Written { id: OpId, bufs: WriteBufs, n: usize }, // normal write remainder
-    SendZcDone { id: OpId },                    // zero-copy buffers released
-    SendFileDone { id: OpId, n: u64 },
-    SpliceDone { id: OpId, n: usize },
-    Datagram { id: OpId, buf: Buf, from: SocketAddr },
+    Read { id: OpId, socket: SocketId, buf: Buf, more: bool }, // len = buf.len()
+    Written { id: OpId, socket: SocketId, bufs: WriteBufs, n: usize }, // bufs = remainder
+    SendZcDone { id: OpId, socket: SocketId },
+    SendFileDone { id: OpId, socket: SocketId, n: u64 },
+    SpliceDone { id: OpId, socket: SocketId, n: usize },
+    Datagram { id: OpId, socket: SocketId, buf: Buf, from: SocketAddr },
     TimedOut { id: OpId },
     Closed { socket: SocketId },
-    Failed { id: OpId, error: io::Error },
+    Failed { id: OpId, socket: SocketId, error: io::Error },
 }
 
 pub trait Session {
-    fn sockets(&self) -> &[SocketId]; // ownership declared at registration
-    fn on_event(&mut self, event: Event, io: &mut Io) -> Step;
+    fn on_completion(&mut self, completion: Completion, io: &mut Io) -> Step;
 }
 
 pub enum Step {
