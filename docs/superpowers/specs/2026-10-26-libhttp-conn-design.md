@@ -92,6 +92,7 @@ pub enum Event {
     Tunnel { stream: StreamId },
     StreamWritable { stream: StreamId },
     StreamsAvailable { count: usize },
+    Datagram,                                     // h3 RFC 9221; carries no metadata
 }
 ```
 
@@ -141,6 +142,8 @@ impl Conn {
     pub fn send_data(&mut self, stream: StreamId, body: Body) -> Result<Flow, ConnError>;
     pub fn send_end(&mut self, stream: StreamId) -> Result<(), ConnError>;
     pub fn send_trailers(&mut self, stream: StreamId, fields: Head) -> Result<(), ConnError>;
+    pub fn send_datagram(&mut self, bytes: Chunk) -> Result<(), ConnError>;   // h3 only
+    pub fn body_wanted(&mut self, stream: StreamId);   // h1: emits 100-continue if due
     pub fn reset(&mut self, stream: StreamId, code: u32);
     pub fn goaway(&mut self, last_stream: StreamId, code: u32);
 }
