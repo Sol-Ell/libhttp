@@ -46,7 +46,7 @@ impl Endpoint {
     pub fn feed(&mut self, datagram: Datagram<'_>) -> Result<(), Error>;
     pub fn poll(&mut self) -> Option<EndpointEvent>;
     pub fn accept(&mut self) -> Option<h3::ConnId>;
-    pub fn conn(&mut self, id: h3::ConnId) -> Option<&mut H3Conn>;
+    pub fn conn(&mut self, id: h3::ConnId) -> Option<&mut Conn>;
     pub fn output_datagram(&mut self) -> Option<OutDatagram<'_>>;
 }
 
@@ -60,7 +60,7 @@ pub enum EndpointEvent {
 
 `h3::ConnId` is generational and distinct from the transport's `ConnId`, because one UDP socket carries many connections and none of them is a socket. That is the one place where the handle shape differs by protocol, and it is visible in the types rather than hidden behind one.
 
-`H3Conn` exposes the same event vocabulary and send API as `conn::Conn` (`conn` §3, §5) — it is the QUIC path of the same envelope, not a second one — but it is created and owned by the endpoint, because a QUIC connection has no socket to be created from. `conn::Conn` covers the TCP path, where the transport's `ConnId` is the identity.
+The envelope is `conn` §6 and it is the same type for both transports: a QUIC connection is `Conn::new(ConnHandle::Quic(id), Protocol::Http3, None, None)`, owned by the endpoint because a QUIC connection has no socket to be created from. There is no second envelope type, and `Conn::tick`/`finish`/`poll` apply here unchanged.
 
 An h3 connection's lifecycle is reported here, not by `Io`: `poll` yields `Closed` with the same `CloseReason` vocabulary, because the proxy needs the reason to choose between a 502 and a retry and cannot infer it from a UDP socket.
 
@@ -127,7 +127,7 @@ Pushing everything into quinn instead would make quinn's send buffer the real bo
 
 ## 9. GOAWAY, shutdown, CONNECT
 
-`Conn::finish` requests a drain: the engine sends `GOAWAY` with a stream id, stops accepting new requests above it, lets in-flight ones finish, and reports `Drained` when the last is terminal (`conn` §6.5). A `Drain` deadline bounds it.
+`Conn::finish` requests a drain: the engine sends `GOAWAY` with a stream id, stops accepting new requests above it, lets in-flight ones finish, and reports `Drained` under `conn` §6.5's three conditions — which this document does not restate, because a weaker local version is how the FIN gets ahead of `close_notify`. A `Drain` deadline bounds it.
 
 A peer `GOAWAY` is `Event::GoAway`; requests above its id were rejected and are safe to retry. The `H3_REQUEST_REJECTED` code is used only for admission refusal, never for a stream that ran.
 

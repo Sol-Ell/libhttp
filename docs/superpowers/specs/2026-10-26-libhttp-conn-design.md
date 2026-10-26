@@ -1,56 +1,53 @@
 # libhttp conn — Design
 
-**Status:** subsystem design. Owns the surface every protocol engine shares: the event vocabulary, the typed message model, the send API, protocol selection, and the graceful drain the transport explicitly does not own.
+**Status:** subsystem design, rewritten after verification. Owns the shared surface: the typed message model, the event vocabulary, the body handle, the send API, and the connection envelope for both TCP and QUIC.
 **Parent:** `2026-10-26-libhttp-design.md`.
-**Consumes:** transport (`Driver`, `Chunk`, `ChunkMut`, `CreditSink`, `TimerKind`, `CloseReason`).
-**Consumed by:** `tls`, `h1`, `h2`, `h3`, `proxy`.
+**Consumes:** transport (`ConnId`, `Chunk`, `ChunkMut`, `CreditSink`, `Read`, `Sent`, `TimerKind`, `CloseReason`), `tls` (`TlsConfig`, `tls::Error`).
+**Consumed by:** `h1`, `h2`, `h3`, `proxy`, `dispatch`.
 
 ---
 
 ## 1. Scope
 
-**Owns:** the `Conn` envelope (TLS + one engine), `Event`, `Head`/`Fields`/`HeaderName`/`HeaderValue`, `Body`, `StreamId`/`StreamKind`, `Flow`, `ConnError`, protocol selection, output admission, `finish`/`Drained`, `tick`, `arm`, deadline dispatch.
+**Owns:** the typed model, `Event`, `Body`, `StreamId`/`StreamKind`/`Flow`/`OpenError`, the send API including tunnels and datagrams, the `Conn` envelope for both transports, protocol selection, output admission, `finish`/`Drained`, `tick`/`arm`, `on_deadline`, `on_closed`, and `ConnError`.
 
-**Does not own:** sockets and readiness (transport), TLS configuration and handshake mechanics (`tls`), frame/field encodings (per protocol), worker dispatch (`dispatch`).
+**Does not own:** sockets and readiness (transport), TLS mechanics (`tls`), frame and field encodings (each protocol), worker dispatch (`dispatch`).
 
 ---
 
-## 2. The typed message model
+## 2. The typed model
 
 ```rust
-pub struct Head {
-    arena: Chunk,                 // owns the bytes the message was parsed from
-    span: std::ops::Range<u32>,   // the message head inside `arena`
-    fields: Box<[FieldSpan]>,     // one per field, in wire order, duplicates kept
-    method: Method,
-    target: Target,
-    version: Version,
-}
-impl Head { pub fn view(&self) -> HeadView<'_>; }
+pub struct StreamId(u64);            // Copy + Eq + Hash + Ord; 0-based for h1, native for h2/h3
+pub enum StreamKind { Request, Connect }
 
-pub struct HeadView<'a>(&'a Head);
-impl HeadView<'_> {
-    pub fn method(&self) -> Method;
-    pub fn target(&self) -> &Target;
-    pub fn version(&self) -> Version;
-    pub fn fields(&self) -> Fields<'_, '_>;
+pub struct Method(u16, Option<Box<[u8]>>);
+impl Method {
+    pub const GET: Method;  pub const HEAD: Method;   pub const POST: Method;
+    pub const PUT: Method;  pub const DELETE: Method; pub const OPTIONS: Method;
+    pub const CONNECT: Method; pub const TRACE: Method; pub const PATCH: Method;
+    pub fn from_bytes(b: &[u8]) -> Result<Method, MethodError>;
+    pub fn as_str(&self) -> &str;                 // "OTHER" for an unknown token
 }
 
-pub struct Fields<'h, 'a>(/* ... */);
-impl<'h, 'a> Fields<'h, 'a> {
-    pub fn get(&self, name: HeaderName<'_>) -> Option<HeaderValue<'a>>;       // first
-    pub fn get_all(&self, name: HeaderName<'_>) -> impl Iterator<Item = HeaderValue<'a>> + '_;
-    pub fn iter(&self) -> impl Iterator<Item = (HeaderName<'h>, HeaderValue<'a>)> + '_;
-    pub fn len(&self) -> usize;
-    pub fn push(&mut self, name: HeaderName<'h>, value: HeaderValue<'a>);      // for responses
-    pub fn strip_hop_by_hop(&mut self);
+pub struct StatusCode(u16);
+impl StatusCode {
+    pub fn as_u16(&self) -> u16;
+    pub fn is_informational(&self) -> bool;
+    pub fn canonical_reason(&self) -> Option<&'static str>;
 }
+
+pub enum Scheme { Http, Https, Other(Box<[u8]>) }
+pub enum Target { Origin(Box<[u8]>), Absolute(Box<[u8]>), Authority(Box<[u8]>), Asterisk }
+pub enum Version { Http10, Http11, Http2, Http3 }
 
 pub enum HeaderName<'a> { Known(u16), Raw(&'a [u8]) }
 impl<'a> HeaderName<'a> {
     pub const CONTENT_LENGTH: HeaderName<'static>;
     pub const HOST: HeaderName<'static>;
-    // ... the registered set the library uses
+    pub const CONNECTION: HeaderName<'static>;
+    pub const TRAILER: HeaderName<'static>;
+    // ... the registered set the library itself uses
     pub fn as_bytes(&self) -> &[u8];
     pub fn eq_ignore_ascii_case(&self, other: HeaderName<'_>) -> bool;
 }
@@ -63,48 +60,107 @@ impl<'a> HeaderValue<'a> {
     pub fn connection_tokens(&self) -> impl Iterator<Item = &'a [u8]> + '_;
 }
 
-pub struct Method(u16, Option<Box<[u8]>>);   // known ids, else the raw token
-pub enum Version { Http10, Http11, Http2, Http3 }
-pub enum Target { Origin(Box<[u8]>), Absolute(Box<[u8]>), Authority(Box<[u8]>), Asterisk }
+pub struct StreamId(u64);   // declared above; kept here for the reader
 ```
 
-`Head` owns its arena, so it survives the read chunk being recycled — that is one refcount, not one copy. `HeadView` and `Fields` are reconstructed per access and borrow from the arena; nothing in the API returns a span that outlives its `Head`.
+### 2.1 Head
 
-`HeaderName` is an interned identity: registered names resolve to an id at compile time, unknown names are a validated byte range compared case-insensitively. Extension headers are first-class without becoming enum variants, which is what lets a relay forward `x-forwarded-for` byte-exactly.
+A head is one of three things, and the type says which:
 
-`Fields` preserves order and duplicates; `strip_hop_by_hop` is a method over the typed list, not a string set.
+```rust
+pub enum HeadKind {
+    Request { method: Method, target: Target, scheme: Scheme, version: Version },
+    Response { status: StatusCode, version: Version },
+    Trailers,
+}
+
+pub enum TrailerPolicy { Forbid, PreferChunked }
+
+pub struct Head {
+    arena: Chunk,               // owns the bytes the field spans point into
+    kind: HeadKind,
+    policy: TrailerPolicy,
+    fields: Box<[FieldSpan]>,   // wire order, duplicates kept
+}
+
+pub struct FieldSpan { name: NameRepr, value: std::ops::Range<u32> }
+pub enum NameRepr { Known(u16), Raw(std::ops::Range<u32>) }
+
+impl Head {
+    pub fn view(&self) -> HeadView<'_>;
+}
+
+pub struct HeadView<'a>(&'a Head);
+impl<'a> HeadView<'a> {
+    pub fn kind(&self) -> &HeadKind;
+    pub fn fields(&self) -> Fields<'a, 'a>;
+    pub fn trailer_policy(&self) -> TrailerPolicy;
+}
+
+pub struct Fields<'h, 'a>(/* ... */);       // read-only view over the arena
+impl<'h, 'a> Fields<'h, 'a> {
+    pub fn get(&self, name: HeaderName<'_>) -> Option<HeaderValue<'a>>;
+    pub fn get_all(&self, name: HeaderName<'_>) -> impl Iterator<Item = HeaderValue<'a>> + '_;
+    pub fn iter(&self) -> impl Iterator<Item = (HeaderName<'h>, HeaderValue<'a>)> + '_;
+    pub fn len(&self) -> usize;
+}
+```
+
+`Head` is immutable once built; construction is the builder's job, because a head assembled by parsing and a head assembled by an application have the same shape and different sources:
+
+```rust
+pub struct HeadBuilder { /* fields, kind, policy */ }
+impl HeadBuilder {
+    pub fn request(method: Method, target: Target, scheme: Scheme, version: Version) -> Self;
+    pub fn response(status: StatusCode, version: Version) -> Self;
+    pub fn trailers() -> Self;
+    pub fn field(&mut self, name: HeaderName<'_>, value: HeaderValue<'_>) -> &mut Self;
+    pub fn extend(&mut self, src: Fields<'_, '_>) -> &mut Self;
+    pub fn trailer_policy(&mut self, policy: TrailerPolicy) -> &mut Self;
+    pub fn build(self) -> Head;          // copies fields into one arena chunk
+}
+pub fn strip_hop_by_hop(out: &mut HeadBuilder, src: Fields<'_, '_>);   // proxy helper
+```
+
+`Head` owns its arena, so it survives the read chunk being recycled: one refcount, not one copy. Every `HeadView`/`Fields` borrows from the arena; nothing returns a span that outlives its `Head`.
+
+`TrailerPolicy` is carried on the head because h1 must decide chunked framing **before** the response head is written (`h1` §4). It is ignored by h2 and h3, where trailers need no such decision.
+
+`Fields` is read-only. A relay builds a new head rather than mutating the parsed one; `strip_hop_by_hop` is the one helper, and it filters while copying, so hop-by-hop fields never enter the new arena.
 
 ---
 
-## 3. The event vocabulary
+## 3. Events
 
 ```rust
 pub enum Event {
     Head { stream: StreamId, head: Head },
     Data { stream: StreamId, body: Body },
-    Trailers { stream: StreamId, fields: Head },   // a field-only block; terminal
-    End { stream: StreamId },                      // body finished, no trailers
+    Trailers { stream: StreamId, head: Head },   // kind == HeadKind::Trailers; terminal
+    End { stream: StreamId },                     // terminal, no trailers
     Reset { stream: StreamId, code: u32 },
     GoAway { last_stream: StreamId, code: u32 },
     Settings,
     Ready,
     Drained,
+    StopAccepting,                                // the peer asked us to wind down
     Tunnel { stream: StreamId },
     StreamWritable { stream: StreamId },
     StreamsAvailable { count: usize },
-    Datagram,                                     // h3 RFC 9221; carries no metadata
+    Datagram { data: Chunk },                     // h3 RFC 9221; no address, no ECN
+    DatagramWritable,                             // h3: the datagram send buffer cleared
 }
 ```
 
 Ordering guarantees, enforced by the engine and checked by the fuzz targets:
 
 - `Head` precedes any `Data` on that stream.
-- `End` or `Trailers` is last on that stream; no `Data` follows either.
-- `Reset` or `GoAway` may follow anything; nothing follows on that stream.
+- `End` or `Trailers` is last on that stream; no `Data` follows either, and the two are mutually exclusive.
+- `Trailers` carries `HeadKind::Trailers`; nothing else may.
+- `Reset` or `GoAway` may follow anything; nothing follows on that stream after a `Reset`.
 - `Ready` appears once, before any other event.
-- `Drained` appears at most once, and only after `finish` (§5).
-
-`Trailers` and `End` are different messages, not a convenience: a body that ends plainly is not an empty trailer block, and h3 distinguishes them.
+- `Drained` appears at most once, only after `finish` (§6.5).
+- `Datagram` events are connection-level: they carry no stream id, because RFC 9221 datagrams are not stream frames.
 
 ---
 
@@ -113,126 +169,140 @@ Ordering guarantees, enforced by the engine and checked by the fuzz targets:
 ```rust
 pub struct Body {
     chunk: Chunk,
+    offset: u32,                 // the view's start inside `chunk`
+    bytes: u32,                  // the view's length
     stream: StreamId,
-    bytes: u32,              // bytes this handle is responsible for
-    sink: Arc<CreditSink>,   // credits the source connection when this handle is consumed
+    sink: Option<Arc<CreditSink>>,   // None on h3, where credit is the transport's
 }
 impl Body {
-    pub fn bytes(&self) -> &[u8];
+    pub fn bytes(&self) -> &[u8];        // &chunk[offset .. offset + bytes]
     pub fn len(&self) -> usize;
-    pub fn split_at(self, at: usize) -> (Body, Body);   // shares storage, no copy
+    pub fn stream(&self) -> StreamId;
+    pub fn split_at(self, at: usize) -> (Body, Body);   // shares storage, offsets differ
 }
 ```
 
-A `Body` is the unit of flow control, not the chunk. Splitting yields two handles over one storage, each carrying its own `bytes`; consuming both returns the sum of credit. `send_data` consumes the handle, which is how a relay's credit travels from the source stream to the destination stream.
+`split_at` produces two views over one storage with different `offset`/`bytes`; both keep the same `stream` and the same sink. Consuming both returns credit once for the whole, because the sink counts bytes, not handles.
 
-Dropping the last handle for `(stream, bytes)` credits the sink. A sink whose connection is gone is closed, and the credit is discarded rather than delivered to a reused id (transport §5.3).
+`Body.stream` must equal the `stream` on the event that carried it; the engine sets both, and `send_data(stream, body)` returns `ConnError::StreamMismatch` if they disagree. That is a checked invariant rather than a hope, because the alternative is credit landing on the wrong stream.
+
+`Option<Arc<CreditSink>>` is `None` for h3, where the transport owns the receive window and credit is released at read time (`h3` §7). Every other protocol carries a sink, and the `Conn` is given it at construction (§6.1) — a `Conn` never needs a `Driver`.
+
+Dropping the last view for a `(stream, bytes)` credits the sink. A sink whose connection is gone is closed and the credit is discarded rather than delivered to a reused id (transport §5.3).
 
 ---
 
 ## 5. The send API
 
 ```rust
-pub enum StreamKind { Request, Connect }
 pub enum Flow { Accepted, Blocked(Body) }
+pub enum OpenError { WouldBlock, Refused, Closed }
 
 impl Conn {
-    pub fn open(&mut self, kind: StreamKind) -> Result<StreamId, WouldBlock>;
+    pub fn open(&mut self, kind: StreamKind) -> Result<StreamId, OpenError>;
     pub fn send_head(&mut self, stream: StreamId, head: Head) -> Result<(), ConnError>;
     pub fn send_data(&mut self, stream: StreamId, body: Body) -> Result<Flow, ConnError>;
     pub fn send_end(&mut self, stream: StreamId) -> Result<(), ConnError>;
-    pub fn send_trailers(&mut self, stream: StreamId, fields: Head) -> Result<(), ConnError>;
-    pub fn send_datagram(&mut self, bytes: Chunk) -> Result<(), ConnError>;   // h3 only
-    pub fn body_wanted(&mut self, stream: StreamId);   // h1: emits 100-continue if due
-    pub fn reset(&mut self, stream: StreamId, code: u32);
+    pub fn send_trailers(&mut self, stream: StreamId, head: Head) -> Result<(), ConnError>;
+    pub fn send_datagram(&mut self, data: Chunk) -> Result<(), ConnError>;      // h3 only
+    pub fn reset(&mut self, stream: StreamId, code: u32) -> Result<(), ConnError>;
     pub fn goaway(&mut self, last_stream: StreamId, code: u32);
+    pub fn stop_accepting(&mut self);                                          // first GOAWAY
+    pub fn body_wanted(&mut self, stream: StreamId);                            // h1: 100-continue
+
+    pub fn read_tunnel(&mut self, stream: StreamId, buf: &mut ChunkMut) -> Result<Read, ConnError>;
+    pub fn write_tunnel(&mut self, stream: StreamId, data: Chunk) -> Result<Sent, ConnError>;
+    pub fn end_tunnel(&mut self, stream: StreamId) -> Result<(), ConnError>;
 }
 ```
 
-`Flow::Blocked` returns the body rather than consuming it. A body refused by the stream's reservation is the caller's to retry; silently dropping it would be a lost body, and buffering it inside the engine would make the reservation a lie.
-
-`open` returns `WouldBlock` when the peer's stream limit is reached; `StreamsAvailable` says when to try again. There is no "open without a limit" path.
-
-`send_end` and `send_trailers` are both terminal and mutually exclusive per stream; sending either twice is `ConnError::StreamDone`.
+- `open` returns `OpenError::WouldBlock` at the peer's stream limit and `Refused` if the peer will not accept the kind at all. On **h1** the engine assigns the next pipeline id and never returns `WouldBlock`; the application does not choose ids.
+- `send_data` returns `Flow::Blocked(body)`: a body refused by the stream's reservation is the caller's to retry. Silently dropping it would be a lost body; buffering it inside the engine would make the reservation a lie.
+- `send_end` and `send_trailers` are terminal and mutually exclusive. Sending either twice, or sending one after the other, is `ConnError::StreamDone`, and the stream is aborted — not the connection (§7).
+- `reset` refuses with `StreamDone` when both sides have already finished, because a frame on a closed stream is a protocol violation (RFC 9113 §5.1) and the signature must be able to say so.
+- `send_datagram` is `ConnError::DatagramTooLarge` above the transport's `max_size`, never a silent drop, and `ConnError::Transport(Error::Exhausted)` is impossible here — the buffer-full case is `Event::DatagramWritable` instead.
+- The tunnel trio is per stream on every protocol. On h1 the stream is the connection's single tunnel, and `end_tunnel` maps to the connection half-close; on h2/h3 it is `END_STREAM` on that stream and the connection is untouched.
 
 ---
 
-## 6. The connection envelope
+## 6. The envelope
+
+One type, two transports:
 
 ```rust
-pub enum Protocol { Http1, Http2, Detect, Alpn(&'static [Version]) }
+pub enum ConnHandle { Tcp(ConnId), Quic(h3::ConnId) }
+
+pub enum Protocol { Http1, Http2, Http3, Detect, Alpn(&'static [Version]) }
 
 impl Conn {
-    pub fn new(id: ConnId, protocol: Protocol, tls: Option<TlsConfig>) -> Result<Conn, ConnError>;
+    pub fn new(handle: ConnHandle, protocol: Protocol,
+               tls: Option<tls::TlsConfig>, sink: Option<Arc<CreditSink>>)
+        -> Result<Conn, ConnError>;
     pub fn start(&mut self) -> Result<(), ConnError>;
     pub fn feed(&mut self, bytes: Chunk) -> Result<(), ConnError>;
+    pub fn feed_datagram(&mut self, bytes: Chunk) -> Result<(), ConnError>;   // h3 only
     pub fn feed_eof(&mut self) -> Result<(), ConnError>;
     pub fn poll(&mut self) -> Option<Event>;
     pub fn output(&mut self) -> Option<Chunk>;
+    pub fn output_datagram(&mut self) -> Option<Chunk>;                       // h3 only
     pub fn finish(&mut self);
-    pub fn tick(&mut self, drv: &mut Driver) -> Result<(), ConnError>;
+    pub fn on_closed(&mut self, reason: CloseReason) -> Result<(), ConnError>;
+    pub fn tick(&mut self) -> Result<(), ConnError>;
     pub fn arm(&mut self, drv: &mut Driver) -> Result<(), ConnError>;
     pub fn on_deadline(&mut self, kind: TimerKind) -> Result<(), ConnError>;
     pub fn protocol(&self) -> Option<Version>;
 }
 ```
 
-### 6.1 Protocol selection
+### 6.1 Construction
 
-`Detect` buffers at most 24 bytes and either matches the HTTP/2 preface or commits to h1. `Alpn` creates the engine when the handshake resolves it. `poll` yields `Ready` once, when an engine exists and the application may send; `protocol()` reports the choice.
+`new` rejects invalid combinations rather than silently ignoring an argument: `Protocol::Http3` requires `ConnHandle::Quic` and `tls: None` (QUIC carries its own TLS); `Protocol::Alpn` requires a `TlsConfig`; `Protocol::Http1`/`Http2`/`Detect` require `ConnHandle::Tcp`. A mismatch is `ConnError::Config`.
 
-The invariant that makes this cheap: **no application bytes exist before the protocol is known.** Over TLS that holds because 0-RTT is out of scope; in cleartext it holds because `Detect` buffers 24 bytes. There is no plaintext holding pen.
+`sink` is the transport's credit sink, `None` for QUIC. It is passed at construction because a `Conn` never touches a `Driver` while parsing; only `arm` does.
 
-### 6.2 feed and feed_eof
+### 6.2 start
 
-`feed` takes a chunk, decrypts if TLS is present, and hands plaintext to the engine. It never calls back into the application and never yields events; parsing output is drained by `poll` afterwards. Calling `feed` from inside `poll` is a borrow error, not a documented precondition.
+`start` begins whatever the transport needs: a TLS handshake's first flight on TCP, a no-op for cleartext and for QUIC (whose handshake belongs to the endpoint). It is idempotent.
 
-`feed_eof` is the input path for the end of the byte stream, and it is the only way a truncated TLS close or a chunked body cut at FIN is detectable. The engine sees EOF before `poll` yields the terminal event for any stream still open.
+### 6.3 feed, feed_eof, feed_datagram
 
-### 6.3 poll
+`feed` decrypts if TLS is present and hands plaintext to the engine. It never calls back into the application and never yields events; parsing output is drained by `poll`. `feed_eof` hands end-of-input to TLS first, then the engine — that ordering is what separates a clean `close_notify` from a truncated close (`tls` §3.4).
 
-`poll` yields events in the order §3 guarantees. It never yields frames, HPACK/QPACK instructions, or partial parse state.
+`feed_datagram` is the QUIC input path; `feed` is an error on a QUIC connection, and `feed_datagram` on TCP likewise.
 
-### 6.4 output and its admission rule
+### 6.4 poll, output, and the admission rule
 
-`output` yields framed, encrypted bytes ready for the transport's `send`. It is not one FIFO, and without the rule below the design deadlocks:
+`poll` yields events in the order §3 guarantees. `output` yields framed, encrypted bytes ready for the transport's `send`; `output_datagram` is the QUIC equivalent.
+
+`output` is not one FIFO, and without this rule the design deadlocks:
 
 1. a stream's pending body is admitted only when that stream's window covers it;
 2. control frames and QPACK encoder/decoder bytes are **never** gated by a request stream;
 3. a header block is admitted only after the encoder instructions it references.
 
-A single ordered queue that a blocked stream can fill would put an h2 `PING` ACK or a GOAWAY behind a zero window the peer itself set. With QPACK at capacity zero there are no encoder instructions to order today, but the rule is stated because the dynamic table lands at M5.
+A single ordered queue that a blocked stream can fill would put an h2 `PING` ACK or a GOAWAY behind a zero window the peer itself set.
 
-`output` returns `None` only when nothing is eligible. There is no "nothing right now but something later" state that the caller must poll for: a later window update arrives as input and produces output, and the application learns of it because `feed` marks the connection active.
+### 6.5 finish, stop_accepting, Drained
 
-### 6.5 finish, Drained, and the handover to the transport
+`stop_accepting` asks the peer to stop opening streams: h2 sends the first GOAWAY with `last_stream = 2^31 - 1`, h3 sends a GOAWAY, h1 marks the connection for close after the current exchange.
 
-`finish` sets an intent; it does not close anything. After it, the connection produces its final output (`close_notify`, h2 GOAWAY), and `poll` yields `Drained` once when all three hold:
+`finish` requests a drain. After it, `poll` yields `Drained` exactly once when **all three** hold:
 
-- every stream is terminal (or h1's pipeline is empty);
-- no output is eligible;
-- TLS has no queued records.
+- every stream is terminal (h1: the pipeline is empty);
+- no output is eligible (§6.4);
+- TLS has no queued records (`tls` §3.3).
 
-Then, and only then, may the application call `drv.shutdown_write`. The precondition on the application side — no partial send outstanding — is the transport's (§4.5 there) and is not repeated here.
+Only then may the application call `drv.shutdown_write`, and only if it has no partial send outstanding (transport §4.5). A GOAWAY is not the last byte: for h2 the second GOAWAY, and for h3 the final GOAWAY, are emitted when the last stream is terminal or the `Drain` deadline fires — never before, because that would truncate the responses the GOAWAY acknowledged.
 
-For h2, `finish` does **not** mean "send GOAWAY and stop": in-flight streams still have bodies. GOAWAY is emitted when the last stream is terminal or the `Drain` deadline fires, whichever comes first. A design that emits GOAWAY and half-closes immediately truncates the responses the GOAWAY just acknowledged.
+### 6.6 tick, arm, on_deadline
 
-### 6.6 tick, arm, deadlines
+`tick` drains the `CreditSink` (when there is one) and returns the aggregate to the engine, which may enqueue output: an h2 `WINDOW_UPDATE`, or an h3 `ShouldTransmit`. It is why the pump calls `tick` before draining output.
 
-`tick` drains the connection's `CreditSink` and returns the aggregate to the engine, which may enqueue output (an h2 `WINDOW_UPDATE`, an h3 `ShouldTransmit`). It is why the pump calls `tick` before draining output.
+`arm` upserts engine deadlines into the driver's heap: `Idle`, `ReadProgress`, `WriteProgress`, and `Drain` after `finish`. `on_deadline` dispatches a fired `TimerKind`; what a kind means is the engine's, but the mapping is fixed: a `ReadProgress` expiry mid-body is a reset, a `Drain` expiry after `finish` is a close, an `Idle` expiry on a keep-alive connection is a graceful finish. `TimerKind::Worker` never reaches a connection.
 
-`arm` upserts the engine's deadlines into the driver's heap: `Idle`, `ReadProgress` and `WriteProgress` as the engine decides; `Drain` after `finish`.
+### 6.7 on_closed
 
-`on_deadline` dispatches a fired `TimerKind`. What a kind means is the engine's business: `ReadProgress` firing mid-body is a reset, `Drain` firing after `finish` is a close, `Idle` firing on a keep-alive connection is a graceful finish. `TimerKind::Worker` never reaches a connection — it is the dispatcher's.
-
-### 6.7 feed_eof, close reasons, and truncation
-
-`feed_eof` hands end-of-input to TLS first, then the engine. That ordering is what separates the two endings:
-
-- a TLS connection that receives `close_notify` and then EOF is a clean peer close;
-- a TLS connection that receives EOF with no `close_notify` reports a truncated close, which is an error.
-
-The connection does not choose the transport's `CloseReason`; the transport does (transport §4.6). The connection's job is to stop producing a clean `End` when the input ended mid-message.
+When the transport reports `Closed`, the application calls `on_closed(reason)`. The engine releases its streams, drops retained credit into closed sinks, and produces no further events except the ones already queued. A connection that is closed without `on_closed` leaks its per-stream state; that is the application's contract to honour, and `Server` does it for you.
 
 ---
 
@@ -241,21 +311,39 @@ The connection does not choose the transport's `CloseReason`; the transport does
 ```rust
 #[non_exhaustive]
 pub enum ConnError {
-    Transport(transport::Error),
-    Protocol(ProtoError),        // an engine-level violation; the connection is dead
-    StreamDone,                  // send after End/Trailers, or a second terminal
-    StreamRefused,               // open/reset against a stream the peer will not accept
-    Tls(tls::Error),             // alert or truncated close
-    Stale,                       // the Conn's id is no longer live
+    Transport(transport::Error),      // retryable ones are transient; see below
+    Protocol(ProtocolError),          // fatal to the connection
+    Tls(tls::Error),                  // alert or truncated close; fatal
+    Config,                           // invalid Conn::new combination
+    StreamDone,                       // terminal already sent, trailers after a length-framed head, or reset after both ends
+    StreamMismatch,                   // Body.stream != the stream named by send_data
+    StreamRefused,                    // the peer will not accept this kind of stream
+    DatagramTooLarge,
+    Closed,                           // the connection is already gone
+}
+
+pub struct ProtocolError {
+    pub connection: bool,             // fatal to the connection, or only to the stream
+    pub status: Option<StatusCode>,   // h1's 400/431/501/417, when one can still be sent
+    pub code: u64,                    // h2/h3 error code, 0 otherwise
 }
 ```
 
-`Protocol` is fatal: the connection is closed after it is reported. `StreamDone` and `StreamRefused` are per-stream and non-fatal. There is no `Box<dyn Error>` and no stringly-typed variant.
+Fatality, which is the part callers branch on:
+
+| Variant | Effect |
+|---|---|
+| `Protocol`, `Tls`, `Config` | the connection is dead |
+| `Transport(Error::Io)`, `Transport(Error::StaleId)`, `Closed` | the connection is dead |
+| `Transport(Error::Exhausted)` | transient: the pool is full, stop reading and retry |
+| `StreamDone`, `StreamMismatch`, `StreamRefused`, `DatagramTooLarge` | the stream (or the datagram) is refused; the connection survives |
+
+h1's "response body written after End" aborts the stream; it closes the connection only because the response was already on the wire, and that is `h1`'s decision, not this variant's fatality.
 
 ---
 
 ## 8. What a builder decides
 
-The `Method` id table and the known-name table's exact contents, the `Fields` inline capacity, the `Target` validation strictness for each form, and whether `Head`'s field spans are 32- or 64-bit.
+The `Method` id table beyond the constants, the registered-name table, `Fields`' inline capacity, the field-span width (32 vs 64 bit), and `Target` validation strictness per form.
 
-Not theirs: arena ownership, the event ordering guarantees, the admission rule, `Drained`'s three conditions, credit travelling on the body handle, and the send API's outcomes.
+Not theirs: arena ownership, `TrailerPolicy` on the head, the checked `Body.stream` invariant, the admission rule, `Drained`'s three conditions, the `ProtocolError` fatality split, and `on_closed`.

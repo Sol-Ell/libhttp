@@ -128,7 +128,7 @@ After a successful `CONNECT` or a `101`, the engine emits `Event::Tunnel { strea
 | Unsupported `Transfer-Encoding` | `501`, then close |
 | Unsupported `Expect` | `417`, then close |
 | `Host` missing/duplicated on 1.1 | `400`, then close |
-| Response body written after `End`/`Trailers` | `ConnError::StreamDone`, connection closed |
+| Response body written after `End`/`Trailers` | `ConnError::StreamDone`; the stream aborts, and the connection closes because the response was already on the wire |
 
 A parse error is fatal to the connection: HTTP/1.1 has no resynchronisation, and pretending otherwise is how desync attacks work.
 

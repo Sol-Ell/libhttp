@@ -40,7 +40,7 @@ The fixed 9-byte frame header and the v1 frame set: `DATA`, `HEADERS`, `PRIORITY
 
 ## 4. Streams
 
-Stream ids are odd for client-initiated and even for server-initiated; a new id must be greater than the last seen from that peer, or the connection is `PROTOCOL_ERROR`. A stream that is closed cannot be reopened; a frame for a closed stream is `STREAM_CLOSED` (or ignored for `RST_STREAM` and `WINDOW_UPDATE`, per RFC 9113 §5.1).
+Stream ids are odd for client-initiated and even for server-initiated; a new id must be greater than the last seen from that peer, or the connection is `PROTOCOL_ERROR`. A stream that is closed cannot be reopened; a frame for a closed stream is `STREAM_CLOSED`, except the three the RFC exempts — `RST_STREAM`, `WINDOW_UPDATE` and `PRIORITY` — which are ignored (RFC 9113 §5.1).
 
 **Admission.** The advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is derived, not guessed: `reservation_cap / min_stream_reservation`, with a floor of one maximum frame per stream, so the advertised limit and the reservation cap cannot drift apart. A `HEADERS` that would exceed it is refused with `REFUSED_STREAM` — the code that promises *not processed* — before any work is done. That code is only legal here because the engine refuses at the frame, before dispatch; a stream that has been dispatched and later times out carries `CANCEL` instead (§9).
 
@@ -91,7 +91,7 @@ Trailers are a `HEADERS` block after the body, ending the stream (`conn` §3).
 
 `finish` does not send GOAWAY immediately. The engine sends a first GOAWAY with `last_stream = 2^31 - 1` only when the application asks to stop accepting new streams, then a second with the last accepted id once the in-flight streams are terminal or the `Drain` deadline fires.
 
-`Conn::finish` (conn §6.5) is the drain request; `Drained` is emitted when the last stream is terminal and no output is eligible. A GOAWAY that overtakes a response body would truncate the very streams it acknowledges — that trap is stated in `conn` and is the reason the two-phase form is required here.
+`Drained` follows `conn` §6.5's three conditions, which include the TLS queue; this document does not restate them, because a weaker local version is how a FIN gets ahead of `close_notify`. A GOAWAY that overtakes a response body would truncate the very streams it acknowledges — that trap is stated in `conn` and is the reason the two-phase form is required here.
 
 A peer GOAWAY is an `Event::GoAway`; streams above `last_stream` were not processed and are safe to retry, and the engine does not silently retry them.
 

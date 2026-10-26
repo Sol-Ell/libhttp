@@ -69,6 +69,10 @@ pub struct OutDatagram<'a> { pub bytes: &'a [u8],
 pub struct Ecn(pub u8);
 
 pub enum BackendPath { Epoll, Kqueue, Afd, WsaPoll }
+
+pub struct ConnId(/* index + generation */);      // Copy + Eq + Hash + Ord
+pub struct ListenerId(/* index + generation */);  // Copy + Eq + Hash
+pub struct UdpId(/* index + generation */);       // Copy + Eq + Hash
 ```
 
 `Datagram.len` and `.ecn` are **outputs** and are ignored on entry; `peer` is ignored and overwritten. `OutDatagram.ecn` is ignored where the platform does not support ECN (§4.7, Appendix).

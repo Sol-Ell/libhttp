@@ -73,7 +73,7 @@ The `last_stream` retry rule is the one that must not be generalized: streams ab
 
 ## 7. Tunnels
 
-`CONNECT` and `101` become `Tunnel` pairs. Half-close is per stream on h2/h3 (`end_tunnel`) and per connection on h1 (`shutdown_write`), and the relay forwards it in both directions.
+`CONNECT` and `101` become `Tunnel` pairs. Half-close is `end_tunnel` on every leg, because the API is per stream: h1 maps its single tunnel to the connection half-close, while h2 and h3 use `END_STREAM` and leave the connection alone. The relay forwards it in both directions.
 
 On an h1-over-TLS leg the half-close is `close_notify` plus `shutdown(SHUT_WR)`, and reading continues; the matrix is `tls` §3.3, not restated here.
 
