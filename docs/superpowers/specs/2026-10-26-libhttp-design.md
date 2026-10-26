@@ -76,13 +76,13 @@ Dependencies point down only. The transport does not know what HTTP is; protocol
 
 | Document | Owns | Status |
 |---|---|---|
-| `2026-10-26-libhttp-transport-design.md` | sockets, readiness, interest, timers, ids, datagrams, chunk pool, credit sinks, close/half-close | written, for verification |
-| `libhttp-conn-design` | `Conn`: `feed`/`feed_eof`/`poll`/`output`/`finish`/`Drained`, protocol selection, `tick`/`arm` | pending |
-| `libhttp-tls-design` | rustls integration, ALPN, `close_notify` | pending |
+| `2026-10-26-libhttp-transport-design.md` | sockets, readiness, interest, timers, ids, datagrams, chunk pool, credit sinks, close/half-close | written; seams closed by a narrow pass |
+| `2026-10-26-libhttp-conn-design.md` | `Conn` envelope, typed model, event vocabulary, send API, protocol selection, `finish`/`Drained`, `tick`/`arm` | written, for verification |
+| `2026-10-26-libhttp-tls-design.md` | rustls config, ALPN, `close_notify`, buffer limits, copy cost | written, for verification |
+| `2026-10-26-libhttp-dispatch-design.md` | workers, queues, caps, deadlines, cancellation, wakes | written, for verification |
 | `libhttp-h1-design` | parser, serializer, framing, smuggling, pipelines, tunnels | pending |
 | `libhttp-h2-design` | frames, HPACK, flow control, streams, settings | pending |
 | `libhttp-h3-design` | QUIC boundary, framing, QPACK, endpoint demux | pending |
-| `libhttp-dispatch-design` | workers, queues, caps, cancellation | pending |
 | `libhttp-proxy-design` | the relay, and the proof the public API is sufficient | pending |
 
 A subsystem document may not restate another's contract; it references it. If two documents need to agree on a type, the lower one owns it.
