@@ -95,7 +95,7 @@ Additional constraints that fall out of the architecture and are not negotiable:
 | **B. Readiness contract, completion backend where it pays** | Chosen, with A as the shipping base. Same public contract; io_uring/IOCP used underneath for writes, zero-copy send, file bodies, datagrams — each behind a benchmark gate |
 | C. Per-platform native public API | Rejected: three public I/O models, violating the uniform-API constraint |
 
-The direction of that decision is asymmetric, but not as cleanly as an earlier draft claimed. For **reads**, a readiness contract can sit on completions without the caller noticing: the driver posts the recv and reports `Readable` when the completion lands, and `recv` returns the data or `WouldBlock` either way. For **writes** it cannot: no platform offers a writability probe on a completion channel, and a send completion means "your earlier send finished", which is a different event. So the completion backends buy batch submission — many datagrams in one trap, file-body ops, batched completion retrieval — and `send` stays a real non-blocking syscall on every backend. Readiness is still the honest lowest common denominator; completions are a submission optimisation, not an invisible one.
+The direction of that decision is asymmetric, but not as cleanly as an earlier draft claimed. For **reads**, readiness *can* sit on completions — the driver posts the recv and reports `Readable` when the completion lands — but only if the driver owns the buffer, which means committing one buffer per connection before readiness is known. v1 does not do that: reads are single-shot into the caller's chunk (§14.5). So the read half is possible rather than free, and this design does not take it. For **writes** the read half's trick does not exist at all: no platform offers a writability probe on a completion channel, and a send completion means "your earlier send finished", which is a different event. `send` therefore stays a real non-blocking syscall on every backend.
 
 ---
 
@@ -127,53 +127,95 @@ let mut drv = Driver::new(Config::default())?;
 let listener = drv.listen("0.0.0.0:8080".parse()?)?;
 
 loop {
-    drv.wait()?;                       // sleeps until an event, a timer, or the batch budget runs out
+    drv.wait()?;                       // returns on an event, a timer, or the batch budget
 
     while let Some(io) = drv.next_io() {
         match io {
-            Io::Acceptable(l)  => { /* accept; create the connection object; arm reads */ }
-            Io::Connected(c)   => conns[c].start()?,
-            Io::ConnectFailed(c, e) => { /* retry or fail, per policy */ }
-            Io::Readable(c)    => read_until_stalled(&mut drv, &mut pool, &mut conns, c)?,
-            Io::HalfClose(c)   => conns[c].feed_eof()?,   // peer finished writing; we may still write
-            Io::Writable(c)    => flush(&mut drv, &mut conns, c)?,
-            Io::Timer(c, kind) => conns[c].on_deadline(kind)?,
-            Io::Drained(c)     => drv.shutdown_write(c)?,
-            Io::Closed(c, r)   => { conns.remove(c); }    // always the last event for c
-            Io::Datagram(u)    => { /* h3: hand to h3::Endpoint */ }
+            Io::Acceptable(l) => {
+                // accept yields an inactive socket; reads start only after the application
+                // has inserted its Conn, so no id can arrive that the app has never seen
+                let (c, _peer) = drv.accept(l)?;
+                conns.insert(c, Conn::new(c, Protocol::Detect, None));
+                drv.activate(c)?;
+            }
+            Io::Connected(c)        => { conns[c].start()?; drv.mark_active(c); }
+            Io::ConnectFailed(c, _) => { /* retry or fail, per policy */ }
+            Io::Readable(c)         => read_until_stalled(&mut drv, &mut pool, &mut conns, c)?,
+            Io::HalfClose(c)        => conns[c].feed_eof()?,
+            Io::Writable(c)         => flush(&mut drv, &mut conns, c)?,
+            Io::Timer(c, kind)      => conns[c].on_deadline(kind)?,
+            Io::Closed(c, _reason)  => { conns.remove(c); }   // always the last event for c
+            Io::Datagram(u)         => { /* h3: hand to h3::Endpoint */ }
         }
     }
 
     for c in drv.active() {            // driver-owned dirty set — not all 10k connections
-        while let Some(ev) = conns[c].poll() { route(ev) }
-        while let Some(out) = conns[c].output() { drv.send(c, out)? }
+        while let Some(ev) = conns[c].poll() {
+            if matches!(ev, Event::Drained) { drv.shutdown_write(c)?; }  // only now is a FIN safe
+            route(ev);
+        }
+        // a chain, so a frame header and its payload cost one writev and no copy
+        while let Some(out) = conns[c].output() {
+            match drv.send(c, &[out])? {
+                Sent::All => {}
+                Sent::WouldBlock => break,
+                Sent::Partial(n) => { conns[c].keep_tail(out, n); break }   // retry on Writable
+            }
+        }
+        conns[c].tick();                          // hand consumed credit back to the engine
+        conns[c].arm(&mut drv);                   // engine deadlines go into the driver's heap
     }
 }
 
-// Reader: stops on WouldBlock *or* on pool exhaustion, and on exhaustion it clears
-// read interest so level-triggered readiness cannot spin against a full pool.
+// Reader: stops on WouldBlock, on EOF, on pool exhaustion, or when the per-event byte
+// budget is spent — so one full socket cannot starve timers or other connections.
 fn read_until_stalled(drv, pool, conns, c) -> Result<()> {
-    loop {
+    let mut budget = READ_BUDGET;
+    while budget > 0 {
         let mut chunk = match pool.get(READ_SIZE) {
             Ok(chunk) => chunk,
-            Err(Exhausted) => return drv.pause_reads(c),   // re-armed by the pool return path
+            Err(Exhausted) => return drv.pause_reads(c),   // resumed at the pool watermark
         };
         match drv.recv(c, &mut chunk)? {
-            Read::Data(n) => { chunk.truncate(n); conns[c].feed(chunk)?; }
-            Read::WouldBlock | Read::Eof => return Ok(()),
+            Read::Data(n) => {
+                budget = budget.saturating_sub(n);
+                chunk.truncate(n);
+                conns[c].feed(chunk.freeze())?;
+                drv.mark_active(c);
+            }
+            Read::WouldBlock => return Ok(()),
+            Read::Eof => { conns[c].feed_eof()?; drv.mark_active(c); return Ok(()); }
         }
     }
+    Ok(())   // readiness repeats, so the remainder is picked up on the next wait
 }
 ```
+
+`READ_SIZE` is 16 KiB and `READ_BUDGET` is 256 KiB per readiness event. The budget is the answer to "a peer that never lets the socket drain": the loop stops, `wait` returns, timers fire, and the same socket is reported again.
 
 A connection object is the TLS+protocol stack:
 
 ```rust
-conn.feed(chunk) -> Result<()>        // ciphertext in; decrypts, parses, retains refcounted spans
-conn.poll() -> Option<Event>          // Head, Data, Trailers, End, Reset, GoAway, Settings, Tunnel
-conn.output() -> Option<Chunk>        // already framed and encrypted, ready for the socket
-conn.finish()                         // queue the graceful shutdown (close_notify, GOAWAY)
+conn.start()                        // begin the handshake; a no-op for cleartext h1
+conn.feed(chunk) -> Result<()>      // ciphertext in; decrypts, parses, retains refcounted spans
+conn.feed_eof() -> Result<()>       // peer finished writing; the only way a truncated close is caught
+conn.poll() -> Option<Event>        // Head, Data, Trailers, End, Reset, GoAway, Settings,
+                                    // Ready, Drained, Tunnel, StreamWritable, StreamsAvailable
+conn.output() -> Option<Chunk>      // framed and encrypted, ready for the socket
+conn.finish()                       // queue close_notify / GOAWAY; poll() then yields Drained
+conn.tick()                         // return consumed credit to the engine
+conn.arm(&mut drv)                  // engine deadlines into the driver heap
+
+conn.open(kind) -> Result<StreamId, WouldBlock>   // the outbound half of Event::Head
+conn.send_head(stream, head) -> Result<()>
+conn.send_data(stream, chunk) -> Result<()>
+conn.send_trailers(stream, fields) -> Result<()>
+conn.reset(stream, code)
+conn.goaway(last_stream, code)
+conn.read_tunnel(stream, &mut ChunkMut) / conn.write_tunnel(stream, Chunk)
 ```
+
+`send` returns an outcome because there is one: `Sent::{All, Partial(n), WouldBlock}`. On `Partial(n)` the application keeps `out.slice(n..)` and retries when `Writable` arrives — the driver holds no output queue, so a short write is the application's to resume, not a hidden buffer. `Sent::WouldBlock` is not an error.
 
 The application writes the loop. Everything the loop touches is public.
 
@@ -187,7 +229,7 @@ Readiness is **level-triggered on every platform**. `wait` re-reports a socket t
 
 `recv` and `send` are non-blocking by contract and return `WouldBlock`. The driver never parks the calling thread; the application's loop does all the waiting, once, in `wait`.
 
-There is no re-arm step *at the API level*. A socket reports readiness while it has readiness to report, and the application never re-arms anything. The Windows backend re-arms its AFD poll internally per completion — an implementation detail the contract hides, and the one place the earlier claim "there is no re-arm step" was literally false.
+There is no re-arm step *at the API level*. A socket reports readiness while it has readiness to report, and the application never re-arms anything. The Windows backend re-issues its AFD poll after each completion; that re-issue belongs to the backend, not the application, and it is the one place the earlier claim "there is no re-arm step" was literally false.
 
 Readiness is a hint, not a promise, and the contract says so out loud: a `recv` after a read event may still return `WouldBlock`. That is not a defect to paper over — every readiness layer produces spurious wakeups, and the Windows one does so by construction (§6.7). Code that treats "readable" as "bytes are waiting" is wrong on every platform; code that loops until `WouldBlock` is right on every platform.
 
@@ -201,7 +243,7 @@ Backpressure is the absence of calls — with one exception. An application that
 
 The driver owns one timer heap, and it is the only clock. Connections do not expose deadlines for the application to aggregate — that would make "missed deadline" a user error. `conn.arm(&mut drv)` inserts or updates that connection's timers; `drv.deadline(conn, kind, after)` sets one explicitly (a tunnel, a slow body, a write-progress bound); `drv.wait()` derives its own timeout from the heap, so no call site can pass a wrong one.
 
-Each arming bumps a counter that travels with the event, so a timer re-armed between `wait` and the drain is recognised as stale even though its slot was not reused. `close` purges that connection's timers, and any event for a closed id is dropped at delivery — `Closed` is the last event an id ever produces, and nothing is delivered after it.
+Each arming bumps a counter the driver keeps; the driver compares it at delivery and drops the event if the timer was re-armed or purged in between. The counter never reaches the application, which is why `Io::Timer` carries only the connection and the kind. `close` purges that connection's timers, and any event for a closed id is dropped at delivery — `Closed` is the last event an id ever produces, and nothing is delivered after it.
 
 A batch also has an event budget. `wait` returns when the budget is spent, not only when the driver runs out of events, so a 10k-event batch cannot push a 1 ms deadline 100 ms late. "The earliest timer always fires" is a property of a `wait` call, and the budget is what keeps calls short.
 
@@ -283,7 +325,7 @@ enum CloseReason {
 - Writing requires an owned chunk. A received chunk is immutable; a split view is immutable. Mutability is not smuggled in through an interior handle.
 - Chunks carry a fixed headroom (16 bytes) so a protocol writer can back-fill a frame length without shifting bytes. This exists because QPACK and h2 both need to prepend a length after the payload is encoded.
 
-`ChunkPool` is per reactor shard, size-classed (4 KiB / 17 KiB / 65 KiB *usable* bytes in the first cut), and bounded by total bytes. Class sizes are usable sizes: the 16-byte headroom and the 2-byte tailroom are added on top, so a 16 KiB TLS record fits the second class instead of spilling into the third — which is how an apparently generous cap becomes ~1 000 records rather than ~4 000. `pool.get(size)` takes from a class or allocates; the allocation is counted and visible in metrics. The pool never grows past its cap, and the class sizes are a builder-tunable constant, not a hidden policy.
+`ChunkPool` is per reactor shard, size-classed (4 KiB / 17 KiB / 65 KiB *usable* bytes in the first cut), and bounded by total bytes. Class sizes are usable sizes, with headroom and tailroom added on top, so a full 16 KiB TLS record fits the 17 KiB class instead of spilling into the 65 KiB one — 64 MiB then holds about 3 800 records, and without that it holds about 1 000. `pool.get(size)` takes from a class or allocates; the allocation is counted and visible in metrics. The pool never grows past its cap, and the class sizes are a builder-tunable constant, not a hidden policy.
 
 ### When the pool is full
 
@@ -301,7 +343,9 @@ h2 stream-level flow control returns credit when the application has consumed a 
 
 Stream ids are 62-bit in QUIC, so the handle stores a `u64`; a compact 16-byte form only works for h2, and two forms is one too many.
 
-Within one thread a split costs one plain refcount; across threads it costs one atomic on the `Arc`, and the earlier claim that there is "no atomic beyond the refcount" was wrong exactly where a body chunk crosses to a worker or another shard.
+The refcount is atomic on every path. `Chunk` is `Send`, so a clone can cross a thread while another stays behind; there is no sound "same-thread plain count" case, and the earlier claim that there was one is withdrawn. An uncontended atomic increment is a lock-prefixed add — that is the cost, one per split.
+
+Framing never writes into a shared allocation. A read slice may begin at offset 0 of its allocation with another stream's payload immediately before it, so headroom on the *allocation* is not headroom on a *slice*. `send` therefore takes a chain of chunks, and the engine emits a frame header as one segment and the payload as the next; the kernel gathers them with one `writev` and nothing is copied to make room. Headroom remains on chunks the engine allocates itself, which is where a length can be back-filled.
 
 Connection-level credit is the opposite and does not wait: it is returned as soon as DATA is admitted to the connection's bounded reservation (§9.3), because otherwise one unread stream would freeze the whole connection's window.
 
@@ -333,7 +377,7 @@ A `Conn` is TLS plus one protocol engine, driven by three calls: `feed`, `poll`,
 - `poll` yields semantic events. It never yields frames, HPACK/QPACK instructions, or partial parse state.
 - `output` yields framed, encrypted bytes, ready for `send`.
 
-`output` has an admission rule, and without it this design deadlocks. It is not one FIFO: a stream's pending body is admitted only when that stream's window covers the bytes, while control frames and QPACK encoder/decoder bytes are never gated by a request stream, and a header block is admitted only after the encoder instructions it references. A single ordered queue that a blocked stream can fill would put a `PING` ACK or a GOAWAY behind a zero window the peer itself set; on h3 it would push encoder bytes behind blocked DATA until the peer's decoder exceeded `SETTINGS_QPACK_BLOCKED_STREAMS` and closed the connection in response to a legal action.
+`output` has an admission rule, and without it this design deadlocks. It is not one FIFO: a stream's pending body is admitted only when that stream's window covers the bytes, while control frames and QPACK encoder/decoder bytes are never gated by a request stream, and a header block is admitted only after the encoder instructions it references. A single ordered queue that a blocked stream can fill would put an h2 `PING` ACK or a GOAWAY behind a zero window the peer itself set. On h3 the encoder-stream half of that failure is currently unreachable, because capacity zero means there are no encoder instructions to order (§9.4) — but the rule is stated now because the dynamic table lands at M5 and the ordering requirement is not optional then.
 
 TLS is a layer, not a second pump. The application never sees plaintext/ciphertext plumbing; it sees `feed` and `output`, and a config that says whether TLS is on. This is what keeps "just enough" true for both the simple server and the relay.
 
@@ -369,20 +413,23 @@ All engines emit and accept the same events:
 ```rust
 Event::Head { stream, head }          // method, target, version, ordered fields
 Event::Data { stream, chunk }         // body bytes, refcounted
-Event::Trailers { stream, fields }
+Event::Trailers { stream, fields }    // terminal for the stream
 Event::End { stream }                 // end of body
 Event::Reset { stream, code }         // h2 RST_STREAM / h3 RESET_STREAM; never from h1
 Event::GoAway { last_stream, code }   // h2 GOAWAY / h3 close; never from h1
-Event::Settings { .. }                // peer settings; h1 synthesises defaults
+Event::Settings { .. }                // h2/h3 only; h1 produces none
 Event::Ready                          // an engine exists and the application may send
+Event::Drained                        // finish()'s output is fully written
 Event::Tunnel { stream }              // 101 / CONNECT established
+Event::StreamWritable { stream }      // h3: the transport will take more on this stream
+Event::StreamsAvailable(n)            // the peer's concurrent-stream room changed
 ```
 
-Connection lifecycle — connected, closed, failed — is reported by the driver (`Io`), not by the engine. The engine reports protocol facts; the driver reports socket facts. Keeping those apart is what lets the same engine sit over TLS, plain TCP or QUIC without knowing which it is on.
+Connection lifecycle — connected, closed, failed — is reported by the driver (`Io`) for TCP, and by `h3::Endpoint::poll` for QUIC connections, which are not `ConnId`s at all (§9.4). The engine reports protocol facts; the transport reports socket facts.
 
-The vocabulary above is what engines *emit*. Sending is the mirror of it, and it needs one thing the event list cannot express: opening a stream. `conn.open(kind) -> Result<StreamId, WouldBlock>` is the outbound counterpart of `Event::Head`, and `Event::StreamsAvailable(n)` says when the peer's `MAX_CONCURRENT_STREAMS` or QUIC stream limit has room again. Without them a relay cannot legally start a request at all — it could only discover capacity by failing.
+The vocabulary above is what engines *emit*, and §5.2's connection object is the send side: `open`, `send_head`, `send_data`, `send_trailers`, `reset`, `goaway`. `Event::StreamsAvailable(n)` says when the peer's `MAX_CONCURRENT_STREAMS` or QUIC stream limit has room again; without `open`, a relay could only discover capacity by failing.
 
-`Trailers` terminates the stream: no DATA follows it, and the type makes that unrepresentable rather than a rule to remember.
+`Trailers` terminates the stream: no DATA follows it. That is an engine rule, not a type property — a flat event enum cannot make it unrepresentable — so the engines enforce it and the fuzz targets check it.
 
 HTTP/1.1 has no stream ids, so the engine assigns synthetic ones in pipeline order. That single decision is what makes a generic relay possible: the proxy does not branch on protocol version when moving a body, only when configuring the connection.
 
@@ -408,10 +455,10 @@ HTTP/1.1 has no stream ids, so the engine assigns synthetic ones in pipeline ord
 - Three control streams (control, encoder, decoder). QPACK encoder and decoder bytes are **never** gated by a request stream's flow control — that ordering is a correctness requirement from §8, not a tuning choice.
 - QPACK: the RFC 9204 wire format, the static table (99 entries), Huffman (shared with HPACK), and field sections. **The dynamic table is deferred, not dropped.** v1 advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` and uses a literal-only encoder. The RFC makes that a clean cut: the default is zero, and when it is zero the peer's encoder must not insert entries or send encoder-stream instructions, so there is no eviction tracking, no blocked streams and no encoder stream to get wrong. The decoder stays format-complete, which is what makes raising the capacity later additive — same wire format, same settings, no public change.
 - **Egress is push-shaped, and this is where the connection shape really differs.** `quinn-proto` exposes a stream write that returns `Blocked` at the stream or connection send limit and becomes writable again after `MAX_STREAM_DATA` or an ACK. It cannot be handed a pre-framed connection-ordered byte stream, so `output_datagram` only drains `poll_transmit`, and bytes refused by the transport wait in the engine's bounded per-stream queue until `Event::StreamWritable`. Pushing everything into quinn instead would make quinn's send buffer the real bound and blow the memory budget.
-- **h3 flow control is the transport's, not ours.** quinn grants receive credit when the engine reads and offers no way to withhold it, so the §7 credit handle does not apply to h3: the bound is `TransportConfig::{receive_window, stream_receive_window}`, configured to the per-stream reservation and stated in the config. The engine therefore reads at most one chunk ahead per stream, so "read" and "consumed" cannot diverge.
-- **The boundary copies, and this is the full count.** Inbound datagrams: one copy per datagram, because `quinn-proto` takes `BytesMut`. Inbound stream bytes: one more copy, because quinn yields its own `Bytes`/`Chunk` that a pooled chunk cannot adopt. Outbound: `poll_transmit` writes coalesced datagrams into caller-owned `Vec<u8>`, so the transport does not allocate the packet — we copy that batch into a pooled chunk once, for the whole batch. RFC 9221 datagrams travel through `Bytes` in both directions. Three copies at the boundary, measured, and the public API never exposes a transport buffer type.
+- **h3 flow control is the transport's, not ours.** quinn grants receive credit when the engine reads and offers no way to withhold it, so the §7 credit handle does not apply to h3: the bound is `TransportConfig::{receive_window, stream_receive_window}`, configured to the per-stream reservation and stated in the config. The engine reads at most one chunk ahead per stream, so the gap between "read" and "consumed" is bounded by one chunk plus the configured window — a bound, not an impossibility.
+- **The boundary copies, and this is the full count.** Inbound datagrams: one copy per datagram, because `quinn-proto` takes `BytesMut`. Inbound stream bytes: one copy from quinn's stream buffer into a pooled chunk via `RecvStream::read`; the copy is forced by the bytes already being in quinn's buffer, not by a buffer type, and the destination chunk must be acquired *before* the read or a pool miss afterward loses data. Outbound: `poll_transmit` writes coalesced datagrams into caller-owned `Vec<u8>`, so the transport does not allocate the packet — we copy that batch into a pooled chunk once, for the whole batch. Per inbound body byte the boundary costs two copies; the outbound batch copy is a different path, not a third.
 - **h3 lifecycle is a second channel, and it is typed.** h3 connections are not `ConnId`s, so `h3::Endpoint::poll` yields `Closed(h3::ConnId, CloseReason)` with a generational id. The driver does not know about them; the proxy needs the reason to choose 502 versus retry.
-- Metadata: ECN is available per transmitted packet (`Transmit::ecn`) and per received packet, but *not* on the RFC 9221 datagram surface, and `local_ip()` is only populated for servers. The public datagram type reports what is actually there and `None` otherwise; it never fabricates metadata. That is a limit of the chosen transport, stated rather than papered over.
+- Metadata: ECN is available per transmitted packet (`Transmit::ecn`). Received ECN is an input to the transport's packet handling, not a property of an application datagram — a datagram frame can be coalesced into a packet with other frames — so the RFC 9221 datagram surface reports no ECN. `local_ip()` is populated for servers. The public datagram type reports what is really there and `None` otherwise.
 - No 0-RTT (the transport supports it; we do not), no connection migration, no Alt-Svc cache, no Happy Eyeballs in v1. The client is told to use h3, or not.
 
 **The deduplication layer is ours, and it is a public type.** `quinn-proto`'s `Endpoint` owns the CID demultiplexer and creates a connection from the first packet of a new CID, before any handle exists. It cannot live in the transport layer, which knows nothing about HTTP, and it must not leak quinn's types into the API. So h3 has its own endpoint:
@@ -482,12 +529,12 @@ The proxy ships as a library type plus an example binary with a static config; i
 
 ## 13. The proxy
 
-The proxy is a state machine on the pump thread, built only from public types. It never blocks and never needs a worker.
+The proxy is a state machine on the pump thread, built only from public types. It never blocks; its only worker involvement is name resolution before an upstream connect (§12).
 
 - h1↔h1, h1↔h2, h2↔h2, h1↔h3, h2↔h3, h3↔h3 — all of them, because the event vocabulary is shared; the only per-protocol code is connection setup.
 - Bodies relay as chunk handles: no copy, one refcount bump per stream split, and a batched return if the two connections live on different shards.
 - Hop-by-hop fields are stripped by a typed list, not a string set.
-- Flow control is propagated, but not uniformly, and the difference is a property of h1 rather than a bug to hide. An h2 or h3 leg is stream-granular: per-stream reservations, credit on consumption, reset for a stream that cannot drain. An **h1 leg is connection-granular**: no per-stream window, no per-stream abort, and stopping reads stops the whole socket. So the relay never multiplexes concurrent streaming exchanges onto one h1 connection — an h1 leg carries one streaming exchange at a time and is pooled for head-complete ones. Any other choice reproduces exactly the failure the brief forbids, where one slow stream stalls its neighbours.
+- Flow control is propagated, but not uniformly, and the difference is a property of the protocols. An h2 leg is stream-granular: per-stream reservations, credit on consumption, reset for a stream that cannot drain. An h3 leg is stream-granular too, but its bound is quinn's configured receive window rather than our credit handle, and a stream that cannot drain is reset by the transport, not by us. An **h1 leg is connection-granular**: no per-stream window, no per-stream abort, and stopping reads stops the whole socket. So the relay never multiplexes concurrent streaming exchanges onto one h1 connection — an h1 leg carries one streaming exchange at a time and is pooled for head-complete ones. Any other choice reproduces exactly the failure the brief forbids, where one slow stream stalls its neighbours.
 - Trailers force a framing decision the relay must make *before* it writes the head: h1 can carry trailers only if it chose chunked, so `Head` carries a `TrailerPolicy`, the relay sets `PreferChunked` whenever the source may produce trailers, and a source `content-length` is dropped and the body re-framed.
 - RST and GOAWAY propagate as events. An h1 leg has no per-stream equivalent, so a per-stream failure there closes the leg and fails every stream on it with a gateway error — stated as a policy, because the alternative (pretending h1 can abort one response mid-body) does not exist.
 - CONNECT and `101` become `Tunnel` pairs; half-close is forwarded in both directions, and a half-closed tunnel keeps reading the other way until it too closes or times out.
@@ -500,15 +547,15 @@ The v1 proxy is single-driver-thread per instance. Multi-shard relaying is possi
 
 1. **I/O model across platforms.** Readiness-shaped public contract; level-triggered; completions used for submission only, never for readiness. A completion API was rejected because it cannot be expressed on kqueue without a helper thread and an operation lifecycle the caller must manage. Readiness on top of completions is honest for reads and not for writes — no platform offers a writability probe on a completion channel — so `send` stays a real syscall and M4's completion work is batch submission. Windows settles it: no documented readiness API for writes at all, hence AFD polling with a `WSAPoll`+`ConnectEx` fallback. §4.3, §6.7.
 2. **Arming and backpressure.** Interest is a per-connection flag and readiness repeats while it is true. There is no per-event re-arm on the portable path; AFD re-arms internally. Backpressure is mostly "stop calling", plus one explicit pause: pool exhaustion clears read interest and parks the connection until the pool crosses its low watermark, because otherwise level-triggered readiness spins against a full pool. `close` aborts, `finish` drains to `Drained` and then half-closes. No operation ids, no completions. §6.1–6.8, §7.
-3. **Buffers.** Pooled, refcounted chunks with spans; split by refcount, never by copy; batched cross-thread returns; write requires ownership; headroom and tailroom for framing. Credit lives on the *handle*, one per `(stream, bytes)`, backed by an `Arc<CreditSink>` that survives a closed connection and refuses credit to a reused id. `get` fails at the pool cap rather than allocating past it. The copy budget is a table, not a claim. §7.
+3. **Buffers.** Pooled, refcounted chunks with spans; split by refcount, never by copy; batched cross-thread returns; write requires ownership; framing by a chunk chain rather than by writing into a shared slice. Credit lives on the *handle*, one per `(stream, bytes)`, backed by an `Arc<CreditSink>` that survives a closed connection and refuses credit to a reused id (h2; on h3 the window belongs to the transport, §9.4). `get` fails at the pool cap rather than allocating past it. The copy budget is a table, not a claim. §7.
 4. **Workers.** Application-owned threads; library-provided bounded queues, a per-connection cap *and* a global parked budget, opaque deadlines owned by the pump, and cancellation that makes late writes fail rather than corrupt. No worker touches a socket or a driver table. §11.
 5. **Fast-path scope.** v1 ships the portable A path on every platform. Phase 2 adds, each behind its own benchmark gate: io_uring submission batching for datagrams and file bodies, `SEND_ZC`, splice and `sendfile`-with-`sf_hdtr` for file bodies, `TransmitFile` on Windows, batched UDP. `send` itself stays a synchronous non-blocking syscall on every backend, because a completion cannot report writability (§4.3). Three facts are written into those ops rather than discovered later: `SEND_ZC` has two completions and the second means "buffer reusable", never "data delivered"; a notification can arrive after the socket is closed, so retained chunks are accounted per ring and close never waits on them; and multishot recv needs provided buffers, which a per-call buffer API cannot supply — so reads stay single-shot in v1 and that is the stated price of the chosen boundary.
-6. **QUIC backend.** `quinn-proto` 0.11 — the only pure-Rust sans-I/O QUIC transport in the field; quiche needs BoringSSL and cmake, s2n-quic mandates tokio, neqo needs NSS, gm-quic is async-bound. Its MSRV is 1.85, the same as ours. The boundary copies in both directions (§9.4): once per inbound datagram into `BytesMut`, once per outbound transmit batch. Per-datagram ECN is not available on its datagram surface, and the design says so instead of pretending. No 0-RTT, no migration, no discovery in v1. HTTP/3 framing and QPACK are ours; QPACK ships format-complete with the dynamic table deferred to its own milestone (capacity zero, literal-only encoder), which the RFC permits by default and which leaves raising it later additive.
+6. **QUIC backend.** `quinn-proto` 0.11 — the only pure-Rust sans-I/O QUIC transport in the field; quiche needs BoringSSL and cmake, s2n-quic mandates tokio, neqo needs NSS, gm-quic is async-bound. Its MSRV is 1.85, the same as ours. The boundary copies (§9.4): once per inbound datagram into `BytesMut`, once per inbound body byte out of quinn's stream buffer, once per outbound transmit batch. Per-datagram ECN is not available on its datagram surface, and the design says so instead of pretending. No 0-RTT, no migration, no discovery in v1. HTTP/3 framing and QPACK are ours; QPACK ships format-complete with the dynamic table deferred to its own milestone (capacity zero, literal-only encoder), which the RFC permits by default and which leaves raising it later additive.
 7. **TLS and milestone order.** rustls inside `Conn`; TLS at M2, before h2's gate, and h3 reuses the same configuration through the QUIC backend. §10, §15.
-8. **File bodies.** Not in the first milestone. The application streams chunks it reads on its own thread; sendfile/splice is a phase-2 op with the same gate as the rest of B. No file I/O on the pump thread, ever. §15.
+8. **File bodies.** Not in the first milestone. The application streams chunks it reads on its own thread; sendfile/splice is a phase-2 op with its own gate, like every other accelerator. No file I/O on the pump thread, ever. §15.
 9. **Half-close.** `shutdown_write` after `close_notify`; tunnels carry it; every backend implements it or the backend is not finished. §6.5.
 10. **Socket ownership.** Driver-owned authoritative tables, generational ids, no adoption, no fd in the API, abort and graceful close as distinct operations. §6.4.
-11. **Performance gate.** Attached to M1 and M2, which can actually serve the endpoints: A-vs-hyper on the same host, recorded rustc/kernel/hyper, six metrics on every platform. A miss keeps the milestone open — fix it or waive it in writing. §15.
+11. **Performance gate.** Attached to M1 and M2, which can actually serve the endpoints: A-vs-hyper on the same host, recorded rustc/kernel/hyper, six metrics on every platform. M3 is correctness-gated instead, because hyper does not speak h3. A miss keeps the milestone open — fix it or waive it in writing. §15.
 12. **Crate layout.** One crate, features `tls`, `h3`, `proxy`, `threads`, `roots`; MSRV 1.85; dependency list with a reason per entry, `ring` pinned as the crypto provider and quinn-proto's defaults disabled. §16.
 
 ---
@@ -543,6 +590,8 @@ Each gate stands up the milestone's endpoint and a hyper equivalent on the same 
 
 The two endpoints in the first version of this policy were the two cases the portable path is strongest on; the extra two exist because they are the cases where it is weakest.
 
+Hyper is the baseline for h1 and h2 only. There is no hyper h3, so Gate 3 is correctness (interop) plus numbers published against an independent implementation; it is not held to the hyper margin, and §14.11 says so rather than leaving the clause to apply uniformly and fail by construction.
+
 Pass condition, on every platform:
 
 - throughput ≥ 95% of hyper;
@@ -560,15 +609,15 @@ The margin is deliberately not "beat hyper". M1's job is to prove the shape is s
 
 | State | Target owned by the library | Dominant term |
 |---|---|---|
-| Idle h1 keep-alive connection | ≤ 3 KiB | parser state plus the pooled chunk a partial head sits in (smallest usable class is 4 KiB) |
+| Idle h1 keep-alive connection | ≤ 5 KiB | the 4 KiB chunk a partial head sits in, plus parser state |
 | Idle h2 keep-alive connection | ≤ 12 KiB | **two** HPACK dynamic tables — encoder and decoder, 4 KiB each — plus stream state |
 | Idle h3 connection | ≤ 32 KiB | quinn-proto loss-recovery and crypto state |
-| TLS, on top | ≤ 32 KiB **with `set_buffer_limit(16 KiB)`** | rustls bounds **two** buffers of 64 KiB each by default; configured down, this is the target |
+| TLS, on top | ≤ 64 KiB with `set_buffer_limit(16 KiB)` | `received_plaintext` is 16 KiB and **not** covered by `set_buffer_limit`; the two sendable buffers are 16 KiB each once configured |
 | Chunk pool, per shard | ≤ 64 MiB cap | a cap, not a page-in: RSS is cap × shards |
 
-The TLS default is the one that would have been embarrassing: 64 KiB × 2 buffers × 10k connections is 1.25 GiB, twice the h3 figure this design already flags. It is configured down and asserted at the gate.
+The TLS default is worse than the first version of this table said. `received_plaintext` is 16 KiB and sits outside `set_buffer_limit`; `sendable_tls` and `sendable_plaintext` are 64 KiB each by default. That is 144 KiB per connection, or 1.37 GiB at 10k — roughly four times the h3 figure this design flags as its worst case. Configured down it is 48 KiB, still 480 MiB at 10k, which is why the gate publishes the number with TLS on and off rather than one blended figure.
 
-So 10k idle connections cost roughly 30 MiB (h1), 120 MiB (h2) or 320 MiB (h3) before TLS, and the gate reports the real figure. The largest single line item is not a connection at all — it is the pool cap times the shard count, which at 8 shards is 512 MiB, and the earlier headline omitted it. If the h3 figure is unacceptable, the knob is a connection limit, not a smaller QUIC state.
+So 10k idle connections cost roughly 50 MiB (h1), 120 MiB (h2) or 320 MiB (h3) before TLS, and the gate reports the real figure. The largest single line item is not a connection at all — it is the pool cap times the shard count, which at 8 shards is 512 MiB, and the earlier headline omitted it. If the h3 figure is unacceptable, the knob is a connection limit, not a smaller QUIC state.
 
 ---
 
@@ -582,6 +631,7 @@ One crate, `libhttp`. Edition 2024, MSRV 1.85.
 | `h3` | quinn-proto, QPACK, the datagram edge | Drags the largest dependency; h1/h2 users should not pay for it |
 | `proxy` | the relay state machine | Leaf functionality; builds only on public API |
 | `threads` | `Server`, `Client`, `Workers` spawning | Keeps "the core spawns no threads" true by construction |
+| `roots` | `webpki-roots` for the client | A default trust store is a policy choice; some deployments use a private CA |
 
 | Dependency | Reason |
 |---|---|
@@ -595,7 +645,7 @@ One crate, `libhttp`. Edition 2024, MSRV 1.85.
 
 `rustls` and `quinn-proto` are configured deliberately, because their defaults contradict this design: rustls defaults to aws-lc-rs, which wants CMake and NASM on Windows, and quinn-proto's default features pull both crypto providers plus `rustls-platform-verifier`, which reads ambient OS roots. We pin `ring`, disable quinn-proto's default features, and make the root store an explicit feature.
 
-The "no C toolchain" claim in the brief applies to the QUIC *transport*, and quinn-proto satisfies it by being pure Rust. It does not apply to the crypto provider: `ring` compiles C and assembly on every platform, through the same compiler every supported CI image already has.
+The brief says TLS must not force a C toolchain unless the QUIC decision requires it, and `ring` compiles C and assembly — so this is a **deviation from the brief, recorded as one** rather than argued away. quinn-proto does not require a C toolchain; rustls' crypto provider does. The alternatives are aws-lc-rs (also native, plus CMake and NASM) or an experimental pure-Rust provider, neither of which is a smaller deviation. The decision to accept it is still open; if the brief's constraint is held, the TLS choice changes rather than the wording.
 
 Dev-only, never in the product: hyper (the benchmark baseline), an independent h2/h3 implementation (interop), a fuzzer harness.
 
