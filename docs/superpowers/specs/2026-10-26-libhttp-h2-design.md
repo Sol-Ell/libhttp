@@ -1,75 +1,95 @@
 # libhttp h2 — Design
 
-**Status:** subsystem design. Owns HTTP/2 framing, HPACK, stream state, flow control and the settings handshake.
+**Status:** subsystem design, rewritten after verification. Owns HTTP/2 framing, HPACK, stream state, flow control and the settings handshake.
 **Parent:** `2026-10-26-libhttp-design.md`.
-**Consumes:** `conn` (`Event`, `Head`, `Body`, `StreamId`, `Flow`, `send_*`), transport (`Chunk`, `CreditSink`).
+**Consumes:** `conn` (`Event`, `Head`, `Body`, `StreamId`, `StreamKind`, `Flow`, `OpenError`, `codes`, `send_*`), transport (`Chunk`, `CreditSink`).
 **Consumed by:** `proxy`.
 
 ---
 
 ## 1. Scope
 
-**Owns:** frames and the frame state machine, HPACK encoding and decoding, connection and stream flow control, stream admission and concurrency, `HEADERS`/`DATA`/`RST_STREAM`/`SETTINGS`/`GOAWAY`/`WINDOW_UPDATE`/`PING`/`CONTINUATION`, trailers, `CONNECT`, and the h2c connection preface.
+**Owns:** frames and their legality, HPACK, connection and stream flow control, stream admission and concurrency, `HEADERS`/`DATA`/`RST_STREAM`/`SETTINGS`/`GOAWAY`/`WINDOW_UPDATE`/`PING`/`CONTINUATION`, trailers, `CONNECT`, and the h2c preface.
 
-**Does not own:** TLS and ALPN (`tls`), the event vocabulary (`conn`), or push and priority, which are out of scope for v1 (§2).
+**Does not own:** TLS and ALPN (`tls`), the event vocabulary (`conn`), or push and priority, which are out of scope (§2).
 
 ---
 
-## 2. Out of scope, and what happens when a peer asks
+## 2. Out of scope, with the exact rule
 
-| Feature | v1 |
+| Feature | Rule |
 |---|---|
-| Server push | `PUSH_PROMISE` from a server is a connection error `PROTOCOL_ERROR`; `SETTINGS_ENABLE_PUSH` is sent as 0 and a peer that sends 1 is a `PROTOCOL_ERROR` |
-| Priority | `HEADERS` priority fields are parsed and discarded; `PRIORITY` frames are parsed and discarded; no scheduling changes |
-| Extended CONNECT (RFC 8441) | not advertised; a request that needs it is refused |
-| `101` | impossible on h2 |
-
-Parsing-and-discarding priority is deliberate: a frame that is legal to receive must not kill the connection, and rejecting priority would break peers that send it unconditionally.
+| Push | We send `SETTINGS_ENABLE_PUSH = 0`. Only a **client** may send that setting: a server receiving it, or a client receiving a value other than 0, is `PROTOCOL_ERROR`. A `PUSH_PROMISE` is `PROTOCOL_ERROR`, but only once our 0 has been acknowledged — before the SETTINGS arrives, a peer that has not yet seen it may legally push, and killing the connection on that race is a bug |
+| Priority | `PRIORITY` frames and `HEADERS` priority fields are parsed and discarded; the frame is legal in every stream state |
+| Extended CONNECT | not advertised; the request is refused |
+| `101` | impossible |
 
 ---
 
 ## 3. Framing
 
-The fixed 9-byte frame header and the v1 frame set: `DATA`, `HEADERS`, `PRIORITY`, `RST_STREAM`, `SETTINGS`, `PUSH_PROMISE`, `PING`, `GOAWAY`, `WINDOW_UPDATE`, `CONTINUATION`, plus unknown types, which are **ignored** (RFC 9113 §4.1) rather than rejected.
+Fixed 9-byte header; frames larger than our `SETTINGS_MAX_FRAME_SIZE` are `FRAME_SIZE_ERROR`. Unknown frame types are **ignored** (RFC 9113 §4.1), not rejected.
 
-`SETTINGS_MAX_FRAME_SIZE` is enforced: a frame larger than the advertised maximum is `FRAME_SIZE_ERROR`. A `HEADERS` block that does not fit one frame is continued with `CONTINUATION`, and **nothing may interleave** between the first `HEADERS` and the final `CONTINUATION` — any other frame in that window is a connection error `PROTOCOL_ERROR`. That rule is the one most likely to be got wrong, so it is a fuzz target on its own.
+The connection preface is the 24-byte client string; `conn`'s `Detect` committed to h2 before this engine saw a byte.
 
-`h2c` uses prior knowledge: the connection begins with the 24-byte preface, and `conn`'s `Detect` already committed to h2 before this engine sees a byte. There is no `Upgrade` dance.
+`SETTINGS` must be the first frame from each peer and is acknowledged with a `SETTINGS` ACK. A missing or misplaced `SETTINGS` is `PROTOCOL_ERROR`.
+
+`HEADERS` may be continued by `CONTINUATION`, and **nothing may interleave** between the first `HEADERS` and its final `CONTINUATION`; any other frame in that window is `PROTOCOL_ERROR`. That rule is a fuzz target on its own.
+
+### 3.1 Stream states
+
+| State | Legal inbound frames |
+|---|---|
+| idle | `HEADERS`, `PRIORITY`; anything else `PROTOCOL_ERROR` |
+| open | all |
+| half-closed (remote) | everything except `DATA`/`HEADERS`; those are `STREAM_CLOSED` |
+| half-closed (local) | `WINDOW_UPDATE`, `RST_STREAM`, `PRIORITY` |
+| closed | `PRIORITY`; `WINDOW_UPDATE`/`RST_STREAM` briefly after the transition; **everything else must be minimally processed**, and `DATA` is a stream error `STREAM_CLOSED` |
+
+"Minimally processed" is not "ignored": a `HEADERS` on a stream we just reset must still be HPACK-decoded, because the dynamic table is connection state and skipping one block desynchronises every later one. That obligation applies to refused streams too (§4).
 
 ---
 
-## 4. Streams
+## 4. Streams and admission
 
-Stream ids are odd for client-initiated and even for server-initiated; a new id must be greater than the last seen from that peer, or the connection is `PROTOCOL_ERROR`. A stream that is closed cannot be reopened; a frame for a closed stream is `STREAM_CLOSED`, except the three the RFC exempts — `RST_STREAM`, `WINDOW_UPDATE` and `PRIORITY` — which are ignored (RFC 9113 §5.1).
+Odd ids for client-initiated, even for server-initiated; a new id greater than the last from that peer, or `PROTOCOL_ERROR`. A closed id cannot be reopened.
 
-**Admission.** The advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is derived, not guessed: `reservation_cap / min_stream_reservation`, with a floor of one maximum frame per stream, so the advertised limit and the reservation cap cannot drift apart. A `HEADERS` that would exceed it is refused with `REFUSED_STREAM` — the code that promises *not processed* — before any work is done. That code is only legal here because the engine refuses at the frame, before dispatch; a stream that has been dispatched and later times out carries `CANCEL` instead (§9).
+**Admission.** We advertise `SETTINGS_MAX_CONCURRENT_STREAMS = reservation_cap / min_stream_reservation`, floored at one maximum frame per stream, so the limit and the cap cannot drift. A `HEADERS` that would exceed it is refused with `REFUSED_STREAM` before dispatch, which is the only place that code is legal.
 
-A stream counts as concurrent from `HEADERS` until it is closed, including half-closed states.
+**Refusal still decodes the block.** The refused stream's `HEADERS` (and any trailer `HEADERS` that arrives before we reset) are decoded and discarded; otherwise the HPACK table diverges and the next accepted request fails with `COMPRESSION_ERROR`.
+
+**Outbound admission.** `open` returns `OpenError::WouldBlock` at the peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, and the engine emits `Event::StreamsAvailable` when a slot frees. `StreamWritable` is emitted when a stream's send window reopens. Without both, the relay waits forever (`proxy` §4).
+
+`open(StreamKind::Connect)` is the CONNECT path (§10).
 
 ---
 
 ## 5. HPACK
 
-Implemented here, not delegated: static table, Huffman coding, dynamic table with eviction, and the encoder/decoder instruction set.
+Implemented here: static table, Huffman, the dynamic table with eviction, and both instruction sets.
 
-- The decoder advertises `SETTINGS_HEADER_TABLE_SIZE` (default 4096) and evicts to match; an encoder that references a needed entry after it was evicted is `COMPRESSION_ERROR`, which is a **connection** error because the decoder's state is now unrecoverable.
-- The encoder keeps a dynamic table bounded by the peer's advertised size. Unlike QPACK, h2 header blocks arrive in order on the connection, so eviction needs no per-block reference counting: an eviction is simply an instruction the decoder applies in order. That asymmetry with QPACK is the reason QPACK's dynamic table is deferred to M5 and this one is not.
-- Sensitive values (authorization, cookie) use the never-indexed representation; the choice is per field and lives in the serializer.
+- The decoder advertises `SETTINGS_HEADER_TABLE_SIZE` (default 4096) and evicts to match. An encoder reference to an evicted entry is `COMPRESSION_ERROR`, which is a **connection** error because the table is unrecoverable.
+- The encoder keeps a table bounded by the peer's advertised size. h2 header blocks arrive in order on the connection, so eviction needs no per-block reference counting — unlike QPACK, whose out-of-order streams are why its table is deferred to M5.
+- Sensitive values use the never-indexed representation.
 
-Header blocks are decoded into a `Head` (`conn` §2) with the arena owned by the block, so a `Head` outlives the frames it arrived in.
+Header blocks decode into a `Head` whose arena outlives the frames.
 
 ---
 
 ## 6. Flow control
 
-Two windows per direction: connection and stream. Initial values are 65535 or `SETTINGS_INITIAL_WINDOW_SIZE`; a `DATA` that exceeds either is `FLOW_CONTROL_ERROR`.
+Two windows per direction, and they are **not** the same kind of thing:
 
-Credit policy, which is the part that decides whether one slow consumer stalls its neighbours:
+- The **connection** window starts at 65535 and is changed only by `WINDOW_UPDATE`. `SETTINGS_INITIAL_WINDOW_SIZE` does **not** affect it.
+- Each **stream** window starts at the peer's `SETTINGS_INITIAL_WINDOW_SIZE` (65535 by default); a change to that setting retroactively shifts every open stream's window by the delta, which is why a stream window can go **negative** and why the engine must track it as a signed value (RFC 9113 §6.9.2).
+- Neither window may exceed 2^31 − 1; an overflow is `FLOW_CONTROL_ERROR`.
 
-- **Connection window**: returned as soon as DATA is admitted into the connection's bounded per-stream reservation, not when the application consumes it.
-- **Stream window**: returned when the application consumes the `Body` handle (conn §4), via the transport's `CreditSink`, drained by `Conn::tick` (`conn` §6.6).
-- The sum of per-stream reservations is a hard cap, and each stream has a floor of at least one maximum frame, so `cap/N` cannot collapse to zero while a stream is legitimate.
-- A stream that cannot drain within its reservation is reset with `CANCEL` — see §9 for why not `REFUSED_STREAM`.
+Credit policy, which decides whether one slow consumer stalls its neighbours:
+
+- Connection credit returns as soon as DATA is admitted into the bounded per-stream reservation.
+- Stream credit returns when the application consumes the `Body` (`conn` §4), via `CreditSink`, drained by `Conn::tick`.
+- Per-stream reservations sum to a hard cap with a floor of one maximum frame.
+- A stream that cannot drain within its reservation is reset with `CANCEL`.
 
 `WINDOW_UPDATE` is emitted from `tick`, which is why the pump calls `tick` before draining output (`conn` §6.6).
 
@@ -77,58 +97,60 @@ Credit policy, which is the part that decides whether one slow consumer stalls i
 
 ## 7. Headers
 
-Pseudo-headers must precede regular fields; `:method`, `:scheme` and `:path` are required for a request (`:path` may be `*` only for `OPTIONS`), `:authority` is optional, and a response carries `:status`. A duplicate pseudo-header, a pseudo-header after a regular field, an undefined pseudo-header, or a `:status` that is not three digits is `PROTOCOL_ERROR`.
+Pseudo-headers precede regular fields; `:method`, `:scheme`, `:path` for a request, `:authority` optional, `:status` for a response, none in trailers. Duplicate or misplaced pseudo-headers, an undefined one, or a non-three-digit `:status` is `PROTOCOL_ERROR`.
 
-Connection-specific fields are forbidden: `connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade` — any of them is a malformed request. `te` is allowed only with the value `trailers`.
+**The one exemption:** `CONNECT` has `:method` and `:authority` only — no `:scheme`, no `:path` (RFC 9113 §8.5). The exemption lives here, not only in §10, because the general rule would otherwise reject it.
 
-`content-length`, when present, must equal the sum of `DATA` payloads, or the stream is `PROTOCOL_ERROR`. `Host` is not required; `:authority` carries it, and a mismatched `host` is not an error but is preserved for the relay.
+Field validation: uppercase names, leading or trailing whitespace, NUL/CR/LF, and the connection-specific fields (`connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade`) are malformed. `te` is allowed only with `trailers`.
 
-Trailers are a `HEADERS` block after the body, ending the stream (`conn` §3).
+`Host` versus `:authority`: a disagreement is **malformed** (RFC 9113 §8.3.1 says a server SHOULD reject it), and this engine does. There is no "reconciled per protocol" rule; the relay rejects it too.
+
+`content-length`, when present, must equal the sum of `DATA`, or `PROTOCOL_ERROR`.
 
 ---
 
 ## 8. GOAWAY and graceful shutdown
 
-`finish` does not send GOAWAY immediately. The engine sends a first GOAWAY with `last_stream = 2^31 - 1` only when the application asks to stop accepting new streams, then a second with the last accepted id once the in-flight streams are terminal or the `Drain` deadline fires.
+Two-phase, the same shape as h3. `Conn::stop_accepting` sends GOAWAY with `last_stream = 2^31 − 1` — stop opening, reject nothing. `Conn::finish` requests the drain; the final GOAWAY with the last accepted id is emitted only when every accepted stream is terminal or the `Drain` deadline fires.
 
-`Drained` follows `conn` §6.5's three conditions, which include the TLS queue; this document does not restate them, because a weaker local version is how a FIN gets ahead of `close_notify`. A GOAWAY that overtakes a response body would truncate the very streams it acknowledges — that trap is stated in `conn` and is the reason the two-phase form is required here.
+`Drained` follows `conn` §6.5's three conditions, which this document does not restate. A GOAWAY that overtakes a response body truncates the streams it acknowledges; that is the trap the two-phase form exists to avoid.
 
-A peer GOAWAY is an `Event::GoAway`; streams above `last_stream` were not processed and are safe to retry, and the engine does not silently retry them.
+A peer GOAWAY is `Event::GoAway`; streams above `last_stream` never ran and are retryable (`proxy` §6).
 
 ---
 
-## 9. Stream errors versus connection errors
+## 9. Errors, with fatality
 
-| Code | Use |
-|---|---|
-| `REFUSED_STREAM` | admission refusal only: nothing was processed |
-| `CANCEL` | a dispatched stream that timed out, or a consumer that could not drain within its reservation |
-| `STREAM_CLOSED` | a frame on a closed stream where RFC 9113 requires it |
-| `PROTOCOL_ERROR` | malformed frames, pseudo-header violations, interleaved `CONTINUATION` |
-| `COMPRESSION_ERROR` | an HPACK failure; always connection-level |
-| `FLOW_CONTROL_ERROR` | a window violation |
-| `ENHANCE_YOUR_CALM` | a peer exceeding configured limits without violating a framing rule |
+| Code | Level | Condition |
+|---|---|---|
+| `PROTOCOL_ERROR` | connection | malformed frame, pseudo-header violation, interleaved `CONTINUATION`, preface/`SETTINGS` rules |
+| `COMPRESSION_ERROR` | connection | any HPACK failure — the table is unrecoverable |
+| `FLOW_CONTROL_ERROR` | connection | window overrun |
+| `FRAME_SIZE_ERROR` | connection | frame above `SETTINGS_MAX_FRAME_SIZE` |
+| `REFUSED_STREAM` | stream | admission refusal only: nothing was processed |
+| `CANCEL` | stream | a dispatched stream timed out, or could not drain |
+| `STREAM_CLOSED` | stream | `DATA`/`HEADERS` on a non-open stream |
+| `CONNECT_ERROR` | stream | a CONNECT that failed to establish |
+| `ENHANCE_YOUR_CALM` | either | a peer exceeding configured limits without breaking framing |
 
-The distinction that matters: `REFUSED_STREAM` promises the peer nothing ran. A deadline or a drain failure must never carry it, because a retrying peer would replay side effects.
+`REFUSED_STREAM` promises the peer nothing ran. A deadline or a drain failure must never carry it.
 
 ---
 
 ## 10. CONNECT
 
-Plain `CONNECT` is supported: `:method = CONNECT`, `:authority` required, no `:scheme` or `:path`. On success the stream becomes a `Tunnel` (`conn` §3), and its half-close is `END_STREAM` on that stream — the connection is untouched, which is why the tunnel API is per-stream.
-
-Extended CONNECT is not advertised and cannot be used.
+`open(StreamKind::Connect)`; `:method = CONNECT`, `:authority` required, no `:scheme`/`:path`. On success the stream becomes a `Tunnel`, and half-close is `END_STREAM` on that stream — the connection is untouched, which is why the tunnel API is per stream. A failed attempt is `CONNECT_ERROR`.
 
 ---
 
 ## 11. Output admission
 
-Per-stream pending bodies are admitted only when that stream's window covers them; control frames (`WINDOW_UPDATE`, `PING` ACK, `SETTINGS` ACK, `RST_STREAM`, `GOAWAY`) are never gated by a stream. A blocked stream's data therefore cannot delay a PING ACK or a GOAWAY — the rule is `conn` §6.4 and is enforced here at the point frames are queued.
+A stream's pending body is admitted only when its window covers it; control frames (`WINDOW_UPDATE`, `PING` ACK, `SETTINGS` ACK, `RST_STREAM`, `GOAWAY`) are never gated. A blocked stream's data cannot delay a PING ACK or a GOAWAY (`conn` §6.4).
 
 ---
 
 ## 12. What a builder decides
 
-`SETTINGS` values beyond the ones that are contracts (initial window, max frame size, max concurrent derived from the cap), HPACK's dynamic table eviction heuristic, and whether `DATA` is coalesced into larger frames.
+`SETTINGS` values beyond the contract ones, HPACK eviction heuristics, and whether `DATA` frames are coalesced.
 
-Not theirs: the admission derivation and its refusal code, the credit policy, the interleaved-`CONTINUATION` rule, the pseudo-header rules, the forbidden fields, and the two-phase GOAWAY.
+Not theirs: admission and the refusal code, the decode-refused-blocks obligation, the credit policy, the state table, the pseudo-header rules and the CONNECT exemption, the negative-window tracking, and the two-phase GOAWAY.

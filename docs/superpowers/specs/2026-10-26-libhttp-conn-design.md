@@ -138,8 +138,8 @@ pub enum Event {
     Data { stream: StreamId, body: Body },
     Trailers { stream: StreamId, head: Head },   // kind == HeadKind::Trailers; terminal
     End { stream: StreamId },                     // terminal, no trailers
-    Reset { stream: StreamId, code: u32 },
-    GoAway { last_stream: StreamId, code: u32 },
+    Reset { stream: StreamId, code: u64 },
+    GoAway { last_stream: StreamId, code: u64 },
     Settings,
     Ready,
     Drained,
@@ -147,7 +147,7 @@ pub enum Event {
     Tunnel { stream: StreamId },
     StreamWritable { stream: StreamId },
     StreamsAvailable { count: usize },
-    Datagram { data: Chunk },                     // h3 RFC 9221; no address, no ECN
+    Datagram { flow: StreamId, data: Chunk },     // h3 RFC 9221; carry the Quarter Stream ID
     DatagramWritable,                             // h3: the datagram send buffer cleared
 }
 ```
@@ -186,7 +186,7 @@ impl Body {
 
 `Body.stream` must equal the `stream` on the event that carried it; the engine sets both, and `send_data(stream, body)` returns `ConnError::StreamMismatch` if they disagree. That is a checked invariant rather than a hope, because the alternative is credit landing on the wrong stream.
 
-`Option<Arc<CreditSink>>` is `None` for h3, where the transport owns the receive window and credit is released at read time (`h3` §7). Every other protocol carries a sink, and the `Conn` is given it at construction (§6.1) — a `Conn` never needs a `Driver`.
+`Option<Arc<CreditSink>>` is `Some` only for h2, the one protocol whose flow control is a window this layer returns on consumption. h1 has no window — its backpressure is not reading — and h3's window belongs to the transport (`h3` §7), so both carry `None`. A sink is passed to the `Conn` only when it needs one (§6.1), which is why a `Conn` never needs a `Driver`.
 
 Dropping the last view for a `(stream, bytes)` credits the sink. A sink whose connection is gone is closed and the credit is discarded rather than delivered to a reused id (transport §5.3).
 
@@ -204,9 +204,9 @@ impl Conn {
     pub fn send_data(&mut self, stream: StreamId, body: Body) -> Result<Flow, ConnError>;
     pub fn send_end(&mut self, stream: StreamId) -> Result<(), ConnError>;
     pub fn send_trailers(&mut self, stream: StreamId, head: Head) -> Result<(), ConnError>;
-    pub fn send_datagram(&mut self, data: Chunk) -> Result<(), ConnError>;      // h3 only
-    pub fn reset(&mut self, stream: StreamId, code: u32) -> Result<(), ConnError>;
-    pub fn goaway(&mut self, last_stream: StreamId, code: u32);
+    pub fn send_datagram(&mut self, flow: StreamId, data: Chunk) -> Result<(), ConnError>;  // h3 only
+    pub fn reset(&mut self, stream: StreamId, code: u64) -> Result<(), ConnError>;
+    pub fn goaway(&mut self, last_stream: StreamId, code: u64);
     pub fn stop_accepting(&mut self);                                          // first GOAWAY
     pub fn body_wanted(&mut self, stream: StreamId);                            // h1: 100-continue
 
@@ -220,7 +220,8 @@ impl Conn {
 - `send_data` returns `Flow::Blocked(body)`: a body refused by the stream's reservation is the caller's to retry. Silently dropping it would be a lost body; buffering it inside the engine would make the reservation a lie.
 - `send_end` and `send_trailers` are terminal and mutually exclusive. Sending either twice, or sending one after the other, is `ConnError::StreamDone`, and the stream is aborted — not the connection (§7).
 - `reset` refuses with `StreamDone` when both sides have already finished, because a frame on a closed stream is a protocol violation (RFC 9113 §5.1) and the signature must be able to say so.
-- `send_datagram` is `ConnError::DatagramTooLarge` above the transport's `max_size`, never a silent drop, and `ConnError::Transport(Error::Exhausted)` is impossible here — the buffer-full case is `Event::DatagramWritable` instead.
+- `send_datagram` is associated with a request stream (`flow`), which becomes the Quarter Stream ID on the wire. It is `ConnError::DatagramTooLarge` above the per-flow `max_datagram_size`, `ConnError::DatagramsUnsupported` when the peer did not advertise support, never a silent drop, and the buffer-full case is `Event::DatagramWritable` rather than an error.
+- Reset and GOAWAY codes are `u64` because h3's do not fit in 32 bits; h2's values are a subset and are passed through. `codes` holds the constants the library uses, so a relay never hardcodes `0x8` or `0x10c`.
 - The tunnel trio is per stream on every protocol. On h1 the stream is the connection's single tunnel, and `end_tunnel` maps to the connection half-close; on h2/h3 it is `END_STREAM` on that stream and the connection is untouched.
 
 ---
@@ -341,6 +342,18 @@ Fatality, which is the part callers branch on:
 h1's "response body written after End" aborts the stream; it closes the connection only because the response was already on the wire, and that is `h1`'s decision, not this variant's fatality.
 
 ---
+
+## 7a. Codes
+
+```rust
+pub mod codes {
+    pub const CANCEL: u64 = 0x8;                 // h2
+    pub const REFUSED_STREAM: u64 = 0x7;         // h2
+    pub const INTERNAL_ERROR: u64 = 0x2;         // h2
+    pub const H3_REQUEST_REJECTED: u64 = 0x10b;  // h3
+    pub const H3_REQUEST_CANCELLED: u64 = 0x10c; // h3
+}
+```
 
 ## 8. What a builder decides
 
