@@ -264,7 +264,7 @@ impl Conn {
 
 `start` begins whatever the transport needs: a TLS handshake's first flight on TCP, a no-op for cleartext and for QUIC (whose handshake belongs to the endpoint). It is idempotent.
 
-### 6.3 feed, feed_eof, feed_datagram
+### 6.3 feed and feed_eof
 
 `feed` decrypts if TLS is present and hands plaintext to the engine. It never calls back into the application and never yields events; parsing output is drained by `poll`. `feed_eof` hands end-of-input to TLS first, then the engine — that ordering is what separates a clean `close_notify` from a truncated close (`tls` §3.4).
 
