@@ -46,23 +46,25 @@ impl Endpoint {
     pub fn feed(&mut self, datagram: Datagram<'_>) -> Result<(), Error>;
     pub fn poll(&mut self) -> Option<EndpointEvent>;
     pub fn accept(&mut self) -> Option<h3::ConnId>;
-    pub fn conn(&mut self, id: ConnId3) -> Option<&mut Conn>;
+    pub fn conn(&mut self, id: h3::ConnId) -> Option<&mut H3Conn>;
     pub fn output_datagram(&mut self) -> Option<OutDatagram<'_>>;
 }
 
 pub enum EndpointEvent {
-    Accepted(ConnId3),              // a client-initiated connection exists
-    Connected(ConnId3),
-    Closed(ConnId3, CloseReason),
+    Accepted(h3::ConnId),           // a client-initiated connection exists
+    Connected(h3::ConnId),
+    Closed(h3::ConnId, CloseReason),
     DatagramWritable,
 }
 ```
 
 `h3::ConnId` is generational and distinct from the transport's `ConnId`, because one UDP socket carries many connections and none of them is a socket. That is the one place where the handle shape differs by protocol, and it is visible in the types rather than hidden behind one.
 
+`H3Conn` exposes the same event vocabulary and send API as `conn::Conn` (`conn` §3, §5) — it is the QUIC path of the same envelope, not a second one — but it is created and owned by the endpoint, because a QUIC connection has no socket to be created from. `conn::Conn` covers the TCP path, where the transport's `ConnId` is the identity.
+
 An h3 connection's lifecycle is reported here, not by `Io`: `poll` yields `Closed` with the same `CloseReason` vocabulary, because the proxy needs the reason to choose between a 502 and a retry and cannot infer it from a UDP socket.
 
-A new client connection is created by the endpoint (from an accepted handle) or by `Endpoint::connect` (client, which owns the four-tuple). A server never reuses a `ConnId3` for a different CID.
+A new client connection is created by the endpoint (from an accepted handle) or by `Endpoint::connect` (client, which owns the four-tuple). A server never reuses an `h3::ConnId` for a different CID.
 
 ---
 
