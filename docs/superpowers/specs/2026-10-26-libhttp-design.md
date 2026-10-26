@@ -246,6 +246,45 @@ Zero-byte completion probes are not used for readiness: a zero-byte `WSASend` co
 
 ---
 
+### 6.9 Driver operations
+
+The transport's surface, normative. §5.2 shows one loop that uses it and defines nothing.
+
+```rust
+let mut drv = Driver::new(Config::default())?;
+
+drv.listen(addr) -> Result<ListenerId>
+drv.connect(addr) -> Result<ConnId>           // completes as Io::Connected / ConnectFailed
+drv.accept(l) -> Result<(ConnId, SocketAddr)> // inactive; reads need activate
+drv.activate(c) -> Result<()>
+drv.interest(c, Interest) -> Result<()>
+drv.recv(c, &mut ChunkMut) -> Result<Read>     // Read::{Data(usize), WouldBlock, Eof}
+drv.send(c, &[Chunk]) -> Result<Sent>          // Sent::{All, Partial(usize), WouldBlock}
+drv.close(c)
+drv.shutdown_write(c) -> Result<()>
+drv.pause_reads(c)
+drv.paused() -> usize
+
+drv.bind_udp(addr) -> Result<UdpId>
+drv.recv_datagrams(u, &mut [Datagram]) -> Result<usize>
+drv.send_datagrams(u, &[OutDatagram]) -> Result<usize>
+
+drv.deadline(c, TimerKind, after)
+drv.wait() -> Result<()>
+drv.next_io() -> Option<Io>
+drv.mark_active(c)                             // the application notes work for this batch
+drv.active() -> impl Iterator<Item = ConnId>   // the ids it may poll this iteration
+drv.wake()                                     // any thread, through a WakeHandle (§11)
+```
+
+`Config { pool: PoolConfig, batch_budget: usize }`. Defaults: 64 MiB pool, 512 events per `wait`.
+
+**The active set belongs to the driver and is filled by the application** via `mark_active`: after feeding bytes, after producing output, after a deadline fires, after a wakeup. It is what lets the loop skip a scan of every connection (§5.2). It is not optional — a connection never marked is never polled — and it costs one integer per connection per busy iteration.
+
+**EOF latches.** The first `Read::Eof` for a connection sets a read-shut latch: the driver reports `HalfClose` once and then stops reporting `Readable` for that id until the application calls `activate` again. Without the latch, level-triggered readiness re-reports a FIN'd socket forever.
+
+**`Sent::WouldBlock` is not an error**, and `Partial(n)` is the normal outcome of a full socket buffer. The driver holds no output queue (§6.4), so the chunks remain the application's until fully written.
+
 ## 7. Buffer contract
 
 ### 7.1 Chunk and pool
@@ -277,7 +316,7 @@ struct Body {
 - `CreditSink` outlives the connection: it carries a generation and a closed flag, so a handle dropped after `close` credits a dead sink instead of a recycled `ConnId`.
 - `conn.tick()` drains the sink and returns credit to the engine. **`tick()` runs before the output drain** (§5.2), because returning credit can itself require output — an h2 `WINDOW_UPDATE`, or an h3 `ShouldTransmit`.
 
-h3's mechanism differs under the hood (§9.5) but the public rule is the same one: the handle is consumed, and only then does the peer learn it can send more.
+h3's mechanism differs under the hood (§9.6) and it is genuinely different, not a detail: the transport releases receive credit when its `Chunks` value is finalized or dropped, and that value borrows the connection, so it cannot be held across an engine operation. h3 therefore releases credit at read time. The public rule — a body is consumed, then the peer may send more — is what h2 and the relay depend on; h3's bound comes from the transport's configured windows instead, and a slow h3 consumer is bounded by them rather than by the handle.
 
 ### 7.3 Copy and atomic budget
 
@@ -371,7 +410,11 @@ conn.send_end(stream) -> Result<()>                  // body finished, no traile
 conn.send_trailers(stream, fields) -> Result<()>
 conn.reset(stream, code)
 conn.goaway(last_stream, code)
-conn.read_tunnel(stream, &mut ChunkMut) / conn.write_tunnel(stream, Chunk)
+
+// Tunnels are stream-scoped, because h2 and h3 CONNECT carry many streams per connection
+conn.read_tunnel(stream, &mut ChunkMut) -> Result<Read>   // Data(n) | WouldBlock | Eof
+conn.write_tunnel(stream, Chunk) -> Result<Sent>
+conn.end_tunnel(stream)                                    // per-stream half-close
 ```
 
 The connection's outbox, shown in §5.2, is the application's, not the driver's: `output` transfers ownership to it and `send` borrows from it, so a `WouldBlock` or a `Partial` leaves the chunk where the application can retry it. The driver holds no output queue (§6.4).
@@ -424,6 +467,19 @@ QUIC delegated to `quinn-proto`; framing, QPACK, control streams, SETTINGS and G
 **Datagram metadata.** ECN is available per transmitted packet. Received ECN is an input to the transport's packet handling, not a property of an application datagram — a datagram frame can be coalesced into a packet with other frames — so the public datagram type reports no ECN. `local_ip()` is populated for servers. Nothing is fabricated.
 
 **Not in v1.** 0-RTT, connection migration, Alt-Svc, Happy Eyeballs. The client is told to use h3, or not.
+
+**The demultiplexer is a public type of ours.** `quinn-proto`'s `Endpoint` owns CID demultiplexing and creates a connection from the first packet of a new CID, before any handle exists. It cannot live in the transport (which knows nothing about HTTP) and must not leak quinn's types. So:
+
+```rust
+h3::Endpoint::new(udp: UdpId, config) -> Result<h3::Endpoint>
+endpoint.feed(datagram, meta)                  // inbound demux; may produce a new connection
+endpoint.accept() -> Option<h3::ConnId>
+endpoint.conn(id) -> Option<&mut Conn>
+endpoint.output_datagram() -> Option<OutDatagram>
+endpoint.poll() -> Option<EndpointEvent>       // Accepted(h3::ConnId) | Closed(h3::ConnId, CloseReason)
+```
+
+h3 connections are therefore **not** `ConnId`s: one UDP socket carries many, and the driver keeps treating that socket as an opaque datagram pipe. The proxy needs the close reason, which is why it is in the endpoint event rather than inferred.
 
 ---
 
