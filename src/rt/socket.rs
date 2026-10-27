@@ -127,6 +127,7 @@ mod tests {
     #[test]
     fn shutdown_write_sends_eof_to_the_peer() {
         let (server, mut client) = socket_pair();
+        client.set_nonblocking(false).unwrap();
         server.shutdown_write().unwrap();
 
         let mut buf = [0u8; 1];
@@ -136,6 +137,8 @@ mod tests {
     #[test]
     fn data_flows_both_ways_and_close_sends_eof() {
         let (mut server, mut client) = socket_pair();
+        server.set_nonblocking(false).unwrap();
+        client.set_nonblocking(false).unwrap();
 
         server.write_all(b"ping").unwrap();
         let mut buf = [0u8; 4];
