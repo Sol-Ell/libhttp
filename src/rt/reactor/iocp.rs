@@ -46,8 +46,8 @@ use crate::rt::slab::ConnId;
 use crate::rt::socket::OwnedSocket;
 #[cfg(test)]
 use crate::rt::test_support::{
-    CommandKind, ControlChannel, Reply, Shutdown, Spawned, SpawnedInternal, SpawnedWithControl,
-    TestControl,
+    CommandKind, ControlChannel, Reply, Shutdown, SpawnClient, Spawned, SpawnedInternal,
+    SpawnedWithControl, TestClientHandle, TestControl,
 };
 use crate::rt::wake::Wake;
 
@@ -183,9 +183,24 @@ impl Drop for ConnectOp {
 /// An operation whose `OVERLAPPED` is currently owned by the completion port.
 enum Posted {
     Accept(Box<AcceptOp>),
-    Recv { id: ConnId, op: Box<RecvOp> },
-    Send { id: ConnId, op: Box<SendOp> },
-    Connect { op: Box<ConnectOp> },
+    Recv {
+        id: ConnId,
+        op: Box<RecvOp>,
+    },
+    Send {
+        id: ConnId,
+        op: Box<SendOp>,
+    },
+    /// A pre-loop connect whose result is picked up by `connect_result`.
+    Connect {
+        op: Box<ConnectOp>,
+    },
+    /// A test-client connect; its acknowledgement receives the result.
+    #[cfg(test)]
+    TestConnect {
+        op: Box<ConnectOp>,
+        ack: std::sync::mpsc::Sender<Reply>,
+    },
 }
 
 impl Posted {
@@ -195,6 +210,8 @@ impl Posted {
             Self::Recv { op, .. } => std::ptr::from_ref(&op.overlapped),
             Self::Send { op, .. } => std::ptr::from_ref(&op.overlapped),
             Self::Connect { op } => std::ptr::from_ref(&op.overlapped),
+            #[cfg(test)]
+            Self::TestConnect { op, .. } => std::ptr::from_ref(&op.overlapped),
         }
     }
 
@@ -206,6 +223,8 @@ impl Posted {
             Self::Recv { op, .. } => op.socket,
             Self::Send { op, .. } => op.socket,
             Self::Connect { op } => op.socket,
+            #[cfg(test)]
+            Self::TestConnect { op, .. } => op.socket,
         }
     }
 
@@ -213,6 +232,8 @@ impl Posted {
         match self {
             Self::Accept(_) | Self::Connect { .. } => None,
             Self::Recv { id, .. } | Self::Send { id, .. } => Some(*id),
+            #[cfg(test)]
+            Self::TestConnect { .. } => None,
         }
     }
 }
@@ -448,6 +469,12 @@ impl<H: Handler> IocpReactor<H> {
                     self.deliver_stale(id);
                     Reply::Done
                 }
+                CommandKind::Connect(addr) => {
+                    // The ConnectEx completion replies through the
+                    // acknowledgement channel once it is dequeued.
+                    self.begin_connect_async(addr, command.ack);
+                    continue;
+                }
             };
             let _ = command.ack.send(reply);
         }
@@ -560,6 +587,19 @@ impl<H: Handler> IocpReactor<H> {
                     }
                 };
                 self.connect_result = Some((key, result));
+                Ok(())
+            }
+            #[cfg(test)]
+            Posted::TestConnect { mut op, ack } => {
+                let socket = op.take_socket();
+                let reply = match overlapped_result(socket, &op.overlapped) {
+                    Ok(_) => self.finish_connect(socket),
+                    Err(err) => {
+                        close_socket(socket);
+                        Err(err)
+                    }
+                };
+                let _ = ack.send(Reply::Connect(reply));
                 Ok(())
             }
         }
@@ -772,6 +812,70 @@ impl<H: Handler> IocpReactor<H> {
         self.post_send(id);
         self.post_recv(id);
         Ok(id)
+    }
+
+    /// Starts a `ConnectEx` for the test client and returns immediately.
+    ///
+    /// The completion is dequeued by the normal completion loop, which adopts
+    /// the socket through [`Self::finish_connect`] and replies on `ack`. Setup
+    /// failures are reported here; once the operation is posted its
+    /// [`ConnectOp`] owns the socket.
+    #[cfg(test)]
+    fn begin_connect_async(&mut self, peer: SocketAddr, ack: std::sync::mpsc::Sender<Reply>) {
+        let family = if peer.is_ipv4() { AF_INET } else { AF_INET6 };
+        let socket = match create_socket(family) {
+            Ok(socket) => socket,
+            Err(err) => {
+                let _ = ack.send(Reply::Connect(Err(err)));
+                return;
+            }
+        };
+
+        let setup = (|| -> io::Result<_> {
+            self.poller_mut()?.associate(socket, CONN_KEY)?;
+            bind_wildcard(socket, family)?;
+            load_connect_ex(socket)
+        })();
+        let connect_ex = match setup {
+            Ok(connect_ex) => connect_ex,
+            Err(err) => {
+                close_socket(socket);
+                let _ = ack.send(Reply::Connect(Err(err)));
+                return;
+            }
+        };
+
+        let address = SockAddrBuf::from_socket_addr(peer);
+        let mut op = Box::new(ConnectOp {
+            socket,
+            overlapped: OVERLAPPED::default(),
+        });
+        // SAFETY: the socket is bound and associated, the sockaddr is valid for
+        // its reported length, and the overlapped structure stays alive in
+        // `op` until the completion is dequeued.
+        let ok = unsafe {
+            connect_ex(
+                socket as SOCKET,
+                address.as_ptr(),
+                address.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut op.overlapped,
+            )
+        };
+        if ok == 0 {
+            let err = last_wsa_error();
+            if err.raw_os_error() != Some(WSA_IO_PENDING) {
+                let socket = op.take_socket();
+                close_socket(socket);
+                let _ = ack.send(Reply::Connect(Err(err)));
+                return;
+            }
+        }
+
+        let key = op.key();
+        self.posted.insert(key, Posted::TestConnect { op, ack });
     }
 
     /// Posts one `WSARecv` when reading is allowed.
@@ -1211,6 +1315,34 @@ impl<H: Handler + Send + 'static> IocpReactor<H> {
 }
 
 #[cfg(test)]
+impl<H: Handler + SpawnClient + Send + 'static> IocpReactor<H> {
+    /// Spawns a listenerless reactor for the outbound-connect tests.
+    ///
+    /// The completion port is created before the wake handle because a Windows
+    /// wake is a sentinel packet posted to that port.
+    pub(crate) fn spawn_client_for_test() -> (
+        TestClientHandle,
+        Shutdown,
+        std::thread::JoinHandle<io::Result<()>>,
+    ) {
+        let (handler, state) = H::new_client();
+        let mut reactor = Self::new(handler);
+        let port = reactor
+            .poller_mut()
+            .expect("create the completion port")
+            .raw_handle();
+        let wake = Arc::new(Wake::new(port).expect("create the reactor wake"));
+        let channel = ControlChannel::new(Arc::clone(&wake));
+        reactor.core.attach_control(Arc::clone(&channel));
+        reactor.control = Some(Arc::clone(&channel));
+        let shutdown = Shutdown::with_control(Arc::clone(&wake), Arc::clone(&channel));
+        let handle = TestClientHandle::new(Arc::clone(&channel), state);
+        let join = std::thread::spawn(move || reactor.run_until(&wake));
+        (handle, shutdown, join)
+    }
+}
+
+#[cfg(test)]
 impl IocpReactor<EchoHandler> {
     /// Starts an echo reactor on an ephemeral loopback port.
     pub(crate) fn spawn_for_test() -> (
@@ -1272,9 +1404,14 @@ impl<H: Handler> Drop for IocpReactor<H> {
 
 #[cfg(test)]
 mod tests {
-    use crate::rt::test_support::{spawn_echo, spawn_echo_on, spawn_echo_with_control};
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use super::IocpReactor;
+    use crate::rt::handler::EchoHandler;
+    use crate::rt::test_support::{
+        ConnectHandler, spawn_echo, spawn_echo_on, spawn_echo_with_control,
+    };
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
 
     #[test]
     fn echo_over_loopback_iocp() {
@@ -1315,6 +1452,58 @@ mod tests {
         assert_ne!(addr.port(), 0);
         shutdown.shutdown();
         join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn connect_refused_closes_socket_iocp() {
+        let dead = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+        let (handle, shutdown, join) = IocpReactor::<EchoHandler>::spawn_client_for_test();
+        let err = handle.connect(dead).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(handle.stats().connections, 0);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn connect_then_echo_iocp() {
+        let (addr, shutdown, join) = spawn_echo();
+        let (handle, client_shutdown, client_join) =
+            IocpReactor::<ConnectHandler>::spawn_client_for_test();
+        handle.connect(addr).unwrap();
+        assert!(handle.wait_until(Duration::from_secs(2), |s| s.echoed));
+        assert!(
+            handle.wait_until(Duration::from_secs(2), |s| s.connections == 0),
+            "handler close must reclaim the client connection"
+        );
+        shutdown.shutdown();
+        client_shutdown.shutdown();
+        join.join().unwrap().unwrap();
+        client_join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn connect_then_echo_ipv6_iocp() {
+        let Ok((addr, shutdown, join)) = spawn_echo_on("[::1]:0") else {
+            return;
+        };
+        let (handle, client_shutdown, client_join) =
+            IocpReactor::<ConnectHandler>::spawn_client_for_test();
+        handle.connect(addr).unwrap();
+        assert!(handle.wait_until(Duration::from_secs(2), |s| s.echoed));
+        assert!(
+            handle.wait_until(Duration::from_secs(2), |s| s.connections == 0),
+            "handler close must reclaim the client connection"
+        );
+        shutdown.shutdown();
+        client_shutdown.shutdown();
+        join.join().unwrap().unwrap();
+        client_join.join().unwrap().unwrap();
     }
 
     #[test]

@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::rt::handler::EchoHandler;
+use crate::rt::conn::Conn;
+use crate::rt::handler::{EchoHandler, Handler};
 #[cfg(windows)]
 use crate::rt::reactor::iocp::IocpReactor;
 #[cfg(unix)]
@@ -192,6 +193,8 @@ pub(crate) enum Reply {
     Done,
     /// Result of a query command.
     Count(usize),
+    /// Result of an asynchronous outbound connect.
+    Connect(io::Result<ConnId>),
 }
 
 /// A command the test thread hands to the reactor thread.
@@ -210,6 +213,8 @@ pub(crate) enum CommandKind {
     Close(ConnId),
     /// Report the number of outstanding kernel operations for a connection.
     PendingOps(ConnId),
+    /// Start a nonblocking outbound connect; the reply arrives on completion.
+    Connect(SocketAddr),
     /// Windows: start a close and cancel posted operations without waiting.
     #[cfg(windows)]
     CloseNoWait(ConnId),
@@ -387,7 +392,7 @@ impl TestControl {
     pub(crate) fn pending_ops(&self, id: ConnId) -> usize {
         match self.call(CommandKind::PendingOps(id)) {
             Reply::Count(count) => count,
-            Reply::Done => 0,
+            Reply::Done | Reply::Connect(_) => 0,
         }
     }
 
@@ -452,6 +457,156 @@ impl TestControl {
         self.channel.wake();
         wait.recv_timeout(Duration::from_secs(5))
             .expect("reactor stopped handling control commands")
+    }
+}
+
+/// Test-only state a client handler shares with its [`TestClientHandle`].
+#[derive(Default)]
+pub(crate) struct ClientState {
+    /// Set by [`ConnectHandler`] once its `ping` came back from the peer.
+    echoed: AtomicBool,
+}
+
+/// A handler that can be built without arguments for a client-test reactor.
+///
+/// The reactor constructs the handler itself, so the state the test thread
+/// observes via [`TestClientHandle`] has to come out of the same construction.
+pub(crate) trait SpawnClient: Handler + Sized + Send + 'static {
+    /// Builds the handler and a handle to the state it reports.
+    fn new_client() -> (Self, Arc<ClientState>);
+}
+
+impl SpawnClient for EchoHandler {
+    fn new_client() -> (Self, Arc<ClientState>) {
+        // The refused-connect test only needs a handler to satisfy the reactor;
+        // it never observes client state.
+        (EchoHandler, Arc::new(ClientState::default()))
+    }
+}
+
+/// The outbound-connect handler: sends `ping`, expects the echo, then closes.
+///
+/// The peer in these tests is [`EchoHandler`], which reflects bytes rather than
+/// translating them. The plan's "expects `pong`" assumed a transforming peer;
+/// the observable contract here is the same round trip: the client sends one
+/// marker and requires exactly that marker back before it reports `echoed`.
+pub(crate) struct ConnectHandler {
+    state: Arc<ClientState>,
+}
+
+impl SpawnClient for ConnectHandler {
+    fn new_client() -> (Self, Arc<ClientState>) {
+        let state = Arc::new(ClientState::default());
+        (
+            Self {
+                state: Arc::clone(&state),
+            },
+            state,
+        )
+    }
+}
+
+impl Handler for ConnectHandler {
+    fn on_accept(&mut self, _conn: &mut Conn) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn on_connect(&mut self, conn: &mut Conn) -> io::Result<()> {
+        conn.enqueue(b"ping")
+            .map_err(|_| io::Error::other("client outbound queue rejected the request bytes"))
+    }
+
+    fn on_read(&mut self, _conn: &mut Conn, data: &[u8]) -> io::Result<()> {
+        if data != b"ping" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected the echoed ping, received {data:?}"),
+            ));
+        }
+        self.state.echoed.store(true, Ordering::SeqCst);
+        // The handler has no graceful close hook, and a deferred close would
+        // never fire on Windows because nothing is queued. A terminal handler
+        // error is the documented immediate-close path on both reactors; no
+        // output is lost because the ping was already flushed.
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "connect test complete",
+        ))
+    }
+
+    fn on_close(&mut self, _id: ConnId) {}
+}
+
+/// Snapshot of the outbound-connect test reactor's observable state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestClientStats {
+    /// Live connections in the client reactor.
+    pub(crate) connections: usize,
+    /// Whether [`ConnectHandler`] has received its echoed `ping` (or, on a
+    /// failed connect, definitively not).
+    pub(crate) echoed: bool,
+}
+
+/// Test-only client side of a reactor, modelled on the future `ClientHandle`.
+///
+/// `connect` enqueues the request and blocks the *test* thread until the
+/// reactor's event loop reports completion; the reactor thread never blocks on
+/// a socket.
+pub(crate) struct TestClientHandle {
+    channel: Arc<ControlChannel>,
+    state: Arc<ClientState>,
+}
+
+impl TestClientHandle {
+    /// Wraps the channel shared with a client-spawned reactor.
+    pub(crate) fn new(channel: Arc<ControlChannel>, state: Arc<ClientState>) -> Self {
+        Self { channel, state }
+    }
+
+    /// Starts a nonblocking connect and waits for its completion.
+    pub(crate) fn connect(&self, addr: SocketAddr) -> io::Result<ConnId> {
+        let (ack, wait) = mpsc::channel();
+        self.channel.lock_commands().push(Command {
+            kind: CommandKind::Connect(addr),
+            ack,
+        });
+        self.channel.wake();
+        match wait.recv_timeout(Duration::from_secs(5)) {
+            Ok(Reply::Connect(result)) => result,
+            Ok(_) => Err(io::Error::other(
+                "reactor answered a connect with the wrong reply",
+            )),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "reactor did not complete the connect",
+            )),
+        }
+    }
+
+    /// Current connection and echo state.
+    pub(crate) fn stats(&self) -> TestClientStats {
+        TestClientStats {
+            connections: self.channel.connection_count(),
+            echoed: self.state.echoed.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Polls [`Self::stats`] until `pred` accepts it or `timeout` elapses.
+    pub(crate) fn wait_until(
+        &self,
+        timeout: Duration,
+        pred: impl Fn(&TestClientStats) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pred(&self.stats()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

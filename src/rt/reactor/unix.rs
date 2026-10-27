@@ -12,6 +12,10 @@
 //!   remainder and write interest;
 //! - a drained queue calls [`ReactorCore::on_write_ready`] immediately, which
 //!   completes a deferred EOF close even without a new readiness edge;
+//! - outbound connect: a nonblocking socket is registered for WRITE; its
+//!   writability or error edge is resolved from `SO_ERROR`, then
+//!   [`Handler::on_connect`] runs and the socket joins the normal read/write
+//!   flow. Failure closes the socket without ever entering the slab;
 //! - any handler error (including an echo `WouldBlock` overflow) is terminal
 //!   for that connection only; the loop continues serving the others.
 //!
@@ -22,9 +26,9 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
-use std::sync::Arc;
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::rt::block::BLOCK_SIZE;
@@ -42,8 +46,8 @@ use crate::rt::slab::ConnId;
 use crate::rt::socket::OwnedSocket;
 #[cfg(test)]
 use crate::rt::test_support::{
-    CommandKind, ControlChannel, Reply, Shutdown, Spawned, SpawnedInternal, SpawnedWithControl,
-    TestControl,
+    CommandKind, ControlChannel, Reply, Shutdown, SpawnClient, Spawned, SpawnedInternal,
+    SpawnedWithControl, TestClientHandle, TestControl,
 };
 use crate::rt::wake::Wake;
 
@@ -62,6 +66,13 @@ const WAKE_ID: ConnId = ConnId {
     slot: u32::MAX,
     generation: u32::MAX,
 };
+
+/// Generation tag reserved for the synthetic ids of in-flight connects.
+///
+/// A connecting socket needs an id before a [`Conn`] exists. These ids never
+/// reach the slab, and the reserved generation keeps them distinct from every
+/// slab id without reserving slots.
+const CONNECT_GENERATION: u32 = u32::MAX - 2;
 
 /// Upper bound on one poller wait, short enough for shutdown responsiveness.
 const MAX_WAIT: Duration = Duration::from_secs(1);
@@ -95,6 +106,49 @@ fn desired_interest(conn: &Conn) -> Option<Interest> {
     }
 }
 
+/// Outcome of creating a nonblocking connecting socket.
+enum ConnectAttempt {
+    /// The kernel completed the handshake before returning from `connect`.
+    Connected(TcpStream),
+    /// `connect` returned `EINPROGRESS`; writability signals completion.
+    Pending(TcpStream),
+}
+
+/// Where a completed outbound connect reports its result.
+///
+/// The synchronous `connect` helper and the test client share the same start,
+/// readiness and adoption path; only the waiter differs.
+enum ConnectSink {
+    /// The pre-loop synchronous helper waits on this channel.
+    Sync(mpsc::Sender<io::Result<ConnId>>),
+    /// The test handle's command acknowledgement.
+    #[cfg(test)]
+    Test(mpsc::Sender<Reply>),
+}
+
+impl ConnectSink {
+    /// Delivers the final result exactly once.
+    fn send(self, result: io::Result<ConnId>) {
+        match self {
+            Self::Sync(wait) => {
+                let _ = wait.send(result);
+            }
+            #[cfg(test)]
+            Self::Test(ack) => {
+                let _ = ack.send(Reply::Connect(result));
+            }
+        }
+    }
+}
+
+/// A socket whose nonblocking `connect` is still in flight.
+struct PendingConnect {
+    /// Owns the connecting socket; dropped on failure, adopted on success.
+    stream: TcpStream,
+    /// Receives the result when the WRITE edge reports completion.
+    sink: ConnectSink,
+}
+
 /// Readiness reactor for Unix.
 pub(crate) struct UnixReactor<H: Handler> {
     core: ReactorCore<H>,
@@ -105,6 +159,10 @@ pub(crate) struct UnixReactor<H: Handler> {
     /// The interest currently registered for each id. `None` means the id was
     /// removed while paused; a later resume re-adds it.
     registrations: HashMap<ConnId, Interest>,
+    /// In-flight nonblocking connects, keyed by their synthetic poller id.
+    connecting: HashMap<ConnId, PendingConnect>,
+    /// Next synthetic slot for [`Self::connecting`]; the generation is fixed.
+    next_connect_id: u32,
     /// Test-only command channel installed by the harness.
     #[cfg(test)]
     control: Option<Arc<ControlChannel>>,
@@ -118,6 +176,8 @@ impl<H: Handler> UnixReactor<H> {
             poller: None,
             listener: None,
             registrations: HashMap::new(),
+            connecting: HashMap::new(),
+            next_connect_id: 0,
             #[cfg(test)]
             control: None,
         }
@@ -157,31 +217,35 @@ impl<H: Handler> UnixReactor<H> {
 
     /// Opens an outbound connection and reports it to the handler.
     ///
-    /// M1 has one connection established before the loop runs; the
-    /// nonblocking `connect` path arrives with the client surface in Task 11.
+    /// The socket is nonblocking: `connect` returns immediately and the result
+    /// is driven by the poller's WRITE readiness, exactly like the reactor
+    /// loop. This pre-loop helper waits for that completion on its own; the
+    /// test client uses the same path asynchronously.
     pub(crate) fn connect(&mut self, addr: &str) -> io::Result<ConnId> {
-        let stream = TcpStream::connect(addr)?;
-        let socket = OwnedSocket::new(stream)?;
-        let conn = Conn::new(socket, Arc::clone(self.core.pool()), WRITE_CAP)?;
-        let id = self.core.insert(conn);
+        let peer = addr.to_socket_addrs()?.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "address resolved to nothing")
+        })?;
+        let (wait, completed) = mpsc::channel();
+        self.start_connect(peer, ConnectSink::Sync(wait));
 
-        let fd = self
-            .conn_fd(id)
-            .expect("connection was just inserted into the slab");
-        if let Err(err) = self.register(id, fd, Interest::Read) {
-            self.core.close(id, "register-failed");
-            return Err(err);
+        let mut events = Vec::with_capacity(64);
+        loop {
+            match completed.try_recv() {
+                Ok(result) => return result,
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "connect completion channel closed",
+                    ));
+                }
+            }
+            self.poller_mut()?.wait(Some(MAX_WAIT), &mut events)?;
+            for event in events.drain(..) {
+                self.dispatch(event)?;
+            }
+            self.fire_timers();
         }
-
-        if let Err(err) = self.core.on_connect(id) {
-            // The core already reported the close; the socket is gone, so the
-            // kernel dropped the registration with it.
-            self.registrations.remove(&id);
-            return Err(err);
-        }
-
-        self.update_interest(id)?;
-        Ok(id)
     }
 
     /// The bound listener address.
@@ -273,6 +337,12 @@ impl<H: Handler> UnixReactor<H> {
                     let _ = id;
                     Reply::Count(0)
                 }
+                CommandKind::Connect(addr) => {
+                    // Completion replies through the acknowledgement channel
+                    // once the WRITE edge reports the result.
+                    self.start_connect(addr, ConnectSink::Test(command.ack));
+                    continue;
+                }
             };
             let _ = command.ack.send(reply);
         }
@@ -301,6 +371,105 @@ impl<H: Handler> UnixReactor<H> {
         Ok(())
     }
 
+    /// Removes the poller interest recorded for `id`, if any.
+    fn unregister(&mut self, id: ConnId, fd: RawFd) {
+        if self.registrations.remove(&id).is_some() {
+            if let Some(poller) = self.poller.as_mut() {
+                // A kernel-side removal failure (the socket may already be
+                // closing) is not actionable.
+                let _ = poller.remove(fd);
+            }
+        }
+    }
+
+    /// A synthetic id for an in-flight connect.
+    fn next_connect_id(&mut self) -> ConnId {
+        let id = ConnId {
+            slot: self.next_connect_id,
+            generation: CONNECT_GENERATION,
+        };
+        self.next_connect_id = self.next_connect_id.wrapping_add(1);
+        id
+    }
+
+    /// Starts a nonblocking connect and arranges for `sink` to receive it.
+    ///
+    /// The reactor thread never blocks on the socket: a pending `EINPROGRESS`
+    /// is registered for WRITE and completed from the readiness loop.
+    fn start_connect(&mut self, addr: SocketAddr, sink: ConnectSink) {
+        let attempt = match nonblocking_connect(addr) {
+            Ok(attempt) => attempt,
+            Err(err) => return sink.send(Err(err)),
+        };
+        match attempt {
+            ConnectAttempt::Connected(stream) => self.adopt_connect(stream, sink),
+            ConnectAttempt::Pending(stream) => {
+                let fd = stream.as_raw_fd();
+                let id = self.next_connect_id();
+                if let Err(err) = self.register(id, fd, Interest::Write) {
+                    // Dropping `stream` closes the failed socket.
+                    return sink.send(Err(err));
+                }
+                self.connecting.insert(id, PendingConnect { stream, sink });
+            }
+        }
+    }
+
+    /// Completes a connect whose WRITE edge fired.
+    fn connect_ready(&mut self, id: ConnId) {
+        let Some(pending) = self.connecting.remove(&id) else {
+            return;
+        };
+        let fd = pending.stream.as_raw_fd();
+        self.unregister(id, fd);
+
+        match socket_error(fd) {
+            Ok(0) => self.adopt_connect(pending.stream, pending.sink),
+            Ok(code) => pending.sink.send(Err(io::Error::from_raw_os_error(code))),
+            Err(err) => pending.sink.send(Err(err)),
+        }
+    }
+
+    /// Turns a completed connecting socket into a live connection.
+    ///
+    /// Every failure closes the socket and, when the connection had already
+    /// entered the slab, reclaims its slot through the core.
+    fn adopt_connect(&mut self, stream: TcpStream, sink: ConnectSink) {
+        let fd = stream.as_raw_fd();
+        let socket = match OwnedSocket::new(stream) {
+            Ok(socket) => socket,
+            Err(err) => return sink.send(Err(err)),
+        };
+        let conn = match Conn::new(socket, Arc::clone(self.core.pool()), WRITE_CAP) {
+            Ok(conn) => conn,
+            Err(err) => return sink.send(Err(err)),
+        };
+        let id = self.core.insert(conn);
+
+        if let Err(err) = self.register(id, fd, Interest::Read) {
+            self.core.close(id, "register-failed");
+            return sink.send(Err(err));
+        }
+
+        if let Err(err) = self.core.on_connect(id) {
+            // The core already closed the socket with the connection.
+            self.registrations.remove(&id);
+            return sink.send(Err(err));
+        }
+
+        // Send whatever the handler queued in `on_connect` before waiting for
+        // the next readiness edge.
+        if let Err(err) = self
+            .flush_pending(id)
+            .and_then(|()| self.update_interest(id))
+        {
+            self.close_conn(id);
+            return sink.send(Err(err));
+        }
+
+        sink.send(Ok(id));
+    }
+
     /// Time until the next timer, capped at [`MAX_WAIT`].
     fn poll_timeout(&self) -> Duration {
         let now = Instant::now();
@@ -323,6 +492,13 @@ impl<H: Handler> UnixReactor<H> {
         }
         if id == LISTEN_ID {
             return self.accept_ready();
+        }
+        if self.connecting.contains_key(&id) {
+            // The socket has no connection state yet: either the connect
+            // finished or the readiness layer flagged an error. SO_ERROR is
+            // the authoritative result in both cases.
+            self.connect_ready(id);
+            return Ok(());
         }
 
         if event.error.is_some() {
@@ -536,16 +712,11 @@ impl<H: Handler> UnixReactor<H> {
 
     /// Closes a connection after clearing its poller interest.
     fn close_conn(&mut self, id: ConnId) {
-        if let Some(fd) = self.conn_fd(id) {
-            if self.registrations.remove(&id).is_some() {
-                if let Some(poller) = self.poller.as_mut() {
-                    // The socket is about to close, so a kernel-side removal
-                    // (EBADF/ENOENT) is not actionable.
-                    let _ = poller.remove(fd);
-                }
+        match self.conn_fd(id) {
+            Some(fd) => self.unregister(id, fd),
+            None => {
+                self.registrations.remove(&id);
             }
-        } else {
-            self.registrations.remove(&id);
         }
         self.core.close(id, "reactor-close");
     }
@@ -653,6 +824,160 @@ impl<H: Handler + Send + 'static> UnixReactor<H> {
     }
 }
 
+/// Creates a nonblocking socket and starts `connect(2)` on it.
+///
+/// A successful handshake is reported as [`ConnectAttempt::Connected`];
+/// `EINPROGRESS` (the normal loopback and network case) is
+/// [`ConnectAttempt::Pending`], to be completed from WRITE readiness.
+fn nonblocking_connect(addr: SocketAddr) -> io::Result<ConnectAttempt> {
+    let family = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: socket(2) takes no pointers; a negative result is checked before
+    // the descriptor is wrapped.
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh, uniquely owned descriptor; the stream takes
+    // ownership and closes it exactly once.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    stream.set_nonblocking(true)?;
+    set_cloexec(fd)?;
+
+    let (address, len) = sockaddr(addr);
+    // SAFETY: `address` is a fully initialized sockaddr of length `len`; the
+    // call only reads that memory.
+    let rc = unsafe { libc::connect(fd, std::ptr::from_ref(&address).cast(), len) };
+    if rc == 0 {
+        return Ok(ConnectAttempt::Connected(stream));
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EINPROGRESS) | Some(libc::EALREADY) => Ok(ConnectAttempt::Pending(stream)),
+        _ => Err(err),
+    }
+}
+
+/// Builds the sockaddr bytes for `addr` in a family-neutral buffer.
+fn sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: an all-zero sockaddr_storage is valid; the concrete struct is
+    // written over it before the buffer is used.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(v4) => {
+            // SAFETY: an all-zero sockaddr_in is valid; every field is set below.
+            let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            // The address bytes are stored in network order.
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            };
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            {
+                sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            }
+            // SAFETY: sockaddr_in fits inside sockaddr_storage and `sin` is
+            // fully initialized.
+            unsafe {
+                std::ptr::write(
+                    std::ptr::from_mut(&mut storage).cast::<libc::sockaddr_in>(),
+                    sin,
+                );
+            }
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: an all-zero sockaddr_in6 is valid; every field is set below.
+            let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sin6.sin6_scope_id = v6.scope_id();
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            {
+                sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            }
+            // SAFETY: sockaddr_in6 fits inside sockaddr_storage and `sin6` is
+            // fully initialized.
+            unsafe {
+                std::ptr::write(
+                    std::ptr::from_mut(&mut storage).cast::<libc::sockaddr_in6>(),
+                    sin6,
+                );
+            }
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (storage, len as libc::socklen_t)
+}
+
+/// Reads and clears `SO_ERROR`, the authoritative result of a nonblocking
+/// connect once its WRITE edge fires.
+fn socket_error(fd: RawFd) -> io::Result<libc::c_int> {
+    let mut error: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `error` and `len` are valid out storage for SO_ERROR, and `fd` is
+    // a live socket owned by the caller.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            std::ptr::from_mut(&mut error).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(error)
+}
+
+/// Marks a descriptor close-on-exec. `TcpStream::from_raw_fd` does not.
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl(2) operates on the live descriptor with no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above; only the descriptor flags are changed.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+impl<H: Handler + SpawnClient + Send + 'static> UnixReactor<H> {
+    /// Spawns a listenerless reactor for the outbound-connect tests.
+    ///
+    /// Connect requests arrive through the test control channel, so the test
+    /// thread blocks until completion while the reactor thread stays
+    /// nonblocking.
+    pub(crate) fn spawn_client_for_test() -> (
+        TestClientHandle,
+        Shutdown,
+        std::thread::JoinHandle<io::Result<()>>,
+    ) {
+        let (handler, state) = H::new_client();
+        let mut reactor = Self::new(handler);
+        let wake = Arc::new(Wake::new().expect("create the reactor wake"));
+        let channel = ControlChannel::new(Arc::clone(&wake));
+        reactor.core.attach_control(Arc::clone(&channel));
+        reactor.control = Some(Arc::clone(&channel));
+        let shutdown = Shutdown::with_control(Arc::clone(&wake), Arc::clone(&channel));
+        let handle = TestClientHandle::new(Arc::clone(&channel), state);
+        let join = std::thread::spawn(move || reactor.run_until(&wake));
+        (handle, shutdown, join)
+    }
+}
+
 #[cfg(test)]
 impl UnixReactor<EchoHandler> {
     /// Starts an echo reactor on an ephemeral loopback port.
@@ -669,27 +994,28 @@ impl UnixReactor<EchoHandler> {
 
 #[cfg(test)]
 mod tests {
+    use super::UnixReactor;
     #[cfg(target_os = "linux")]
     use super::desired_interest;
+    use crate::rt::handler::EchoHandler;
     #[cfg(target_os = "linux")]
     use crate::rt::poller::epoll::EpollPoller;
     #[cfg(target_os = "linux")]
     use crate::rt::poller::{Interest, Poller};
     #[cfg(target_os = "linux")]
     use crate::rt::slab::ConnId;
+    use crate::rt::test_support::{ConnectHandler, spawn_echo, spawn_echo_on};
     #[cfg(target_os = "linux")]
     use crate::rt::test_support::{
         library_bytes, raise_nofile, spawn_echo_with_backlog, spawn_echo_with_control,
         spawn_echo_with_control_on, wait_for_connections,
     };
-    use crate::rt::test_support::{spawn_echo, spawn_echo_on};
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixStream;
-    #[cfg(target_os = "linux")]
     use std::time::Duration;
 
     #[cfg(target_os = "linux")]
@@ -913,6 +1239,87 @@ mod tests {
             shutdown6.shutdown();
             join6.join().unwrap().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_refused_closes_socket() {
+        let dead = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+        let (handle, shutdown, join) = UnixReactor::<EchoHandler>::spawn_client_for_test();
+        let err = handle.connect(dead).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(handle.stats().connections, 0);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_then_echo() {
+        let (addr, shutdown, join) = spawn_echo();
+        let (handle, client_shutdown, client_join) =
+            UnixReactor::<ConnectHandler>::spawn_client_for_test();
+        handle.connect(addr).unwrap();
+        assert!(handle.wait_until(Duration::from_secs(2), |s| s.echoed));
+        assert!(
+            handle.wait_until(Duration::from_secs(2), |s| s.connections == 0),
+            "handler close must reclaim the client connection"
+        );
+        shutdown.shutdown();
+        client_shutdown.shutdown();
+        join.join().unwrap().unwrap();
+        client_join.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_then_echo_ipv6() {
+        let Ok((addr, shutdown, join)) = spawn_echo_on("[::1]:0") else {
+            return;
+        };
+        let (handle, client_shutdown, client_join) =
+            UnixReactor::<ConnectHandler>::spawn_client_for_test();
+        handle.connect(addr).unwrap();
+        assert!(handle.wait_until(Duration::from_secs(2), |s| s.echoed));
+        assert!(
+            handle.wait_until(Duration::from_secs(2), |s| s.connections == 0),
+            "handler close must reclaim the client connection"
+        );
+        shutdown.shutdown();
+        client_shutdown.shutdown();
+        join.join().unwrap().unwrap();
+        client_join.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_reports_a_live_connection() {
+        let (addr, shutdown, join) = spawn_echo();
+        let (handle, client_shutdown, client_join) =
+            UnixReactor::<EchoHandler>::spawn_client_for_test();
+        let _id = handle.connect(addr).unwrap();
+        assert_eq!(handle.stats().connections, 1);
+        shutdown.shutdown();
+        client_shutdown.shutdown();
+        join.join().unwrap().unwrap();
+        client_join.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_loop_connect_uses_the_nonblocking_path() {
+        let (addr, shutdown, join) = spawn_echo();
+        let mut reactor = UnixReactor::<EchoHandler>::new(EchoHandler);
+        let id = reactor.connect(&addr.to_string()).unwrap();
+        assert_eq!(reactor.core.conn(id).unwrap().peer_addr(), addr);
+        drop(reactor);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
     }
 
     #[cfg(target_os = "linux")]
