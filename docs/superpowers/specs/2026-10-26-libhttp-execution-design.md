@@ -12,12 +12,14 @@ these are the contracts most easily lost between a reactor design and a planner.
 
 - **Reactor threads** own sockets, connection state machines, timers, buffer pools, and the socket
   table. Only the owning reactor mutates a connection.
-- **Worker threads** run handlers. They own nothing shared except a per-exchange queue, a cancel flag,
-  and a parking reservation. They never touch a socket, a timer, or a socket-table entry.
+- **Worker threads** run handlers and client `fetch`/`fetch_with` callback/upload jobs. They own
+  nothing shared except a per-exchange queue, a cancel flag, and a parking reservation. They never
+  touch a socket, a timer, or a socket-table entry. Client callback/upload jobs have a separate
+  `RuntimeBuilder::max_client_callbacks` budget so they cannot crowd out handler dispatch.
 - **Client connections** run on the same runtime reactors as server connections; the client pool
-  and call queue are reactor-owned. `Client::send`/`ClientExchange::finish` block the calling thread
-  (application thread or, if the app chooses, a handler worker) on the exchange; there is no client
-  call object, callback executor or library worker per request.
+  and call queue are reactor-owned. `Client::send`/`send_with` block the calling thread;
+  `fetch`/`fetch_with` return after enqueue and run their callback on a runtime worker when the
+  response head arrives. There is no client call object or application callback executor.
 - **Cross-thread state** is per exchange: an inbound ring (reactor → worker), an outbound ring
   (worker → reactor), a terminal-state slot, two condition variables, and a parking reservation.
   Worker output marks the exchange ready and wakes the reactor at most once per batch, not per chunk.
@@ -75,8 +77,8 @@ wake per dispatch, measured by the harness.
   Application-thread body I/O does not take a worker parking reservation; it is bounded by the
   connection/global caps and by `read_stall`/`write_stall`/`deferred` and cannot starve workers.
 - Typed header decoding runs on the worker when the exchange is dispatched; on the client it runs on
-  the `Client::send`/`ClientExchange::finish` thread before `ClientResponse` is returned. A queued
-  exchange carries only its raw head. A decode
+  the `send`/`send_with` thread or the `fetch`/`fetch_with` callback worker before `ClientResponse`
+  is handed over. A queued exchange carries only its raw head. A decode
   failure is a `400`/stream error before the handler runs. Typed values live in a per-head arena
   bounded by `max_header_arena_bytes`.
 

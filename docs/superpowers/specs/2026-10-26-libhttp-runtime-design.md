@@ -17,16 +17,68 @@ threads of their own. `Server::builder()`/`Client::builder()` create a private r
 is built with `Runtime::builder()` and used through `rt.server()`/`rt.client()`.
 
 Reactor threads (`libhttp-reactor-N`) are created at runtime build. Worker threads
-(`libhttp-worker-N`) start lazily on the first server and resolver threads (`libhttp-resolver-N`) on
-the first client; a client-only runtime has no workers, a server-only runtime no resolvers. A
+(`libhttp-worker-N`) start lazily on the first server or the first `fetch`/`fetch_with` callback;
+resolver threads (`libhttp-resolver-N`) start on the first client. A client-only runtime using only
+`send`/`send_with` has no workers; a server-only runtime has no resolvers. A
 component shutdown stops only its connections/listeners and leaves the runtime usable;
 `RuntimeHandle::shutdown` is the root and cancels both components. Failure isolation is a second
 runtime, not a hidden per-component pool.
 
 The same reactor hosts server and client connections; role and protocol live on the connection.
-Client `send`/`send_streaming` block the calling thread and consume no reactor or library worker of
-their own. If the caller is a handler worker, that worker is blocked; the documented `Request::defer`
-pattern frees the worker and does the blocking call on the application thread.
+Client `send`/`send_with` block the calling thread and consume no reactor or library worker of their
+own. `fetch`/`fetch_with` return after enqueue and use a runtime worker only for the upload/callback
+job. If a blocking verb is called on a handler worker, that worker is blocked; the documented
+`Request::defer` pattern frees it and does the blocking call on the application thread.
+
+## Runtime public API
+
+```rust
+pub struct Runtime;                                        // Clone + Send + Sync
+impl Runtime {
+    pub fn builder() -> RuntimeBuilder;
+    pub fn server(&self) -> ServerBuilder;                 // attaches, does not own
+    pub fn client(&self) -> ClientBuilder;                 // attaches, does not own
+    pub fn handle(&self) -> RuntimeHandle;
+}
+
+impl RuntimeBuilder {
+    pub fn reactors(self, n: usize) -> Self;               // default min(available_parallelism(), 4)
+    pub fn workers(self, n: usize) -> Self;                // default available_parallelism()
+    pub fn resolver_threads(self, n: usize) -> Self;       // default 1
+    pub fn max_client_callbacks(self, n: usize) -> Self;   // default max(1, workers / 2)
+    pub fn build(self) -> Result<Runtime, Error>;
+}
+
+impl RuntimeHandle {
+    pub fn shutdown(&self);
+    pub fn shutdown_with_deadline(&self, grace: Duration);
+    pub fn wait(&self) -> Result<(), Error>;
+    pub fn stats(&self) -> RuntimeStats;
+}
+
+impl ServerHandle {
+    pub fn runtime(&self) -> Runtime;
+    pub fn wait_ready(&self, timeout: Duration) -> Result<(), Error>;
+}
+impl ClientHandle { pub fn runtime(&self) -> Runtime; }
+```
+
+- `Runtime::server()`/`client()` return builders attached to this runtime. `Server::builder()`/
+  `Client::builder()` create a private runtime.
+- `RuntimeBuilder::max_client_callbacks` is the global cap on `fetch`/`fetch_with` callback jobs and
+  `fetch_with` upload jobs. It is separate from handler admission; exhausting it returns
+  `Overloaded` from the verb.
+- Reactors start at build; workers start with the first server or `fetch`/`fetch_with`; resolvers
+  start with the first client. A client-only runtime using only blocking verbs has no worker threads;
+  a server-only runtime has no resolver threads. `workers(0)` allows blocking-only use but makes
+  `fetch`/`fetch_with` return `InvalidConfig`/`Overloaded` rather than spawning a worker lazily.
+- `RuntimeHandle` is the root shutdown. `ServerHandle::shutdown`/`ClientHandle::shutdown` stop only
+  their component. `RuntimeHandle::stats` is a relaxed snapshot; it does not expose per-operation
+  costs.
+- `Runtime` is refcounted; components and in-flight calls hold leases, so a late completion cannot
+  touch a freed runtime.
+
+---
 
 ---
 
@@ -200,7 +252,8 @@ per frame. Inside the reactor, the parser and engine use the unique-owner path w
 
 The reactor parses and validates the raw head (framing fields, name/value syntax, limits). Typed
 header decoding runs **when the exchange is handed to the handler or caller**, on the worker or on
-the client's `Client::send`/`ClientExchange::finish` thread, not on the reactor; a queued exchange
+the client's `send`/`send_with` thread or the `fetch`/`fetch_with` callback worker, not on the
+reactor; a queued exchange
 therefore holds only its raw head. This keeps
 the reactor's work bounded and keeps typed-header allocation off the I/O path.
 
@@ -344,9 +397,9 @@ the exchange under its lock, wakes the worker, and the worker returns that outco
 invents a timeout for an exchange the reactor still considers live; there is no second timer
 authority and no race at the deadline instant.
 
-The client call queue is reactor-owned too: `Client::send`/`send_streaming` enqueue a call and
-`PoolConfig::queue_timeout` is a normal reactor deadline. The caller blocks on the exchange; it does
-not own connection deadlines. Once a call is matched to a connection, the reactor owns its
+The client call queue is reactor-owned too: the client verbs enqueue a call and
+`PoolConfig::queue_timeout` is a normal reactor deadline. The blocking caller or the callback waits;
+it does not own connection deadlines. Once a call is matched to a connection, the reactor owns its
 deadlines.
 
 Timer resolution is the backend's: millisecond on epoll/IOCP, kernel-tick on kqueue. Sub-millisecond

@@ -11,7 +11,7 @@ proxy, portability, performance, and the §8 failure lessons — remains binding
 no prior git revision was read.
 
 **Document map:** this file is the top-level design: scope, public API, the twelve §10 decisions,
-performance gates, packaging, milestones and risks. The binding contracts live in four companion
+performance gates, packaging, milestones and risks. The binding contracts live in five companion
 documents, all in this directory:
 
 | Document | Binds |
@@ -19,7 +19,8 @@ documents, all in this directory:
 | [runtime design](2026-10-26-libhttp-runtime-design.md) | reactor loop, transports, TLS, buffers/head storage, copy/atomic/syscall budgets, timers, sockets, listeners, close/drain, memory arithmetic, fast-path scope |
 | [execution design](2026-10-26-libhttp-execution-design.md) | worker pool, exchanges, queues, admission, deadline ownership, parking caps, per-stream isolation, cancellation, shutdown, limit reactions |
 | [protocol design](2026-10-26-libhttp-protocols-design.md) | HTTP/1.1, HTTP/2, HTTP/3 wire behavior, parser strictness, HPACK/QPACK, flow control, QUIC backend choice, security tests |
-| [client design](2026-10-26-libhttp-client-design.md) | client API, pool/queue semantics, DNS, retries, timeouts, limits |
+| [client design](2026-10-26-libhttp-client-design.md) | client verbs, pool/queue semantics, DNS, retries, timeouts, limits |
+| [testing design](2026-10-26-libhttp-testing-design.md) | feature-gated `TestServer` harness, readiness, teardown, testing matrix |
 
 ---
 
@@ -174,7 +175,7 @@ transport detail; the public API exposes neither.
 ```
 
 Threads created by the library, all named, no global state: `libhttp-reactor-N` (socket ownership,
-engines, timers, dispatch), `libhttp-worker-N` (handlers and server-side work), `libhttp-resolver-N`
+engines, timers, dispatch), `libhttp-worker-N` (handlers and client callback/upload jobs), `libhttp-resolver-N`
 (DNS). `Runtime` owns these pools; `Server` and `Client` are front-ends. Multiple components share a
 runtime when the application builds one; otherwise each component gets a private runtime.
 
@@ -191,9 +192,9 @@ are builder discretion; signatures and semantics are the contract.
 |---|---|
 | `libhttp` | `Runtime`, `RuntimeBuilder`, `RuntimeHandle`, `RuntimeStats`, `Method`, `StatusCode`, `Version`, `HeaderName`, `HeaderValue`, `HeaderRef`, `HeaderMap`, `Header`, `HeaderError`, `Timeouts`, `CancelToken`, `Target`, `Uri`, `header`, `Error`, `TimeoutKind`, `ProtocolError`, `ProtocolErrorKind`, `TlsError` |
 | `libhttp::server` | `Server`, `ServerBuilder`, `ServerHandle`, `Handler`, `Request`, `Response`, `DeferredRequest`, `DeferredResponse`, `BodyReader`, `BodyWriter`, `BodyChunk`, `Limits`, `Stats`, and a `Timeouts` re-export |
-| `libhttp::client` | `Client`, `ClientBuilder`, `ClientHandle`, `ClientRequest`, `ClientResponse`, `ClientExchange`, `ClientStats`, `PoolConfig`; uses the root `Timeouts`/`CancelToken` |
+| `libhttp::client` | `Client`, `ClientBuilder`, `ClientHandle`, `ClientRequest`, `ClientResponse`, `ClientStats`, `PoolConfig`; uses the root `Timeouts`/`CancelToken` |
 | `libhttp::tls` | `TlsServerConfig`, `TlsClientConfig` (PEM/roots/ALPN/client-auth); rustls types stay internal in v1 |
-| `libhttp::testing` | `TestServer`, `TestServerBuilder` (feature `testing`, off by default) |
+| `libhttp::testing` | `TestServer`, `TestServerBuilder` (feature `testing`, off by default; see the [testing design](2026-10-26-libhttp-testing-design.md)) |
 
 ### 6.2 Server and handler
 
@@ -220,7 +221,8 @@ server.run(my_handler)?;                      // blocks until shutdown
 ```
 
 - `ServerHandle`: `shutdown()`, `shutdown_with_deadline(Duration)`, `stats() -> Stats`,
-  `runtime() -> Runtime`, `local_addrs() -> Vec<SocketAddr>` (TCP), `local_udp_addrs() -> Vec<SocketAddr>`.
+  `runtime() -> Runtime`, `wait_ready(Duration)`, `local_addrs() -> Vec<SocketAddr>` (TCP),
+  `local_udp_addrs() -> Vec<SocketAddr>`.
 - `Server::builder()`/`Client::builder()` create a private `Runtime`. To share one, build
   `Runtime::builder()...build()?` and use `rt.server()`/`rt.client()`; worker/reactor/resolver
   configuration belongs to `RuntimeBuilder`, not the component builders.
@@ -591,27 +593,35 @@ public per-operation cost API.
 
 ### 6.6 Client (summary)
 
-`Client` is `Clone + Send + Sync` and is a blocking front-end over a shared `Runtime`; it owns no
-threads of its own. `send(request)` blocks through the response head and returns a streamed
-`ClientResponse`; `send_streaming(request)` returns a `ClientExchange` whose `BodyWriter` uploads and
-whose `finish()` blocks for the response. There is no `ClientCall`, `wait`, `on_complete`, callback
-executor, or application `Executor`; the caller is the execution context.
+`Client` is `Clone + Send + Sync` and is a set of verbs over the shared `Runtime`; it owns no
+threads. The four verbs are a systematic blocking/nonblocking × buffered/streaming matrix:
 
 ```rust
-let res = client.send(ClientRequest::get(uri).timeout(d))?;
-let mut ex = client.send_streaming(ClientRequest::post(uri))?;
-ex.body().write_all(chunk)?;
-ex.body().finish()?;
-let res = ex.finish()?;
+let res = client.send(ClientRequest::get(uri))?;                       // blocking, buffered
+let res = client.send_with(req, |body| body.write_all(data)?)?;        // blocking, streaming
+client.fetch(req, |result| { /* callback on runtime worker */ Ok(()) })?; // nonblocking
+client.fetch_with(req, upload, on_response)?;                          // nonblocking + streaming
 ```
+
+`send`/`send_with` block the calling thread through the response head. `fetch`/`fetch_with` return
+after enqueue and run exactly one callback on a runtime worker when the response head arrives (and,
+for `fetch_with`, after the upload job). The callback receives
+`Result<&mut ClientResponse, Error>`: the runtime owns the response and drops it after the callback;
+the callback may stream the body but cannot retain or move the response. There is no `ClientCall`,
+`wait`, `on_complete`, call table, application executor, or `Executor` trait. Callback errors go to
+`ClientBuilder::on_error`; pre-enqueue errors (`Overloaded`, `Closed`) are returned by the verb.
+`fetch`/`fetch_with` callbacks and `fetch_with` uploads are bounded by
+`RuntimeBuilder::max_client_callbacks` (default `max(1, workers / 2)`), separate from handler
+admission, so callbacks cannot starve handlers.
 
 `ClientHandle` provides `shutdown`, `shutdown_with_deadline`, `stats` and `runtime`. A private
 runtime is created by `Client::builder()`; a shared one by `Runtime::builder()...build()?` and
 `rt.client()`. `Runtime` owns reactors, workers, resolver threads, block/timer pools and admission;
-`Server`/`Client` stop only their component, while `RuntimeHandle::shutdown` is the root. Workers and
-resolvers start lazily (client-only starts no workers, server-only starts no resolvers). A server
-handler that calls `send` blocks a worker; the documented deferred pattern frees the worker and does
-the blocking send on the application thread.
+`Server`/`Client` stop only their component, while `RuntimeHandle::shutdown` is the root. Workers
+start lazily on the first server or `fetch`/`fetch_with`; resolvers on the first client. A client-only
+runtime using only blocking verbs has no workers. A server handler should use `fetch`/`fetch_with` and complete a
+`DeferredResponse` from the callback; a blocking `send`/`send_with` is for application threads or
+after `Request::defer`.
 
 Protocol selection is explicit: `http1`, `http2`, `h2c` (prior knowledge), `http3` (opt-in, no
 Alt-Svc/fallback). Pool key is `(scheme, host, port, ALPN)`; no certificate coalescing. h1 opens up
@@ -625,7 +635,7 @@ bytes, idempotent method, replayable body. Requests and responses use typed head
 `ClientResponse::headers().get::<ContentType>()`), with raw `header`/`header_value` for custom fields
 and `ClientBuilder::register_header::<T>()` for incoming extension types. Header limits are the fixed
 protocol defaults, not configurable in v1. `CancelToken` can be armed on a request and cancelled from
-another thread; there is no post-send call handle for a blocking `send`. No redirects, cookies,
+another thread; there is no post-send call handle for blocking verbs. No redirects, cookies,
 compression, or CONNECT. Full contract in the [client design](2026-10-26-libhttp-client-design.md).
 
 ### 6.7 TLS configuration
@@ -643,13 +653,14 @@ production pure-Rust TLS provider exists. `aws-lc-rs` is not offered in v1.
 
 ### 6.8 Testing API
 
-Feature `testing` (off by default) exposes `libhttp::testing::TestServer`; there is no `TestClient`
-and no fake transport. `TestServerBuilder::handler/tls/http1/http2/http3/runtime` plus `spawn()`
-binds loopback TCP port 0 (and the same UDP port for h3), starts `Server::run` on a thread, waits for
-readiness, and exposes `addr()`, `udp_addr()`, `handle()` and deterministic `shutdown()`. Tests use a
-normal `Client` on the same runtime via `handle().runtime().client()`. This exercises the real
-reactors, TLS, ALPN and h1/h2/h3; the harness only removes ephemeral-port/readiness/teardown
-boilerplate. No certificates are generated; TLS fixtures are caller-supplied.
+Feature `testing` (off by default; requires `server` and `client`) exposes
+`libhttp::testing::{TestServer, TestServerBuilder}`. `TestServer` starts the normal `Server` on
+loopback TCP port 0 (and the same UDP port for h3), waits for readiness, exposes `addr()`,
+`udp_addr()`, `handle()` and deterministic `shutdown()`. Tests use a normal `Client` on the same
+runtime via `handle().runtime().client()`. There is no `TestClient`, no fake transport, and no
+generated certificate; TLS fixtures are caller-supplied. The harness removes only ephemeral-port,
+readiness and teardown boilerplate, so the real reactors, TLS, ALPN and h1/h2/h3 are exercised.
+Full contract in the [testing design](2026-10-26-libhttp-testing-design.md).
 
 ## 7. The twelve §10 decisions
 
@@ -660,7 +671,7 @@ Every §10 question is settled. The contracts behind each decision are in the co
 | 1 | I/O model across platforms | No public I/O model. Engines are sans-I/O byte-flow machines; each platform uses its native primitive (epoll/kqueue readiness, IOCP completion). io_uring later is another transport. → runtime §2 |
 | 2 | Read/accept arming, backpressure, close | One logical read and one write in flight; pause by clearing interest/not reposting; terminal read = EOF/error; op identity = `(slot, generation)`; close cancels/wait for completions; accept loops on readiness and a bounded `AcceptEx` pool on Windows. → runtime §2.3, §6 |
 | 3 | Buffer ownership | 16 KiB refcounted blocks from a bounded per-reactor pool; ranges, not copies; one atomic per block crossing threads; batched returns with one coalesced wake; explicit head storage, quotas and copy/atomic budget. → runtime §4 |
-| 4 | Worker model | One shared, bounded pool; handlers only on workers; single-owner reactor deadlines; `read_stall`/`write_stall`; global parked-worker ceiling plus per-connection reader/writer caps; per-stream connection-window shares; explicit admission and cancellation; per-request deferred completion on the same handler trait; no
+| 4 | Worker model | One shared, bounded pool for handlers and client callback/upload jobs; single-owner reactor deadlines; `read_stall`/`write_stall`; global parked-worker ceiling plus per-connection reader/writer caps; per-stream connection-window shares; explicit admission and cancellation; per-request deferred completion on the same handler trait; no
 preemption of blocking handlers. → execution §6, §9 |
 | 5 | Fast-path scope | v1 native baselines; optional gated `SO_REUSEPORT`/`TCP_FASTOPEN`/`EPOLLEXCLUSIVE`/Linux datagram batching; all zero-copy and io_uring paths phase 2 behind the same seam. → runtime §9 |
 | 6 | QUIC backend and budget | `quinn-proto` chosen on merit (sans-I/O, rustls, no async), not obligation; h3 framing + static QPACK ours; datagram copy/syscall budget stated; quiche remains the measured fallback if G3 fails. → protocols §4 |
@@ -766,8 +777,8 @@ close/cancel, no blocking socket calls on reactors, Windows handoff. Exit: echo 
 
 **M2 — HTTP/1.1 server and client, Runtime and workers.** Shared `Runtime` (reactors/workers/resolver/
 lazy pools), parser/serializer, streaming bodies, dispatch, queues, deadlines, cancellation,
-keep-alive, pipelining, h1c, smuggling corpus, fuzz targets, blocking `Client::send`/
-`send_streaming`, and the `testing` `TestServer` harness. Exit: **G1** passes; deferred completion
+keep-alive, pipelining, h1c, smuggling corpus, fuzz targets, blocking `send`/`send_with`, nonblocking `fetch`/`fetch_with` callbacks, and the `testing`
+`TestServer` harness. Exit: **G1** passes; deferred completion
 works with streaming bodies, typed headers, trailers and h1/h2 ordering; client interoperates with
 external servers; server and client share one runtime in a combined test.
 
@@ -910,11 +921,11 @@ and the performance gates (§8).
   60 s; counted detached exchanges as open; enforced `MULTIPLE` on input and synthesised h2/h3
   `Host`; replaced `const NAME` with `fn name()`; made `encode` fallible and caught codec panics;
   moved `Timeouts` to the crate root.
-- **2026-10-27 (client API final):** replaced the call-handle/callback client with a blocking
-  exchange over a public shared `Runtime`. `Client::{send,send_streaming,handle}`;
-  `ClientExchange::{body,finish,cancel}`; request-level `CancelToken`; no `ClientCall`, callback
-  executor, application `Executor`, `try_wait`, or `wait_timeout`. `Runtime` owns reactors/workers/
-  resolver/block/timer pools; `Server`/`Client` are front-ends and share it when built via
-  `rt.server()`/`rt.client()`. Added `TimeoutKind::Wait` removal, feature-gated `testing` with a
-  real-loopback `TestServer`, and public-runtime lifecycle/stats. One blocked caller per outbound
-  call; handlers should defer before a blocking upstream call.
+- **2026-10-27 (client API final):** replaced the call-handle/callback client with four verbs over a
+  public shared `Runtime`: `send`/`send_with` block the caller; `fetch`/`fetch_with` enqueue and run
+  exactly one callback on a runtime worker, receiving `Result<&mut ClientResponse, Error>`.
+  Request-level `CancelToken`; no `ClientCall`, `ClientExchange`, application `Executor`,
+  `try_wait`, or `wait_timeout`. `Runtime` owns reactors/workers/resolver/block/timer pools and a
+  separate `max_client_callbacks` budget; `Server`/`Client` are front-ends via
+  `rt.server()`/`rt.client()`. Moved the Runtime API to the runtime design and the real-loopback
+  `TestServer` to a separate testing design under feature `testing`. Removed `TimeoutKind::Wait`.
