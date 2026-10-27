@@ -10,7 +10,7 @@
 
 **Spec:** [top-level design](../specs/2026-10-26-libhttp-sync-http-design.md), [runtime design](../specs/2026-10-26-libhttp-runtime-design.md), [execution design](../specs/2026-10-26-libhttp-execution-design.md).
 
-This is plan 1 of 6. M2 (HTTP/1.1 + workers + typed headers + deferred completion), M3 (TLS), M4 (HTTP/2), M5 (HTTP/3) and M6 (hardening) get separate plans because each produces a working, independently testable increment.
+This is plan 1 of 6. M2 (shared Runtime + HTTP/1.1 + workers + typed headers + deferred completion + the four client verbs `send`/`send_with`/`fetch`/`fetch_with`), M3 (TLS), M4 (HTTP/2), M5 (HTTP/3) and M6 (hardening) get separate plans because each produces a working, independently testable increment.
 
 ## Global Constraints
 
@@ -21,7 +21,7 @@ This is plan 1 of 6. M2 (HTTP/1.1 + workers + typed headers + deferred completio
 - All queues and buffers are bounded; every bound has a reaction.
 - Blocks are 16 KiB. `Block` is `Send + Sync`, refcounted, and returns to its origin pool on last drop.
 - One logical read and one write in flight per connection; pause by clearing interest / not reposting; close cancels and waits where required.
-- Timers: one heap per reactor; entries are `(deadline, slot, generation, kind)`; stale entries are skipped by generation.
+- Timers: one heap per reactor; entries are `(TimerKey{slot,generation,exchange_seq}, timer_generation, deadline, kind)`; stale key/generation entries are skipped.
 - Unsafe code is confined to `src/rt/sys/` and the block refcount internals; every block is documented and wrapped safely. The crate builds with `#![forbid(unsafe_op_in_unsafe_fn)]`.
 - Platform targets: Linux, macOS, FreeBSD, Windows; CI runs functional tests on all four (FreeBSD in a VM).
 - M1 adds no public API and no HTTP; `pub(crate)` only until M2.
@@ -35,7 +35,7 @@ These are the failure modes M1's tests must pin, most likely first:
 2. **Close with an in-flight operation and slot reuse.** A connection closes while a read/write/overlapped operation is outstanding; late completion or a reused slot must not affect the next connection. Tests: `close_with_pending_read`, `stale_completion_after_reuse_is_ignored` (Windows).
 3. **Stale timers after slot reuse.** A timeout from connection N must not fire against N+1 on an h1 keep-alive slot. Tests: `stale_timer_generation_is_skipped`, `timer_reinsert_cancels_previous`.
 4. **Lost or uncoalesced wakeups.** A cross-thread wake between poll iterations must not be lost; many wakes must drain once. Tests: `wake_before_poll_is_seen`, `many_wakes_coalesce`.
-5. **Accept/connect handoff and addressing.** Accepted sockets must reach the intended reactor and preserve peer/local addresses for IPv4 and IPv6; a failed connect reports a typed error without leaking the socket. Tests: `accept_handoff_ipv4_ipv6`, `connect_refused_closes_socket`.
+5. **Accept/connect addressing.** Accepted and connected sockets preserve peer/local addresses for IPv4 and IPv6; a failed connect reports a typed error without leaking the socket. Tests: `accept_ipv4_ipv6`, `connect_refused_closes_socket`.
 
 ---
 
@@ -121,7 +121,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 ```
 
-`src/lib.rs` starts with `#![forbid(unsafe_op_in_unsafe_fn)]`, declares `mod rt;`, and the test above. `src/rt/mod.rs` declares the submodules listed in File Structure as empty stubs; `src/rt/sys/mod.rs` is empty.
+`src/lib.rs` starts with `#![forbid(unsafe_op_in_unsafe_fn)]`, declares `mod rt;`, and the test above. Create an empty file for every module declared in File Structure and list it in `src/rt/mod.rs`; do not declare a module whose file does not exist. `src/rt/sys/mod.rs` is empty.
 
 - [ ] **Step 4: Run test and checks**
 
@@ -222,23 +222,30 @@ git commit -m "feat(rt): refcounted 16 KiB blocks and bounded pool"
 
 **Interfaces:**
 - Produces:
+  - `pub(crate) struct TimerKey { slot: u32, generation: u32, exchange_seq: u32 }`
+  - `pub(crate) struct TimerToken { key: TimerKey, timer_generation: u32 }`
   - `pub(crate) struct TimerHeap`
   - `TimerHeap::new()`
-  - `TimerHeap::insert(&mut self, deadline: Instant, kind: u16) -> TimerToken`
+  - `TimerHeap::insert(&mut self, key: TimerKey, deadline: Instant, kind: u16) -> TimerToken`
   - `TimerHeap::cancel(&mut self, token: TimerToken)`
   - `TimerHeap::next_deadline(&self) -> Option<Instant>`
   - `TimerHeap::pop_expired(&mut self, now: Instant) -> Vec<(u16, TimerToken)>`
-  - `TimerToken { slot: u32, generation: u32 }` (the connection slot plus its generation)
+- `exchange_seq` is carried now because runtime §5 requires it; M1 uses `0` for all echo connections. M2 supplies the real per-exchange sequence.
+- The live-key generation is the connection's `ConnId` generation; `timer_generation` distinguishes reinserts for the same key. A stale key or timer generation is skipped.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
+fn key(slot: u32) -> TimerKey {
+    TimerKey { slot, generation: 0, exchange_seq: 0 }
+}
+
 #[test]
 fn pops_in_deadline_order() {
     let mut h = TimerHeap::new();
     let base = Instant::now();
-    let later = h.insert(base + Duration::from_millis(20), 1);
-    let sooner = h.insert(base + Duration::from_millis(10), 2);
+    let later = h.insert(key(1), base + Duration::from_millis(20), 1);
+    let sooner = h.insert(key(2), base + Duration::from_millis(10), 2);
     let got = h.pop_expired(base + Duration::from_millis(30));
     assert_eq!(got, vec![(2, sooner), (1, later)]);
 }
@@ -246,29 +253,29 @@ fn pops_in_deadline_order() {
 #[test]
 fn cancel_skips_the_entry() {
     let mut h = TimerHeap::new();
-    let t = h.insert(Instant::now(), 7);
+    let t = h.insert(key(7), Instant::now(), 7);
     h.cancel(t);
     assert!(h.pop_expired(Instant::now() + Duration::from_secs(1)).is_empty());
 }
 
 #[test]
-fn reinsert_cancels_previous_deadline_for_same_slot() {
+fn timer_reinsert_cancels_previous() {
     let mut h = TimerHeap::new();
-    let old = h.insert(Instant::now(), 7);
-    let new = h.insert(Instant::now() + Duration::from_secs(10), 7);
+    let old = h.insert(key(7), Instant::now(), 7);
+    let new = h.insert(key(7), Instant::now() + Duration::from_secs(10), 7);
     let got = h.pop_expired(Instant::now() + Duration::from_secs(1));
     assert!(got.is_empty());
     let got = h.pop_expired(Instant::now() + Duration::from_secs(11));
     assert_eq!(got, vec![(7, new)]);
-    assert_ne!(old.generation, new.generation);
+    assert_ne!(old.timer_generation, new.timer_generation);
 }
 
 #[test]
-fn stale_generation_is_skipped() {
+fn stale_timer_generation_is_skipped() {
     let mut h = TimerHeap::new();
-    let t = h.insert(Instant::now(), 7);
+    let t = h.insert(key(7), Instant::now(), 7);
     h.cancel(t);
-    let newer = h.insert(Instant::now(), 7);
+    let newer = h.insert(key(7), Instant::now(), 7);
     let got = h.pop_expired(Instant::now() + Duration::from_secs(1));
     assert_eq!(got, vec![(7, newer)]);
 }
@@ -281,7 +288,7 @@ Expected: FAIL with unresolved `TimerHeap`.
 
 - [ ] **Step 3: Implement the heap**
 
-Use `BinaryHeap<Reverse<TimerEntry>>` plus a `HashMap<u32, u32>` of live generation per slot. `insert` bumps the slot generation and stores it; `cancel` removes the live generation; `pop_expired` skips entries whose generation is stale and returns `(kind, token)` in deadline order. `next_deadline` peeks and skips stale entries without popping them.
+Use `BinaryHeap<Reverse<TimerEntry>>` plus `HashMap<TimerKey, u32>` of the live `timer_generation` per key. `insert` bumps the timer generation for that key and stores it; `cancel` removes the live generation; `pop_expired` skips entries whose key/timer generation is stale and returns `(kind, token)` in deadline order. `next_deadline` peeks and skips stale entries without popping them.
 
 - [ ] **Step 4: Run tests and checks**
 
@@ -324,7 +331,7 @@ fn wake_then_drain() {
 }
 
 #[test]
-fn many_wakes_coalesce_to_one_drain() {
+fn many_wakes_coalesce() {
     let mut w = Wake::new().unwrap();
     for _ in 0..64 { w.wake().unwrap(); }
     assert!(w.drain().unwrap());
@@ -332,7 +339,7 @@ fn many_wakes_coalesce_to_one_drain() {
 }
 
 #[test]
-fn wake_from_another_thread_is_seen() {
+fn wake_before_poll_is_seen() {
     let mut w = Wake::new().unwrap();
     let fd = w.raw_fd();
     let t = std::thread::spawn(move || unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) });
@@ -494,7 +501,7 @@ git commit -m "feat(rt): handler seam and shared reactor core"
 ### Task 7: Linux epoll backend and loopback echo
 
 **Files:**
-- Create: `src/rt/poller/mod.rs`, `src/rt/poller/epoll.rs`, `src/rt/reactor/unix.rs`
+- Create: `src/rt/poller/mod.rs`, `src/rt/poller/epoll.rs`, `src/rt/reactor/unix.rs`, `src/rt/test_support.rs`
 - Modify: `src/rt/mod.rs`
 
 **Interfaces:**
@@ -504,7 +511,7 @@ git commit -m "feat(rt): handler seam and shared reactor core"
   - `pub(crate) trait Poller { fn add(&mut self, fd: RawFd, id: ConnId, interest: Interest) -> io::Result<()>; fn modify(...); fn remove(...); fn wait(&mut self, timeout: Option<Duration>, events: &mut Vec<PollEvent>) -> io::Result<()>; }`
   - `pub(crate) struct UnixReactor<H: Handler>` with `new(handler)`, `listen(addr)`, `connect(addr) -> io::Result<ConnId>`, `run_until(&mut self, shutdown: &Wake)`, `local_addr()`, and `spawn_for_test() -> (SocketAddr, Shutdown, JoinHandle<io::Result<()>>)`
   - `EpollPoller::new() -> io::Result<Self>`, `KqueuePoller::new() -> io::Result<Self>`
-  - Test helper `spawn_echo() -> (SocketAddr, Shutdown, JoinHandle<io::Result<()>>)` and `struct Shutdown` in `src/rt/test_support.rs`.
+  - Test helpers in `src/rt/test_support.rs`: `spawn_echo()`, `spawn_echo_on(addr: &str) -> io::Result<(SocketAddr, Shutdown, JoinHandle<io::Result<()>>)>`, and `struct Shutdown`. The control/backlog variants are added in Task 10.
 - Edge-triggered epoll (`EPOLLET | EPOLLIN | EPOLLOUT | EPOLLRDHUP`), full drain to `EAGAIN`, one read buffer per conn, write flush on writable, close on EOF/error.
 
 - [ ] **Step 1: Write the failing tests**
@@ -534,6 +541,20 @@ fn read_partial_then_eagain() {
     let mut buf = [0u8; 5];
     client.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"abcde");
+    shutdown.shutdown();
+    join.join().unwrap().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn write_partial_then_writable() {
+    let (addr, shutdown, join) = spawn_echo();
+    let mut client = TcpStream::connect(addr).unwrap();
+    let payload = vec![0x5au8; 1 << 20];
+    client.write_all(&payload).unwrap();
+    let mut echo = vec![0u8; payload.len()];
+    client.read_exact(&mut echo).unwrap();
+    assert_eq!(echo, payload);
     shutdown.shutdown();
     join.join().unwrap().unwrap();
 }
@@ -673,16 +694,8 @@ fn echo_over_loopback_iocp() {
     join.join().unwrap().unwrap();
 }
 
-#[cfg(windows)]
-#[test]
-fn stale_completion_after_reuse_is_ignored() {
-    // close a conn with an outstanding recv, reuse the slot, deliver the old completion,
-    // assert the new conn is untouched.
-}
-
-#[cfg(windows)]
-#[test]
-fn cancel_io_on_close() { /* close with a posted recv; slot frees only after aborted completion */ }
+// Close-with-pending-I/O and stale-completion tests are added in Task 10, after the
+// TestControl harness exists; they are not optional.
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -708,43 +721,133 @@ git commit -m "feat(rt): IOCP reactor for Windows"
 
 ---
 
-### Task 10: Backpressure, close/cancel, 10k-idle budget and the M1 exit gate
+### Task 10: Backpressure, close/cancel and 10k-idle budget
 
 **Files:**
-- Modify: `src/rt/reactor/mod.rs`, `src/rt/reactor/unix.rs`, `src/rt/reactor/iocp.rs`, `src/rt/conn.rs`
-- Create: `src/rt/test_support.rs` (counting allocator + loopback harness)
+- Modify: `src/rt/reactor/mod.rs`, `src/rt/reactor/unix.rs`, `src/rt/reactor/iocp.rs`, `src/rt/conn.rs`, `src/rt/test_support.rs` (allocator/counter instrumentation only; harness already exists from Task 7)
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Produces: `Conn::pause_read/resume_read` wired into both reactors; `ReactorCore::close(ConnId, reason)`; allocation-counting test hooks; M1 exit assertions.
-- Adds tests: `pause_stops_reads`, `resume_after_flush`, `close_cancels_pending`, `idle_10k_alloc_budget`, `wake_before_poll_is_seen`, `many_wakes_coalesce`.
+- Produces: `Conn::pause_read/resume_read` wired into both reactors; `ReactorCore::close(ConnId, reason)`; `TestControl { pause, resume, close_no_wait, mark_connection_reusable, deliver_stale, wait_for_read_bytes, wait_for_connections, total_read_bytes, first_connection, last_connection, peer_addr, local_addr, pending_ops }`; `spawn_echo_with_control()`, `spawn_echo_with_control_on(addr: &str)`, `spawn_echo_with_backlog()`; `test_support::{library_bytes, raise_nofile, wait_for_connections}`; library-owned byte counters; budget/backpressure assertions.
+- Adds tests: `pause_stops_reads_until_resume`, `close_cancels_pending_operation`, `idle_10k_alloc_budget`, `stale_completion_after_reuse_is_ignored` (Windows), `cancel_io_on_close` (Windows).
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
 fn pause_stops_reads_until_resume() {
-    // client sends 1 MiB; handler pauses after first block; assert no kernel read progresses
-    // until the test resumes, then all bytes arrive.
+    let (addr, shutdown, join, control) = spawn_echo_with_control();
+    let mut client = TcpStream::connect(addr).unwrap();
+    client.write_all(&vec![7u8; 64 * 1024]).unwrap();
+    assert!(control.wait_for_read_bytes(1, Duration::from_secs(2)));
+    control.pause();
+    let paused = control.total_read_bytes();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(control.total_read_bytes(), paused, "reactor kept reading while paused");
+    client.write_all(&vec![8u8; 16 * 1024]).unwrap();
+    control.resume();
+    assert!(control.wait_for_read_bytes(paused + 16 * 1024, Duration::from_secs(2)));
+    drop(client);
+    shutdown.shutdown();
+    join.join().unwrap().unwrap();
 }
 
 #[test]
 fn close_cancels_pending_operation() {
-    // close while a read is armed; assert slot is freed and no completion targets it.
+    let (addr, shutdown, join, control) = spawn_echo_with_control();
+    let client = TcpStream::connect(addr).unwrap();
+    assert!(control.wait_for_connections(1, Duration::from_secs(2)));
+    let id = control.first_connection();
+    control.close(id);
+    assert!(control.wait_for_connections(0, Duration::from_secs(2)));
+    assert_eq!(control.pending_ops(id), 0);
+    drop(client);
+
+    let mut second = TcpStream::connect(addr).unwrap();
+    second.write_all(b"ok").unwrap();
+    let mut buf = [0u8; 2];
+    second.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"ok");
+    shutdown.shutdown();
+    join.join().unwrap().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn accept_ipv4_ipv6() {
+    let (addr4, shutdown4, join4, control4) = spawn_echo_with_control_on("127.0.0.1:0").unwrap();
+    let mut c4 = TcpStream::connect(addr4).unwrap();
+    assert!(control4.wait_for_connections(1, Duration::from_secs(2)));
+    let id4 = control4.first_connection();
+    assert_eq!(control4.local_addr(id4), addr4);
+    assert_eq!(control4.peer_addr(id4), c4.local_addr().unwrap());
+    c4.write_all(b"v4").unwrap();
+    let mut b4 = [0u8; 2]; c4.read_exact(&mut b4).unwrap(); assert_eq!(&b4, b"v4");
+    shutdown4.shutdown(); join4.join().unwrap().unwrap();
+
+    if let Ok((addr6, shutdown6, join6, control6)) = spawn_echo_with_control_on("[::1]:0") {
+        let mut c6 = TcpStream::connect(addr6).unwrap();
+        assert!(control6.wait_for_connections(1, Duration::from_secs(2)));
+        let id6 = control6.first_connection();
+        assert_eq!(control6.local_addr(id6), addr6);
+        assert_eq!(control6.peer_addr(id6), c6.local_addr().unwrap());
+        c6.write_all(b"v6").unwrap();
+        let mut b6 = [0u8; 2]; c6.read_exact(&mut b6).unwrap(); assert_eq!(&b6, b"v6");
+        shutdown6.shutdown(); join6.join().unwrap().unwrap();
+    }
 }
 
 #[test]
 fn idle_10k_alloc_budget() {
-    let before = test_support::allocated_bytes();
-    let (addr, shutdown, join) = spawn_echo();
+    test_support::raise_nofile(65_536);
+    let before = test_support::library_bytes();
+    let (addr, shutdown, join) = spawn_echo_with_backlog(1_024);
     let clients: Vec<TcpStream> = (0..10_000)
         .map(|_| TcpStream::connect(addr).unwrap())
         .collect();
-    std::thread::sleep(Duration::from_millis(200));
-    let after = test_support::allocated_bytes();
+    assert!(test_support::wait_for_connections(10_000, Duration::from_secs(5)));
+    let after = test_support::library_bytes();
     let per_conn = (after - before) / 10_000;
     assert!(per_conn < 1024, "library allocated {per_conn} bytes per idle connection");
     drop(clients);
+    shutdown.shutdown();
+    join.join().unwrap().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn stale_completion_after_reuse_is_ignored() {
+    let (addr, shutdown, join, control) = spawn_echo_with_control();
+    let first = TcpStream::connect(addr).unwrap();
+    assert!(control.wait_for_connections(1, Duration::from_secs(2)));
+    let old = control.first_connection();
+    control.close_no_wait(old); // posts CancelIoEx but leaves the completion to be delivered
+    control.mark_connection_reusable(old); // test-only: free the slot while the completion is pending
+    let mut second = TcpStream::connect(addr).unwrap();
+    assert!(control.wait_for_connections(1, Duration::from_secs(2)));
+    let new = control.last_connection();
+    assert_eq!(new.slot, old.slot, "test did not reuse the old slot");
+    control.deliver_stale(old); // force the old completion after the new connection exists
+    second.write_all(b"new").unwrap();
+    let mut buf = [0u8; 3];
+    second.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"new", "stale completion affected the reused slot");
+    drop(first);
+    shutdown.shutdown();
+    join.join().unwrap().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn cancel_io_on_close() {
+    let (addr, shutdown, join, control) = spawn_echo_with_control();
+    let client = TcpStream::connect(addr).unwrap();
+    assert!(control.wait_for_connections(1, Duration::from_secs(2)));
+    let id = control.first_connection();
+    control.close(id);
+    assert!(control.wait_for_connections(0, Duration::from_secs(2)));
+    assert_eq!(control.pending_ops(id), 0);
+    drop(client);
     shutdown.shutdown();
     join.join().unwrap().unwrap();
 }
@@ -753,22 +856,22 @@ fn idle_10k_alloc_budget() {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --lib rt::reactor idle_10k_alloc_budget`
-Expected: FAIL (no pause wiring / no counting allocator).
+Expected: FAIL (no `TestControl`, pause wiring or library-byte counters).
 
 - [ ] **Step 3: Wire backpressure, close, and the budget test**
 
-Pause means clearing read interest (readiness) or not reposting the recv (IOCP); resume when the outbound queue falls below the low-water mark. Close order follows the runtime design; Windows waits for aborted completions. The counting allocator is a `#[global_allocator]` in `test_support` active only under `cfg(test)`, counting bytes allocated by library-owned slabs/pools; the test opens 10,000 loopback connections, waits for them to be idle, records the delta, and asserts < 1 KiB/conn. Add the test to the CI matrix.
+Pause means clearing read interest (readiness) or not reposting the recv (IOCP); resume when the outbound queue falls below the low-water mark. `TestControl` is a test-only handle into the reactor; its `pending_ops(id)` makes the Windows close wait observable. Close order follows the runtime design; Windows waits for aborted completions. `test_support::library_bytes()` sums counters maintained by the reactor's slab and block pools, so 10,000 client `TcpStream`s and test allocations are excluded; `raise_nofile` and a 1,024 backlog make the 10,000-connection test stable. Add these tests to the CI matrix.
 
 - [ ] **Step 4: Run all checks on every platform**
 
 Run: `cargo test --all-targets && cargo fmt --check && cargo clippy --all-targets -- -D warnings`
 Expected: PASS on Linux, macOS, Windows; FreeBSD job passes.
 
-- [ ] **Step 5: Commit and tag the M1 exit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/rt .github/workflows/ci.yml
-git commit -m "feat(rt): backpressure, close/cancel and 10k-idle M1 exit gate"
+git commit -m "feat(rt): backpressure, close/cancel and 10k-idle budget"
 ```
 
 ### Task 11: Outbound connect
@@ -777,7 +880,7 @@ git commit -m "feat(rt): backpressure, close/cancel and 10k-idle M1 exit gate"
 - Modify: `src/rt/reactor/unix.rs`, `src/rt/reactor/iocp.rs`, `src/rt/handler.rs`, `src/rt/test_support.rs`
 
 **Interfaces:**
-- Produces: `UnixReactor::spawn_client_for_test(handler) -> (ClientHandle, Shutdown, JoinHandle<io::Result<()>>)`; `ClientHandle::connect(&self, addr: SocketAddr) -> io::Result<ConnId>`, `ClientHandle::wait_until(&self, timeout: Duration, pred: impl Fn(&ClientStats) -> bool) -> bool`, `ClientStats { connections: usize, echoed: bool }`; `Handler::on_connect` (default no-op). Windows `IocpReactor` provides the same test surface via `ConnectEx`.
+- Produces: `UnixReactor::spawn_client_for_test() -> (TestClientHandle, Shutdown, JoinHandle<io::Result<()>>)`; test-only `TestClientHandle::connect(&self, addr: SocketAddr) -> io::Result<ConnId>` (enqueues and blocks the test thread until completion), `TestClientHandle::stats(&self) -> TestClientStats`, `TestClientHandle::wait_until(&self, timeout: Duration, pred: impl Fn(&TestClientStats) -> bool) -> bool`, `TestClientStats { connections: usize, echoed: bool }`; `Handler::on_connect` (default no-op). Windows `IocpReactor` provides the same test surface via `ConnectEx`. These are test-only names; the public `ClientHandle`/`ClientStats` do not exist until M2.
 - `ConnectHandler` writes `ping` in `on_connect`, asserts `pong` in `on_read`, sets `echoed`, then closes.
 
 - [ ] **Step 1: Write the failing tests**
@@ -785,7 +888,7 @@ git commit -m "feat(rt): backpressure, close/cancel and 10k-idle M1 exit gate"
 ```rust
 #[cfg(unix)]
 #[test]
-fn connect_refused_returns_error_and_reclaims_slot() {
+fn connect_refused_closes_socket() {
     let dead = {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let a = l.local_addr().unwrap();
@@ -804,6 +907,17 @@ fn connect_refused_returns_error_and_reclaims_slot() {
 #[test]
 fn connect_then_echo() {
     let (addr, shutdown, join) = spawn_echo();
+    let (handle, _s, cjoin) = UnixReactor::<ConnectHandler>::spawn_client_for_test();
+    handle.connect(addr).unwrap();
+    assert!(handle.wait_until(Duration::from_secs(2), |s| s.echoed));
+    shutdown.shutdown();
+    cjoin.join().unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn connect_then_echo_ipv6() {
+    let Ok((addr, shutdown, join)) = spawn_echo_on("[::1]:0") else { return; };
     let (handle, _s, cjoin) = UnixReactor::<ConnectHandler>::spawn_client_for_test();
     handle.connect(addr).unwrap();
     assert!(handle.wait_until(Duration::from_secs(2), |s| s.echoed));

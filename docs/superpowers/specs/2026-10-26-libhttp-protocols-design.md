@@ -33,7 +33,9 @@ security contracts of the three protocol engines. Engines are sans-I/O; they see
   a generated known-name table; application types are registered with `register_header::<T>()`.
   Unregistered fields stay raw. Typed values live in a per-head arena bounded by
   `max_header_arena_bytes` and charged to the connection/global buffer caps. Application
-  `decode`/`encode` panics are caught at the boundary and mapped to `400`/`500`.
+  `decode`/`encode` panics are caught at the library boundary and mapped to `400`/`500`; the one
+  exception is an application `encode` panic on a deferred application thread, which the library
+  cannot catch (that thread unwinds and the deferred drop rule applies).
 - The same `Handler` may opt into deferred completion with
   `Request::defer(&mut self, &mut Response) -> Result<(DeferredRequest, DeferredResponse), Error>`. The move is
   atomic; the deferred handles support typed/raw headers, streaming request and response bodies,
@@ -63,9 +65,11 @@ Smuggling defenses (all are errors, not "best effort"):
   byte bound (`max_chunk_extension_bytes`, 1 KiB); chunk data followed by exactly CRLF.
 - Trailers: bounded (`max_trailer_bytes`, 8 KiB), no `Content-Length`, `Transfer-Encoding`, `Host`,
   or other framing fields; parsed only after the last chunk.
-- Absolute-form targets: the authority is authoritative; a conflicting `Host` is ignored for routing
-  but retained for the handler (and never used to rewrite the target). Multiple `Host` fields are
-  rejected (`400`) even when identical.
+- Absolute-form targets: the authority is authoritative. A `Host` field that differs from it
+  (case-insensitive host, normalized port) is rejected with `400`; it is never retained for the
+  handler. `Request::header::<Host>()` synthesizes the authority when the field is absent, so h1,
+  h2 and h3 expose the same Host value. Multiple `Host` fields are rejected (`400`) even when
+  identical.
 - Request-target and header values reject NUL and CTLs; obs-text (0x80–0xFF) is allowed in values
   only, never in names.
 - A second request head arriving while a body is incomplete is not parsed until the body ends.
@@ -277,7 +281,8 @@ response resets its stream; the connection stays.
 
 - HTTP/1.1 smuggling corpus (RFC 9112 §11 examples plus known vectors: CL/TE conflicts, duplicate CL,
   obs-fold, whitespace before colon, bare CR/LF, chunk-size oddities, trailer abuse, pipelining after
-  errors).
+  errors; absolute-form target with conflicting `Host` is rejected, and typed `Host` returns the
+  authority).
 - HTTP/2 conformance (h2spec) and frame/HPACK fuzzing; CONTINUATION, SETTINGS and PING floods;
   window-overflow; forbidden fields; pseudo-header ordering.
 - HTTP/3 interop (curl/quiche) and frame/QPACK fuzzing; decoded-size budget; control-stream abuse.

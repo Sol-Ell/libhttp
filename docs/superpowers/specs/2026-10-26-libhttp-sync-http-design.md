@@ -189,8 +189,8 @@ are builder discretion; signatures and semantics are the contract.
 
 | Module | Contents |
 |---|---|
-| `libhttp` | `Runtime`, `RuntimeBuilder`, `RuntimeHandle`, `RuntimeStats`, `Method`, `StatusCode`, `Version`, `HeaderName`, `HeaderValue`, `HeaderRef`, `HeaderMap`, `Header`, `HeaderError`, `Timeouts`, `CancelToken`, `Target`, `Uri`, `header`, `Error`, `TimeoutKind`, `ProtocolError`, `ProtocolErrorKind`, `TlsError` |
-| `libhttp::server` | `Server`, `ServerBuilder`, `ServerHandle`, `Handler`, `Request`, `Response`, `DeferredRequest`, `DeferredResponse`, `BodyReader`, `BodyWriter`, `BodyChunk`, `Limits`, `Stats`, and a `Timeouts` re-export |
+| `libhttp` | `Runtime`, `RuntimeBuilder`, `RuntimeHandle`, `RuntimeStats`, `Method`, `StatusCode`, `Version`, `HeaderName`, `HeaderValue`, `HeaderRef`, `HeaderMap`, `Header`, `HeaderError`, `Timeouts`, `CancelToken`, `BodyReader`, `BodyWriter`, `BodyChunk`, `Target`, `Uri`, `header`, `Error`, `TimeoutKind`, `ProtocolError`, `ProtocolErrorKind`, `TlsError` |
+| `libhttp::server` | `Server`, `ServerBuilder`, `ServerHandle`, `Handler`, `Request`, `Response`, `DeferredRequest`, `DeferredResponse`, `Limits`, `Stats`, and re-exports of `Timeouts` and the root body types |
 | `libhttp::client` | `Client`, `ClientBuilder`, `ClientHandle`, `ClientRequest`, `ClientResponse`, `ClientStats`, `PoolConfig`; uses the root `Timeouts`/`CancelToken` |
 | `libhttp::tls` | `TlsServerConfig`, `TlsClientConfig` (PEM/roots/ALPN/client-auth); rustls types stay internal in v1 |
 
@@ -223,7 +223,10 @@ server.run(my_handler)?;                      // blocks until shutdown
   `local_udp_addrs() -> Vec<SocketAddr>`.
 - `Server::builder()`/`Client::builder()` create a private `Runtime`. To share one, build
   `Runtime::builder()...build()?` and use `rt.server()`/`rt.client()`; worker/reactor/resolver
-  configuration belongs to `RuntimeBuilder`, not the component builders.
+  configuration belongs to `RuntimeBuilder`, not the component builders. `RuntimeBuilder::build`
+  rejects `reactors == 0`; `Server::build`/`rt.server()` rejects `workers == 0` with `InvalidConfig`;
+  `fetch`/`fetch_with` also reject a zero-worker runtime. Validating these at build prevents
+  worker-derived `Limits` resolving to zero and a server that accepts but never dispatches.
 - `shutdown()` signals and returns. `Server::run` closes listeners, sends GOAWAY/`Connection: close`,
   gives in-flight exchanges `Timeouts::shutdown_grace` (default 30 s; `shutdown_with_deadline`
   overrides it for that call), and cancels what remains, then returns `Ok(())`; `Err` only for a
@@ -463,9 +466,10 @@ storage variants. Typed access is `get::<T>()` or the generated inherent accesso
 raw entries only. `Header::decode` is called once per field line when the exchange is handed to the
 handler/caller (queued exchanges hold raw heads only); `MULTIPLE` is enforced on input and on
 `append`, so a duplicate singleton is `400`/stream reset. An unregistered extension field stays raw;
-`get::<T>()` returns `None` until `register_header::<T>()` is called. For h2/h3,
-`Request::header::<Host>()` synthesises `Host` from `:authority` when the field is absent; the raw
-map contains a `Host` entry only if the peer sent one.
+`get::<T>()` returns `None` until `register_header::<T>()` is called. For h2/h3 and h1
+absolute-form requests, `Request::header::<Host>()` synthesises `Host` from the authority when the
+field is absent; a h1 absolute-form `Host` that conflicts with the authority is rejected with `400`.
+The raw map contains a `Host` entry only if the peer sent one.
 
 The typed arena's type-erased entries need drop and encode function pointers; those are invoked once
 per typed header, never per byte or per lookup. Standard headers use generated accessors and decoder
@@ -525,10 +529,12 @@ pub struct Limits {
     pub max_chunk_extension_bytes: u32,       // 1 KiB (h1)
     pub max_connection_buffer_bytes: usize,   // 8 MiB h2/h3, 256 KiB h1; effective total per stream = min(128 KiB, cap/open)
     pub max_buffered_bytes: usize,            // 256 MiB per server; low-water reset, not a global stall
+    pub max_pinned_bytes: usize,              // 64 MiB retained BodyChunks at handoff (open or post-close)
+    pub max_pinned_bytes_per_exchange: usize, // 128 KiB outstanding chunks per exchange
     pub max_parked_workers: Option<usize>,    // None = max(1, workers / 2)
     pub max_parked_per_connection: Option<usize>, // None = max(1, parked / 2)
-    pub max_parked_writers_per_connection: usize, // 1, within the per-connection total
-    pub max_parked_readers_per_connection: usize, // 1, within the per-connection total
+    pub max_parked_writers_per_exchange: usize,  // 1, within the per-connection total
+    pub max_parked_readers_per_exchange: usize,  // 1, within the per-connection total
     pub max_deferred_exchanges: usize,        // 4,096 detached exchanges per server
     pub h2_max_concurrent_streams: u32,       // 32
     pub h2_initial_stream_window: u32,        // 64 KiB
@@ -570,8 +576,7 @@ pub enum Error {
     Header(HeaderError),                // typed header decode/registration failure
 }
 pub enum TimeoutKind {
-    Connect, TlsHandshake, HeaderRead, BodyIdle, ReadStall, WriteStall, KeepAlive, PoolQueue,
-    Total, Deferred,
+    Connect, TlsHandshake, HeaderRead, BodyIdle, ReadStall, WriteStall, PoolQueue, Total, Deferred,
 }
 pub struct ProtocolError;   // version() + kind(); stable classification, not a wire dump
 pub enum ProtocolErrorKind { MalformedMessage, Framing, HeaderCompression, FlowControl,
@@ -612,10 +617,12 @@ for `fetch_with`, after the upload job). The callback receives
 `Result<&mut ClientResponse, Error>`: the runtime owns the response and drops it after the callback;
 the callback may stream the body but cannot retain or move the response. There is no `ClientCall`,
 `wait`, `on_complete`, call table, application executor, or `Executor` trait. Callback errors go to
-`ClientBuilder::on_error`; pre-enqueue errors (`Overloaded`, `Closed`) are returned by the verb.
-`fetch`/`fetch_with` callbacks and `fetch_with` uploads are bounded by
+`ClientBuilder::on_error`; pre-enqueue errors (`Overloaded`, `Closed`, and `InvalidConfig` on a
+zero-worker runtime) are returned by the verb.
+`fetch`/`fetch_with` callbacks and `fetch_with` uploads execute under
 `RuntimeBuilder::max_client_callbacks` (default `max(1, workers / 2)`), separate from handler
-admission, so callbacks cannot starve handlers.
+admission, so callbacks cannot starve handlers; admitted calls whose callback has no slot wait in
+the callback queue and are not rejected.
 
 `ClientHandle` provides `shutdown`, `shutdown_with_deadline`, `stats` and `runtime`. A private
 runtime is created by `Client::builder()`; a shared one by `Runtime::builder()...build()?` and
@@ -635,7 +642,7 @@ runs on the runtime resolver threads with a 60 s cache (1,024-entry LRU) and Hap
 stagger), never on the caller or a reactor. One retry only for a reused connection, before response
 bytes, idempotent method, replayable body. Requests and responses use typed headers through the same
 `Header` trait (`ClientRequest::set(ContentType::json())`,
-`ClientResponse::headers().get::<ContentType>()`), with raw `header`/`header_value` for custom fields
+`ClientResponse::headers().get::<ContentType>()`), with `raw_header` for custom fields
 and `ClientBuilder::register_header::<T>()` for incoming extension types. Header limits are the fixed
 protocol defaults, not configurable in v1. `CancelToken` can be armed on a request and cancelled from
 another thread; there is no post-send call handle for blocking verbs. No redirects, cookies,
@@ -663,7 +670,7 @@ Every §10 question is settled. The contracts behind each decision are in the co
 | 1 | I/O model across platforms | No public I/O model. Engines are sans-I/O byte-flow machines; each platform uses its native primitive (epoll/kqueue readiness, IOCP completion). io_uring later is another transport. → runtime §2 |
 | 2 | Read/accept arming, backpressure, close | One logical read and one write in flight; pause by clearing interest/not reposting; terminal read = EOF/error; op identity = `(slot, generation)`; close cancels/wait for completions; accept loops on readiness and a bounded `AcceptEx` pool on Windows. → runtime §2.3, §6 |
 | 3 | Buffer ownership | 16 KiB refcounted blocks from a bounded per-reactor pool; ranges, not copies; one atomic per block crossing threads; batched returns with one coalesced wake; explicit head storage, quotas and copy/atomic budget. → runtime §4 |
-| 4 | Worker model | One shared, bounded pool for handlers and client callback/upload jobs; single-owner reactor deadlines; `read_stall`/`write_stall`; global parked-worker ceiling plus per-connection reader/writer caps; per-stream connection-window shares; explicit admission and cancellation; per-request deferred completion on the same handler trait; no
+| 4 | Worker model | One shared, bounded pool for handlers and client callback/upload jobs; single-owner reactor deadlines; `read_stall`/`write_stall`; global parked-worker ceiling plus per-exchange direction caps within the per-connection total; per-stream connection-window shares; explicit admission and cancellation; per-request deferred completion on the same handler trait; no
 preemption of blocking handlers. → execution §6, §9 |
 | 5 | Fast-path scope | v1 native baselines; optional gated `SO_REUSEPORT`/`TCP_FASTOPEN`/`EPOLLEXCLUSIVE`/Linux datagram batching; all zero-copy and io_uring paths phase 2 behind the same seam. → runtime §9 |
 | 6 | QUIC backend and budget | `quinn-proto` chosen on merit (sans-I/O, rustls, no async), not obligation; h3 framing + static QPACK ours; datagram copy/syscall budget stated; quiche remains the measured fallback if G3 fails. → protocols §4 |
@@ -764,13 +771,11 @@ acceptance.
 read/write/close; byte-echo server on the transport. Tests: loopback echo, 10k idle connection memory,
 close/cancel, no blocking socket calls on reactors, Windows handoff. Exit: echo works on all CI platforms (Linux, macOS, Windows; FreeBSD VM); idle memory measured.
 
-**M2
-
 **M2 — HTTP/1.1 server and client, Runtime and workers.** Shared `Runtime` (reactors/workers/resolver/
 lazy pools), parser/serializer, streaming bodies, dispatch, queues, deadlines, cancellation,
-keep-alive, pipelining, h1c, smuggling corpus, fuzz targets, blocking `send`/`send_with`, nonblocking `fetch`/`fetch_with` callbacks, and a combined
+keep-alive, pipelining, smuggling corpus, fuzz targets, blocking `send`/`send_with`, nonblocking `fetch`/`fetch_with` callbacks, and a combined
 server/client test on one runtime. Exit: **G1** passes; deferred completion
-works with streaming bodies, typed headers, trailers and h1/h2 ordering; client interoperates with
+works with streaming bodies, typed headers, trailers and h1 ordering; client interoperates with
 external servers; server and client share one runtime in a combined test.
 
 **M3 — TLS.** rustls, ALPN, `close_notify`, client roots/certs, handshake timeouts, TLS copy/syscall

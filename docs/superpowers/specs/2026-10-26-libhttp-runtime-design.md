@@ -63,10 +63,13 @@ impl ClientHandle { pub fn runtime(&self) -> Runtime; }
 ```
 
 - `Runtime::server()`/`client()` return builders attached to this runtime. `Server::builder()`/
-  `Client::builder()` create a private runtime.
-- `RuntimeBuilder::max_client_callbacks` is the global cap on `fetch`/`fetch_with` callback jobs and
-  `fetch_with` upload jobs. It is separate from handler admission; exhausting it returns
-  `Overloaded` from the verb.
+  `Client::builder()` create a private runtime. `reactors(0)` and `resolver_threads(0)` are rejected
+  at build with `InvalidConfig`; `workers(0)` is allowed only for a blocking-only client, so
+  `rt.server()` and `fetch`/`fetch_with` reject it with `InvalidConfig`.
+- `RuntimeBuilder::max_client_callbacks` caps concurrently executing `fetch`/`fetch_with` callback
+  jobs and `fetch_with` upload jobs. It is separate from handler admission and from call admission:
+  a completed call waits in the callback queue when all slots are busy; calls are bounded by
+  `max_inflight_calls`, not by this budget.
 - Reactors start at build; workers start with the first server or `fetch`/`fetch_with`; resolvers
   start with the first client. A client-only runtime using only blocking verbs has no worker threads;
   a server-only runtime has no resolver threads. `workers(0)` allows blocking-only use but makes
@@ -237,9 +240,11 @@ the same host, the cause is investigated before any further TLS work.
 ### 4.1 Blocks
 
 Fixed 16 KiB refcounted blocks from a per-reactor pool. The pool grows lazily to a derived cap of
-`max_buffered_bytes / max(1, reactors) / 16 KiB` blocks (256 MiB across four reactors ≈ 16,384
-blocks total, 4,096 per reactor) and never allocates without bound. An exhausted pool stops reading
-and triggers the global low-water reaction (§4.3) rather than allocating more. A block has a
+`(max_buffered_bytes + max_pinned_bytes) / max(1, reactors) / 16 KiB` blocks (320 MiB across four
+reactors ≈ 20,480 blocks total, 5,120 per reactor with defaults) and never allocates without bound.
+The 64 MiB pinned reserve is part of that capacity; it does not consume the active 256 MiB admission
+budget. An exhausted pool stops reading and triggers the global low-water reaction (§4.3) rather
+than allocating more. A block has a
 refcount, a length, and an owning pool id. Splits are ranges, not copies.
 
 A read may contain a body tail and the next request head, or DATA for several HTTP/2 streams, or
@@ -288,8 +293,9 @@ raw ones.
   Standard accessors and decode entries are generated; extension values use the trait.
 - Response typed headers are encoded to `HeaderValue`s on the worker (or the application thread for a
   deferred response) when the head is committed; the reactor only frames/HPACK/QPACK-encodes raw
-  values. Typed-header `encode` never runs on a reactor. An `encode` error is a `500`/reset; a panic
-  in an application `encode`/`decode` is caught at the boundary and mapped the same way.
+  values. Typed-header `encode` never runs on a reactor. An `encode` error is a `500`/reset; an
+  application `decode`/`encode` panic is caught at the boundary and mapped the same way, except an
+  `encode` panic on a deferred application thread (it unwinds that thread and applies the drop rule).
 - A deferred exchange moves the same request head/body and response state into `DeferredRequest`/
   `DeferredResponse`; the typed map and arena move with them. The application thread's body reads and
   response writes use the same bounded rings, deadlines and `Canceled` propagation as a handler; the
@@ -297,8 +303,11 @@ raw ones.
 
 ### 4.3 Retention, quotas and memory arithmetic
 
-Two explicit quotas bound memory; the per-connection one prevents one peer from eating the reactor's
-pool, and the global one prevents a reactor from eating the process:
+Two admission quotas plus a separate pinned-chunk quota bound memory: the per-connection one
+prevents one peer from eating the reactor's pool, the global one prevents a reactor from eating the
+process, and the pinned quota bounds memory a handler retains after it has been handed a chunk.
+Worst-case live body/arena memory is therefore `max_buffered_bytes + max_pinned_bytes` (320 MiB with
+the defaults):
 
 - `Limits::max_connection_buffer_bytes` (default 8 MiB for h2/h3, 256 KiB for h1) covers the
   connection's read block, inbound exchange queues and outbound queue. The per-exchange
@@ -311,12 +320,22 @@ pool, and the global one prevents a reactor from eating the process:
   can use its ceilings; a user-raised stream count triggers sharing rather than immediate resets.
   A connection that exceeds its budget resets the stream that is over its share with no progress
   (h2/h3), or closes (h1). This is a safety net, not the normal path.
-- `Limits::max_buffered_bytes` (default 256 MiB per server) counts all outstanding blocks **and
-  typed-header arena bytes**, including blocks/arenas held by workers or detached exchanges. On reaching it the reactor resets the connections holding the most
-  buffered bytes (those over their per-connection share) until usage falls below a 90% low-water
-  mark; if it is still full, it stops reading and accepting, applies the normal read/write deadlines,
-  and resets the top consumers again after `read_stall`. It never converts one reactor's pressure
-  into an indefinite global stall.
+- `Limits::max_buffered_bytes` (default 256 MiB per server) counts active outstanding blocks and
+  typed-header arena bytes, including blocks/arenas held by workers or detached exchanges. It does
+  **not** count retained/pinned `BodyChunk`s (charged at handoff to `max_pinned_bytes`). On reaching it the reactor resets the connections
+  holding the most buffered bytes (those over their per-connection share) until usage falls below a
+  90% low-water mark; if it is still full, it stops reading and accepting, applies the normal
+  read/write deadlines, and resets the top consumers again after `read_stall`. It never converts one
+  reactor's pressure into an indefinite global stall.
+- `Limits::max_pinned_bytes` (default 64 MiB per server) counts blocks retained through
+  `BodyChunk` while the exchange is open and after it closes. A chunk is reclassified from the
+  active buffer to pinned when it is handed to the caller; the per-exchange
+  `max_pinned_bytes_per_exchange` (128 KiB) and the global cap are checked at that handoff. Reaching
+  either cap makes that `read` return `Overloaded` and resets its stream/connection; no new pinned
+  bytes are admitted. Pinned blocks are outside `max_buffered_bytes` admission, so pinned growth
+  cannot consume the active admission budget; if the shared pool is exhausted, reads pause until
+  active blocks are released. The handler already owns previously returned chunks; the caps bound
+  new retention rather than pretending it can reclaim them.
 - A queued exchange holds only its head, never a body: the reactor stops reading body bytes until a
   worker is assigned. That keeps `max_queued_exchanges` (default workers × 256) from multiplying
   `max_request_body_buffer`.
@@ -342,13 +361,15 @@ pool, and the global one prevents a reactor from eating the process:
 ### 4.4 `BodyChunk` ownership and shutdown
 
 `BodyChunk` is `Send + Sync`, immutable, and holds a block reference. A handler may retain chunks; it
-cannot free them early or forge them. Retaining all blocks delays that reactor's pool and therefore
-its reads — bounded by `max_buffered_bytes`, not a leak. If the global cap stays at its low-water
-mark, the reactor resets the connections holding the most buffered bytes (§4.3); a handler that keeps
-chunks cannot be forced to drop them, but its connection is cut, its I/O returns `Canceled`, and the
-memory is bounded by the global cap until the chunk drops. Shutdown does **not** wait for user-held
-chunks: the reactor closes, the pool is marked dead, and the last drop of a chunk frees its block
-directly instead of pushing to a dead return queue. Late drops from any thread are safe. This is the
+cannot free them early or forge them. Each chunk handed to the caller is charged to
+`max_pinned_bytes`/`max_pinned_bytes_per_exchange`; the next read on that exchange fails
+`Overloaded` once either cap is reached, so a handler cannot keep growing its retained set. After
+the exchange/connection closes, the remaining chunks stay pinned but are outside
+`max_buffered_bytes` admission; they cannot stall the server. A handler that keeps chunks cannot be
+forced to drop them, but its connection is already closed, its I/O returns `Canceled`, and the caps
+bound new retention. Shutdown does **not** wait for user-held chunks: the reactor closes, the pool
+is marked dead, and the last drop of a chunk frees its block directly instead of pushing to a dead
+return queue. Late drops from any thread are safe. This is the
 "buffer accounting on close must not wait for user-held buffers" rule.
 
 ### 4.5 Copy and syscall budget

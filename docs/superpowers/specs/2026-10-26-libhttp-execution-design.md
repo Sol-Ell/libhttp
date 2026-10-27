@@ -133,9 +133,10 @@ must actually wait.
   so 2 with 8 workers) caps all parked readers and writers on one connection. One connection cannot
   consume the global parking budget; when its total is reached, the call gets `Error::Overloaded` and
   its stream is reset (h1 closes).
-- **Direction sub-caps.** `max_parked_writers_per_connection` (1) and
-  `max_parked_readers_per_connection` (1) are ceilings within the per-connection total; they exist to
-  keep a duplex exchange from being starved by one direction.
+- **Direction sub-caps.** `max_parked_writers_per_exchange` (1) and
+  `max_parked_readers_per_exchange` (1) are per-exchange ceilings within the per-connection total;
+  they prevent one exchange from issuing a second blocking read/write in the same direction. Other
+  streams on the connection are unaffected; `max_parked_per_connection` bounds the total.
 - HTTP/2/3 flow-control stalls are therefore either resolved by data/capacity arriving, capped by
   these reservations, or reset; HTTP/1.1 has one writer, so `write_stall` is its only stall bound.
 
@@ -197,16 +198,19 @@ its share, then reset, and the rest continue.
   succeeded, the panic only cancels the detached exchange; it never synthesises a response for state
   owned by `DeferredRequest`/`DeferredResponse`. The worker returns to the pool; poisoned exchange
   state is discarded. Application `Header::decode`/`encode` panics are caught at the library
-  boundary: input becomes `400`/stream error, output `500`/reset.
+  boundary: input becomes `400`/stream error, output `500`/reset. An `encode` panic on a deferred
+  application thread cannot be caught; that thread unwinds and the deferred drop rule applies.
 - **Shutdown:** `ServerHandle::shutdown()` signals and returns; `Server::run` closes listeners, sends
-  GOAWAY / `Connection: close`, stops dispatch, gives in-flight and deferred exchanges `Timeouts::shutdown_grace` (30 s by
-  default; `shutdown_with_deadline` overrides it for that call), then sets terminal `Canceled` on
-the remaining deferred handles, resets/closes what remains, and joins the
-  reactor threads; it returns `Ok(())` unless a reactor/listener failed fatally. Normal handlers are
-  drained within the grace period. A handler that ignores cancellation but eventually returns only
-  delays teardown by its own runtime; a handler that never returns keeps its worker thread and
-  prevents `run` from returning. That is the single unbounded wait in the design, it is caused by user
-  code, and Rust cannot preempt it; tests must not install never-returning handlers.
+  GOAWAY / `Connection: close`, stops dispatch, gives its in-flight and deferred exchanges
+  `Timeouts::shutdown_grace` (30 s by default; `shutdown_with_deadline` overrides it for that call),
+  then sets terminal `Canceled` on its remaining deferred handles, resets/closes what remains, and
+  returns `Ok(())` unless a listener/server-side reactor failed fatally. It does **not** join or stop
+  the shared reactors: those belong to `Runtime`; `RuntimeHandle::shutdown` or the last lease joins
+  them. A shared-runtime client remains usable after `run` returns. Normal handlers are drained
+  within the grace period. A handler that ignores cancellation but eventually returns only delays
+  teardown by its own runtime; a handler that never returns keeps its worker thread and prevents
+  `run` from returning. That is the single unbounded wait in the design, caused by user code, and
+  Rust cannot preempt it; tests must not install never-returning handlers.
 
 ---
 
@@ -225,7 +229,9 @@ Every bound has a reaction. This is the table the implementation and tests are c
 | `max_request_body_buffer` | 64 KiB/exchange ceiling | stop reading that stream/socket; effective total = min(128 KiB, connection budget / open streams) |
 | `max_response_body_buffer` | 64 KiB/exchange ceiling | writer blocks if a parking slot is available, otherwise `Overloaded`+reset |
 | `max_connection_buffer_bytes` | 8 MiB (h2/h3), 256 KiB (h1) | reset stream over its share / close connection |
-| `max_buffered_bytes` (server) | 256 MiB | reset top consumers to 90% low-water; then stop reading/accepting; no indefinite global stall |
+| `max_buffered_bytes` (server) | 256 MiB | reset top consumers to 90% low-water; then stop reading/accepting; no indefinite global stall; excludes retained/pinned chunks |
+| `max_pinned_bytes` (server) | 64 MiB | retained `BodyChunk`s at handoff; `read` `Overloaded`, reset that exchange, no admission stop |
+| `max_pinned_bytes_per_exchange` | 128 KiB | `read` `Overloaded`, reset that exchange |
 | `max_connections` | 100,000 | pause accepts |
 | `max_connections_per_reactor` | 50,000 | pause accepts on that reactor |
 | `max_pending_accepts` | 1,024 | pause accepts until the handoff queue drains |
@@ -239,8 +245,8 @@ Every bound has a reaction. This is the table the implementation and tests are c
 | `h3_max_concurrent_streams` | 32 | streams over the advertised limit are reset |
 | `max_parked_workers` | max(1, workers/2) | `Overloaded`, reset/close |
 | `max_parked_per_connection` | max(1, parked/2) | `Overloaded`, reset that stream |
-| `max_parked_writers_per_connection` | 1 | `Overloaded`, reset that stream |
-| `max_parked_readers_per_connection` | 1 | `Overloaded`, reset that stream |
+| `max_parked_writers_per_exchange` | 1 | `Overloaded`, that exchange only |
+| `max_parked_readers_per_exchange` | 1 | `Overloaded`, that exchange only |
 | `max_trailer_bytes` | 8 KiB | h1: `431`/close; h2/h3: stream error |
 | `max_chunk_extension_bytes` (h1) | 1 KiB | `400`, close |
 | `max_header_arena_bytes` | 64 KiB per active head; charged to connection/global caps | `431`/stream error; `defer` `Overloaded` if the global reservation fails |
@@ -249,7 +255,8 @@ Every bound has a reaction. This is the table the implementation and tests are c
 
 Memory arithmetic: idle connections hold zero blocks (§ runtime 4.3); active connections hold one
 read block plus bounded exchange queues, capped at 8 MiB each; the sum of outstanding blocks and
-typed-header arenas is capped globally at 256 MiB with a 90% low-water reset; queued exchanges hold
+typed-header arenas is capped globally at 256 MiB with a 90% low-water reset, and retained chunks are
+capped separately at 64 MiB, so the worst case is 320 MiB; queued exchanges hold
 heads only. `max_queued_exchanges` therefore does not multiply body buffers, and `max_connections`
 does not imply a block per connection. Detached exchanges hold their head/body/response buffers and
 arena under the same per-connection and global caps and count as open; `max_deferred_exchanges`

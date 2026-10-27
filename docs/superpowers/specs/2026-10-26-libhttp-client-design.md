@@ -102,7 +102,8 @@ can be expressed; there is no fifth convenience wrapper.
 - `send`/`send_with` return the final response or error. They are for application threads. Calling
   them inside a handler blocks that worker; use `fetch`/`fetch_with` or `Request::defer` + an
   application thread.
-- `fetch`/`fetch_with` return only enqueue/queue-admission errors (`Overloaded`, `Closed`).
+- `fetch`/`fetch_with` return only enqueue/queue-admission errors (`Overloaded`, `Closed`, and
+  `InvalidConfig` on a zero-worker runtime).
   Everything after enqueue — DNS, connect, TLS, rejection, timeout, cancellation, callback
   processing error — is delivered to the one callback. The callback runs exactly once.
 - The callback receives `Result<&mut ClientResponse, Error>`, not an owned response. The runtime
@@ -111,7 +112,11 @@ can be expressed; there is no fifth convenience wrapper.
 - A callback `Err` is reported through `ClientBuilder::on_error`; the response is dropped/reset. A
   panic in a callback or upload closure is caught by the worker and reported the same way.
 - `fetch`/`fetch_with` never hold a worker while waiting for DNS/connect/TLS/response; a worker is
-  occupied only for the upload closure and for the response callback.
+  occupied only for the upload closure and for the response callback. Calls are admitted by
+  `PoolConfig::max_inflight_calls`, not by the callback budget: if all callback slots are busy, the
+  completed call waits in the runtime callback queue with its response held, and runs when a slot
+  frees. The callback is still delivered exactly once; no call is rejected merely because callbacks
+  are busy.
 
 ### 1.2 Request and cancellation
 
@@ -123,6 +128,7 @@ impl ClientRequest {
     pub fn set<T: Header>(self, value: T) -> Self;
     pub fn append<T: Header>(self, value: T) -> Result<Self, HeaderError>;
     pub fn header<T: Header>(self, value: T) -> Self;
+    pub fn raw_header(self, name: HeaderName, value: HeaderValue) -> Result<Self, Error>;
     pub fn body(self, body: impl IntoRequestBody) -> Self;
     pub fn timeout(self, timeout: Duration) -> Self;       // Timeout(Total)
     pub fn cancel_with(self, token: &CancelToken) -> Self;
@@ -155,8 +161,9 @@ workers.
 - `fetch`/`fetch_with` callbacks and `fetch_with` uploads are worker jobs; the first such call starts
   the runtime worker pool if it is not already running. They are bounded by
   `RuntimeBuilder::max_client_callbacks` (default `max(1, workers / 2)`), separate from handler
-  dispatch, so a flood of callbacks cannot starve handlers. A full callback budget returns
-  `Overloaded` from the verb.
+  dispatch, so a flood of callbacks cannot starve handlers. This caps **concurrently executing**
+  callback/upload jobs, not admitted calls; a completed call waits in the callback queue (bounded by
+  `max_inflight_calls`) until a slot frees.
 - A server handler should use `fetch`/`fetch_with` and complete a `DeferredResponse` from the
   callback; no application executor or thread is needed. A blocking `send` is for application
   threads or after `Request::defer`.
@@ -221,7 +228,7 @@ pub struct PoolConfig {
   Buffered bodies are already in memory; streaming bodies are caller/worker-owned and bounded by the
   caller and the request deadline. Only responses have `max_response_body_bytes`.
 - Response header limits are the fixed protocol defaults (`max_header_count`/`max_head_bytes` for h1;
-  64 KiB including 32 bytes/field and the QPACK budget for h2/h3); the typed-header arena is 64 KiB
+  64 KiB including 32 bytes/field, with the h2 HPACK and h3 QPACK budgets); the typed-header arena is 64 KiB
   per in-flight response, bounded by the pool/stream caps and `max_inflight_calls`.
 - Dropping a `ClientResponse` before EOF closes the HTTP/1.1 connection or resets the HTTP/2/3
   stream. In a `fetch` callback this is the runtime dropping it after the callback returns; a
@@ -250,7 +257,7 @@ Requests and responses use the same `Header` trait as the server:
 ```rust
 let req = ClientRequest::get(uri)
     .set(Accept::text())
-    .header(header::X_REQUEST_ID, "abc")?;
+    .raw_header(header::X_REQUEST_ID, HeaderValue::from_static("abc"))?;
 let ct = res.headers().get::<ContentType>();
 ```
 
@@ -296,7 +303,8 @@ let ct = res.headers().get::<ContentType>();
 - `CancelToken` cancels queued, resolving, connecting and in-flight; a resolving cancel never sends.
 - Shutdown cancels calls and response readers; later calls are `Closed`; runtime/component
   lifecycle; private vs shared runtime.
-- Queue full (`Overloaded`), queue timeout, callback-budget exhaustion, h1/h2/h3 per-host caps,
+- Queue full (`Overloaded`), queue timeout, callback slots busy with calls queued rather than
+  rejected, h1/h2/h3 per-host caps,
   global connection/in-flight/body caps, h2 stream saturation opening a second connection.
 - Resolver cache/Happy Eyeballs; no caller blocking on DNS; late resolver result after shutdown.
 - Retry on reused connection, no retry on streaming body, no retry after response bytes.
