@@ -30,8 +30,9 @@ const MAX_EVENTS: usize = 256;
 /// Longest timeout `kevent` accepts on macOS; longer values return `EINVAL`.
 const MAX_TIMEOUT_SECS: u64 = 1_000_000;
 
-/// A `ConnId` is carried through `udata`, so a pointer must hold all 64 bits.
-const _: () = assert!(std::mem::size_of::<usize>() >= 8);
+// `ConnId` is carried through `udata`, so a 64-bit pointer is required.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("kqueue poller requires a 64-bit target (ConnId in kevent.udata)");
 
 /// Edge-triggered kqueue instance.
 pub(crate) struct KqueuePoller {
@@ -389,6 +390,36 @@ mod tests {
             .wait(Some(Duration::from_millis(20)), &mut events)
             .unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn re_adding_read_interest_reports_pending_data() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut poller = KqueuePoller::new().unwrap();
+        let conn = id(9, 11);
+        poller
+            .add(reader.as_raw_fd(), conn, Interest::Read)
+            .unwrap();
+        poller.remove(reader.as_raw_fd()).unwrap();
+
+        // The byte arrives while the descriptor has no kernel registration.
+        writer.write_all(b"x").unwrap();
+
+        poller
+            .add(reader.as_raw_fd(), conn, Interest::Read)
+            .unwrap();
+        let mut events = Vec::new();
+        poller
+            .wait(Some(Duration::from_millis(100)), &mut events)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, conn);
+        assert!(
+            events[0].readable,
+            "pending data must produce an edge on re-add"
+        );
+        assert!(!events[0].writable);
     }
 
     #[test]

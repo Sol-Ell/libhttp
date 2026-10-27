@@ -60,7 +60,7 @@ const WAKE_ID: ConnId = ConnId {
     generation: u32::MAX,
 };
 
-/// Upper bound on one `epoll_wait`, short enough for shutdown responsiveness.
+/// Upper bound on one poller wait, short enough for shutdown responsiveness.
 const MAX_WAIT: Duration = Duration::from_secs(1);
 
 /// Blocks gathered into one `writev` call.
@@ -89,7 +89,7 @@ fn desired_interest(conn: &Conn) -> Option<Interest> {
     }
 }
 
-/// Readiness reactor for Linux.
+/// Readiness reactor for Unix.
 pub(crate) struct UnixReactor<H: Handler> {
     core: ReactorCore<H>,
     /// Created lazily so `new` cannot fail; `listen`, `connect` and
