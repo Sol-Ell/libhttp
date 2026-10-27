@@ -41,6 +41,8 @@ pub(crate) struct Conn {
     pending_bytes: usize,
     paused: bool,
     closed: bool,
+    /// Close as soon as the outbound queue drains (peer EOF with output queued).
+    close_after_flush: bool,
 }
 
 impl Conn {
@@ -62,6 +64,7 @@ impl Conn {
             pending_bytes: 0,
             paused: false,
             closed: false,
+            close_after_flush: false,
         })
     }
 
@@ -83,6 +86,7 @@ impl Conn {
             pending_bytes: 0,
             paused: false,
             closed: false,
+            close_after_flush: false,
         }
     }
 
@@ -230,6 +234,21 @@ impl Conn {
     pub(crate) fn is_closed(&self) -> bool {
         self.closed
     }
+
+    /// Requests close once every queued outbound byte has drained.
+    ///
+    /// Used on peer EOF when output is still queued: the peer cannot send more,
+    /// but it can still receive the echo. The reactor keeps the connection alive
+    /// until the queue empties, then calls [`Self::close`]. A plain
+    /// [`Self::close`] here would discard those bytes.
+    pub(crate) fn close_after_flush(&mut self) {
+        self.close_after_flush = true;
+    }
+
+    /// Whether a close has been requested for when the outbound queue drains.
+    pub(crate) fn is_close_after_flush(&self) -> bool {
+        self.close_after_flush
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +329,17 @@ mod tests {
         assert!(c.is_paused());
         assert_eq!(c.enqueue(b"d"), Err(WriteError::Closed));
         assert!(c.take_pending_write().is_none());
+    }
+
+    #[test]
+    fn close_after_flush_is_a_deferred_request() {
+        let mut c = Conn::new_for_test(16);
+        assert!(!c.is_close_after_flush());
+
+        c.close_after_flush();
+
+        assert!(c.is_close_after_flush());
+        assert!(!c.is_closed(), "the connection must stay open to flush");
     }
 
     #[test]

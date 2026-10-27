@@ -52,10 +52,15 @@ impl Handler for EchoHandler {
 
     fn on_read(&mut self, conn: &mut Conn, data: &[u8]) -> io::Result<()> {
         match conn.enqueue(data) {
-            // A full queue or exhausted pool is backpressure, not a failure:
-            // `enqueue` has already paused reads, and the reactor resumes them
-            // once the outbound queue drains. The current chunk is not retried.
-            Ok(()) | Err(WriteError::QueueFull) | Err(WriteError::PoolExhausted) => Ok(()),
+            Ok(()) => Ok(()),
+            // Backpressure must not silently truncate the stream. `enqueue` has
+            // already paused reads; returning `WouldBlock` makes the reactor
+            // close/reset instead of losing this chunk. Task 10 replaces this
+            // with carry/retry backpressure.
+            Err(WriteError::QueueFull) | Err(WriteError::PoolExhausted) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "echo output queue cannot accept the chunk",
+            )),
             Err(WriteError::Closed) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "cannot echo to a closed connection",
@@ -81,10 +86,11 @@ mod tests {
     }
 
     #[test]
-    fn echo_handler_pauses_when_queue_full() {
+    fn echo_handler_errors_when_queue_full() {
         let mut h = EchoHandler;
         let mut c = Conn::new_for_test(4);
-        h.on_read(&mut c, b"hello").unwrap();
+        let err = h.on_read(&mut c, b"hello").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         assert!(c.is_paused());
     }
 

@@ -24,6 +24,9 @@ use crate::rt::pool::BlockPool;
 use crate::rt::slab::{ConnId, Slab};
 use crate::rt::timer::TimerHeap;
 
+pub(crate) mod iocp;
+pub(crate) mod unix;
+
 /// Default block-pool capacity for one reactor: 5,120 blocks (80 MiB).
 ///
 /// This is the runtime design's per-reactor default. The pool grows lazily, so
@@ -75,6 +78,9 @@ impl<H: Handler> ReactorCore<H> {
     }
 
     /// The installed handler.
+    ///
+    /// Test-only observation point for handler state after callbacks run.
+    #[cfg(test)]
     pub(crate) fn handler(&self) -> &H {
         &self.handler
     }
@@ -133,21 +139,41 @@ impl<H: Handler> ReactorCore<H> {
 
     /// Applies the post-write state rules after the platform flushed output.
     ///
-    /// Once the outbound queue is empty, reads paused by backpressure can resume.
     /// The platform reactor performs the actual socket writes and calls this
-    /// helper afterwards; this helper performs no I/O.
+    /// helper only once the queue has drained. If EOF was seen while output was
+    /// still queued, the deferred close now runs; otherwise reads paused by
+    /// backpressure can resume. This helper performs no I/O.
     pub(crate) fn on_write_ready(&mut self, id: ConnId) -> io::Result<()> {
-        let Some(conn) = self.conns.get_mut(id) else {
-            return Ok(());
+        let close_now = match self.conns.get_mut(id) {
+            Some(conn) if !conn.has_pending_write() => {
+                if conn.is_close_after_flush() {
+                    true
+                } else {
+                    conn.resume_read();
+                    false
+                }
+            }
+            _ => false,
         };
-        if conn.is_paused() && !conn.has_pending_write() {
-            conn.resume_read();
+
+        if close_now {
+            self.close(id);
         }
         Ok(())
     }
 
-    /// Closes a connection after the peer sent EOF.
+    /// Handles peer EOF.
+    ///
+    /// If output is still queued the close is deferred until the queue drains:
+    /// the peer has half-closed its sending side but can still receive the echo.
+    /// Closing immediately would discard the queued bytes.
     pub(crate) fn on_eof(&mut self, id: ConnId) {
+        if let Some(conn) = self.conns.get_mut(id) {
+            if conn.has_pending_write() {
+                conn.close_after_flush();
+                return;
+            }
+        }
         self.close(id);
     }
 
@@ -307,6 +333,39 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(core.is_empty());
         assert_eq!(core.handler().closed, vec![id]);
+    }
+
+    #[test]
+    fn echo_backpressure_closes_instead_of_dropping_the_chunk() {
+        let mut core = ReactorCore::new(EchoHandler);
+        let id = core.insert(Conn::new_for_test(4));
+
+        let err = core.on_read_ready(id, b"hello").unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(core.is_empty(), "backpressure must reset, not keep a gap");
+    }
+
+    #[test]
+    fn eof_with_queued_echo_defers_close_until_flush() {
+        let mut core = ReactorCore::new(EchoHandler);
+        let id = core.insert(Conn::new_for_test(64));
+        core.on_read_ready(id, b"hello").unwrap();
+
+        core.on_eof(id);
+        assert_eq!(core.len(), 1, "EOF must not drop queued echo output");
+
+        // Calling on_write_ready before the platform has flushed the queue must
+        // not close; the test's drain seam stands in for the socket write.
+        core.on_write_ready(id).unwrap();
+        assert_eq!(core.len(), 1, "must not close before the queue drains");
+        assert_eq!(
+            core.conn_mut(id).unwrap().take_pending_write(),
+            Some(b"hello".to_vec())
+        );
+
+        core.on_write_ready(id).unwrap();
+        assert_eq!(core.len(), 0);
     }
 
     #[test]
