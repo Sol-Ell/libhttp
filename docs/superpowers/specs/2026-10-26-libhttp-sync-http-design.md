@@ -314,11 +314,12 @@ impl Request {
     pub fn defer_with_fallback<F>(&mut self, res: &mut Response, fallback: F)
         -> Result<(DeferredRequest, DeferredResponse), Error>
     where
-        F: FnOnce(&mut Response, DeferredFailure) -> Result<(), Error>
+        F: FnOnce(&mut Response, &DeferredFailure) -> Result<(), Error>
             + Send + 'static;
 }
 
-/// Owned terminal-failure context. The fallback hook may retain it.
+/// Terminal-failure context. Fields are owned by the library and passed by
+/// reference; the hook may copy fields but cannot retain the reference.
 pub struct DeferredFailure {
     pub reason: DeferredFailureReason,
     pub method: Method,
@@ -416,11 +417,11 @@ reachable peer runs the fallback exactly once:
 
 - The library creates a fresh `Response`, sets the default status (`504` for any timeout, `503` for
   shutdown, `500` for application error/drop/internal), and passes it as `&mut Response` together with
-  the owned `DeferredFailure` to the hook. The hook mutates the response and may retain the failure;
-  it cannot retain the response. The library commits the response after the hook returns.
+  `&DeferredFailure` to the hook. The hook mutates the response and may copy failure fields; it cannot
+  retain either reference. The library commits the response after the hook returns.
 - The hook does not receive the original request body or the tombstoned `Response`. It receives
-  owned request metadata (`method`, `target`, `version`, `elapsed`, body-consumed flag) and the
-  reason. It must not block; it runs on a runtime worker, not a reactor.
+  owned request metadata inside `DeferredFailure` (`method`, `target`, `version`, `elapsed`,
+  body-consumed flag) and the reason. It must not block; it runs on a runtime worker, not a reactor.
 - A hook `Err` or panic discards its response and uses the default status/empty body. A failed
   default commit resets or closes. There is no second fallback and no retry.
 - If the head is already committed or the peer is gone, the hook is not called; the exchange is
@@ -978,9 +979,10 @@ and the performance gates (§8).
   `rt.server()`/`rt.client()`. Moved the Runtime API to the runtime design and the real-loopback
   test pattern. Removed `TimeoutKind::Wait`. No public test harness: tests use the normal API with
   port 0, `local_addrs`, `ServerHandle::shutdown` and a client on the same runtime.
-- **2026-10-27 (deferred terminal fallback):** added `Request::defer_with_fallback` and the owned
-  `DeferredFailure`/`DeferredFailureReason` metadata. The per-request hook receives
-  `(&mut Response, DeferredFailure)`, mutates a library-owned `Response`, and runs once only for a
-  terminal exchange with an uncommitted head and a reachable peer. Defaults are `504` timeout, `503`
-  shutdown, `500` application/drop/internal; committed/peer-gone paths reset/close. No
-  `FallbackResponse` type, no handler replay/resume, no separate `on_deferred_failure` observer.
+- **2026-10-27 (deferred terminal fallback):** added `Request::defer_with_fallback` and the
+  `DeferredFailure`/`DeferredFailureReason` metadata, passed by reference to the hook. The
+  per-request hook receives `(&mut Response, &DeferredFailure)`, mutates a library-owned `Response`,
+  and runs once only for a terminal exchange with an uncommitted head and a reachable peer. Defaults
+  are `504` timeout, `503` shutdown, `500` application/drop/internal; committed/peer-gone paths
+  reset/close. No `FallbackResponse` type, no handler replay/resume, no separate
+  `on_deferred_failure` observer.

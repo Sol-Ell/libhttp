@@ -307,7 +307,7 @@ take a worker parking reservation and never blocks a reactor or library worker.
 ### 9.1 Terminal fallback
 
 `defer_with_fallback` stores
-`FnOnce(&mut Response, DeferredFailure) -> Result<(), Error> + Send + 'static` in the detached
+`FnOnce(&mut Response, &DeferredFailure) -> Result<(), Error> + Send + 'static` in the detached
 exchange. `defer` stores no hook and uses the default. If the defer fails, the hook is dropped and
 neither side moves; the handler can continue synchronously.
 
@@ -317,9 +317,9 @@ When a terminal transition wins and the response head is uncommitted and the pee
    releases rings/blocks at cancellation as usual. The fallback does not revive the handles.
 2. A fresh `Response` is created with the default status: `504` for any timeout (`Deferred` or an
    earlier `Total`), `503` for shutdown, `500` for application error/drop/internal.
-3. A fallback job is admitted to the worker pool. The hook receives `&mut Response` and the **owned**
-   `DeferredFailure`; it may mutate/commit the response and may retain the failure metadata. It
-   cannot retain the response. The hook runs exactly once.
+3. A fallback job is admitted to the worker pool. The hook receives `&mut Response` and
+   `&DeferredFailure`; it may mutate/commit the response and copy failure fields, but cannot retain
+   either reference. The hook runs exactly once.
 4. On `Ok(())` the library finishes the body and commits. On `Err` or panic the response is discarded
    and the default status with an empty body is used. If even the default cannot be committed, the
    connection is reset/closed.
@@ -327,10 +327,11 @@ When a terminal transition wins and the response head is uncommitted and the pee
 A terminal deferred body/send error before the head is committed enters the same fallback. Once any
 response byte is committed, only reset/close is possible; the hook is not called.
 
-`DeferredFailure` is owned and `Send + Sync`: `reason` (`Timeout(TimeoutKind)`, `Shutdown`,
-`ApplicationError`, `Dropped`, `Internal`), `method`, owned raw `target`, `version`, `elapsed` from
-the defer, and `request_body_consumed`. It contains no headers or body, so it is safe to log and
-retain. The hook is the observation point; v1 adds no separate `on_deferred_failure` observer.
+`DeferredFailure` is `Send + Sync` and passed by reference: `reason` (`Timeout(TimeoutKind)`,
+`Shutdown`, `ApplicationError`, `Dropped`, `Internal`), `method`, owned raw `target`, `version`,
+`elapsed` from the defer, and `request_body_consumed`. It contains no headers or body; the hook may
+copy fields, but the reference is scoped to the call. The hook is the observation point; v1 adds no
+separate `on_deferred_failure` observer.
 
 Fallback is not run when the head is committed or the peer is gone; those paths reset/close. It is
 not a second attempt at the handler: no replay, no re-entry, no retry, no fallback-to-synchronous.
