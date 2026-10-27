@@ -14,9 +14,10 @@ these are the contracts most easily lost between a reactor design and a planner.
   table. Only the owning reactor mutates a connection.
 - **Worker threads** run handlers. They own nothing shared except a per-exchange queue, a cancel flag,
   and a parking reservation. They never touch a socket, a timer, or a socket-table entry.
-- **Client reactors** run client-role engines, the call queue and the connection pool. A `ClientCall`
-  is an exchange without a worker: `wait` blocks its caller, `on_complete` hands the result to an
-  application executor, and `try_wait` polls; no library thread is consumed per request.
+- **Client connections** run on the same runtime reactors as server connections; the client pool
+  and call queue are reactor-owned. `Client::send`/`ClientExchange::finish` block the calling thread
+  (application thread or, if the app chooses, a handler worker) on the exchange; there is no client
+  call object, callback executor or library worker per request.
 - **Cross-thread state** is per exchange: an inbound ring (reactor → worker), an outbound ring
   (worker → reactor), a terminal-state slot, two condition variables, and a parking reservation.
   Worker output marks the exchange ready and wakes the reactor at most once per batch, not per chunk.
@@ -73,9 +74,9 @@ wake per dispatch, measured by the harness.
   exchanges do count as open for the per-connection buffer share and arena charging (§6, §8).
   Application-thread body I/O does not take a worker parking reservation; it is bounded by the
   connection/global caps and by `read_stall`/`write_stall`/`deferred` and cannot starve workers.
-- Typed header decoding runs on the worker when the exchange is dispatched (client: on the
-  `ClientCall::wait`/`try_wait` thread or the `on_complete` executor thread before the response is returned), so
-  a queued exchange carries only its raw head. A decode
+- Typed header decoding runs on the worker when the exchange is dispatched; on the client it runs on
+  the `Client::send`/`ClientExchange::finish` thread before `ClientResponse` is returned. A queued
+  exchange carries only its raw head. A decode
   failure is a `400`/stream error before the handler runs. Typed values live in a per-head arena
   bounded by `max_header_arena_bytes`.
 

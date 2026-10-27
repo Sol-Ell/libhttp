@@ -174,9 +174,9 @@ transport detail; the public API exposes neither.
 ```
 
 Threads created by the library, all named, no global state: `libhttp-reactor-N` (socket ownership,
-engines, timers, dispatch), `libhttp-worker-N` (handlers), `libhttp-client-reactor-N` (client
-reactors). A process may build several `Server`/`Client` instances; nothing is shared unless the
-application shares it.
+engines, timers, dispatch), `libhttp-worker-N` (handlers and server-side work), `libhttp-resolver-N`
+(DNS). `Runtime` owns these pools; `Server` and `Client` are front-ends. Multiple components share a
+runtime when the application builds one; otherwise each component gets a private runtime.
 
 ---
 
@@ -189,10 +189,11 @@ are builder discretion; signatures and semantics are the contract.
 
 | Module | Contents |
 |---|---|
-| `libhttp` | `Method`, `StatusCode`, `Version`, `HeaderName`, `HeaderValue`, `HeaderRef`, `HeaderMap`, `Header`, `HeaderError`, `Timeouts`, `Target`, `Uri`, `header`, `Error`, `TimeoutKind`, `ProtocolError`, `ProtocolErrorKind`, `TlsError` |
+| `libhttp` | `Runtime`, `RuntimeBuilder`, `RuntimeHandle`, `RuntimeStats`, `Method`, `StatusCode`, `Version`, `HeaderName`, `HeaderValue`, `HeaderRef`, `HeaderMap`, `Header`, `HeaderError`, `Timeouts`, `CancelToken`, `Target`, `Uri`, `header`, `Error`, `TimeoutKind`, `ProtocolError`, `ProtocolErrorKind`, `TlsError` |
 | `libhttp::server` | `Server`, `ServerBuilder`, `ServerHandle`, `Handler`, `Request`, `Response`, `DeferredRequest`, `DeferredResponse`, `BodyReader`, `BodyWriter`, `BodyChunk`, `Limits`, `Stats`, and a `Timeouts` re-export |
-| `libhttp::client` | `Client`, `ClientBuilder`, `ClientHandle`, `ClientCall`, `CancelHandle`, `Executor`, `ClientRequest`, `ClientResponse`, `ClientStats`, `PoolConfig`; uses the root `Timeouts` |
+| `libhttp::client` | `Client`, `ClientBuilder`, `ClientHandle`, `ClientRequest`, `ClientResponse`, `ClientExchange`, `ClientStats`, `PoolConfig`; uses the root `Timeouts`/`CancelToken` |
 | `libhttp::tls` | `TlsServerConfig`, `TlsClientConfig` (PEM/roots/ALPN/client-auth); rustls types stay internal in v1 |
+| `libhttp::testing` | `TestServer`, `TestServerBuilder` (feature `testing`, off by default) |
 
 ### 6.2 Server and handler
 
@@ -205,8 +206,6 @@ where F: Fn(&mut Request, &mut Response) -> Result<(), Error> + Send + Sync + 's
 
 let server = Server::builder()
     .bind("0.0.0.0:8080")?           // repeatable; port 0 allowed
-    .workers(8)                      // default: available_parallelism()
-    .reactors(2)                     // default: min(available_parallelism(), 4)
     .tls(TlsServerConfig::from_pem(CERT, KEY)?)
     .http1(true)                     // defaults: h1 on, h2 on, h3 off
     .http2(true)
@@ -214,22 +213,26 @@ let server = Server::builder()
     .register_header::<XRequestId>() // extension type decoded on input; standard types built in
     .limits(Limits::default())
     .timeouts(Timeouts::default())
-    .build()?;                       // binds TCP (and UDP when h3 is on); run() starts threads
+    .build()?;                       // binds TCP (and UDP when h3 is on); run() starts the listener
 
 let handle: ServerHandle = server.handle();   // Clone + Send + Sync
 server.run(my_handler)?;                      // blocks until shutdown
 ```
 
 - `ServerHandle`: `shutdown()`, `shutdown_with_deadline(Duration)`, `stats() -> Stats`,
-  `local_addrs() -> Vec<SocketAddr>` (TCP), `local_udp_addrs() -> Vec<SocketAddr>`.
+  `runtime() -> Runtime`, `local_addrs() -> Vec<SocketAddr>` (TCP), `local_udp_addrs() -> Vec<SocketAddr>`.
+- `Server::builder()`/`Client::builder()` create a private `Runtime`. To share one, build
+  `Runtime::builder()...build()?` and use `rt.server()`/`rt.client()`; worker/reactor/resolver
+  configuration belongs to `RuntimeBuilder`, not the component builders.
 - `shutdown()` signals and returns. `Server::run` closes listeners, sends GOAWAY/`Connection: close`,
   gives in-flight exchanges `Timeouts::shutdown_grace` (default 30 s; `shutdown_with_deadline`
-  overrides it for that call), cancels what remains, and joins the reactor threads, then returns
-  `Ok(())`; `Err` only for a fatal listener/reactor failure. Normal handlers are drained
-  within the grace period. A handler that never returns keeps its worker thread, so `run` does not
-  return in that case; this is the one unbounded wait, caused by user code, and is documented rather
-  than papered over. A handler that ignores cancellation but eventually returns does not prevent
-  teardown.
+  overrides it for that call), and cancels what remains, then returns `Ok(())`; `Err` only for a
+  fatal listener/reactor failure. Normal handlers are drained within the grace period. A handler
+  that never returns keeps its worker thread, so `run` does not return in that case; this is the one
+  unbounded wait, caused by user code, and is documented rather than papered over. A handler that
+  ignores cancellation but eventually returns does not prevent teardown. Reactors belong to the
+  `Runtime`: a private runtime is joined when its last handle drops; a shared runtime stays alive
+  and other components continue.
 - `run` consumes `Server`; the calling thread is neither reactor nor worker.
 - `register_header::<T: Header>()` on the server (and client) builder adds an application-defined
   typed header to the input decoder registry. Standard headers are registered internally. A name
@@ -563,7 +566,7 @@ pub enum Error {
 }
 pub enum TimeoutKind {
     Connect, TlsHandshake, HeaderRead, BodyIdle, ReadStall, WriteStall, KeepAlive, PoolQueue,
-    Total, Deferred, Wait,
+    Total, Deferred,
 }
 pub struct ProtocolError;   // version() + kind(); stable classification, not a wire dump
 pub enum ProtocolErrorKind { MalformedMessage, Framing, HeaderCompression, FlowControl,
@@ -588,31 +591,42 @@ public per-operation cost API.
 
 ### 6.6 Client (summary)
 
-`Client` is `Clone + Send + Sync` and owns its reactors, resolver threads and pool. It has two
-surfaces: `start`/`start_streaming` return a `ClientCall` without blocking on DNS, connect, pool
-capacity or stream capacity; `send`/`send_with` are the blocking convenience wrappers
-(`start(...).wait()`). `ClientCall` supports `wait`, `try_wait`, `wait_timeout`, `cancel_handle`,
-`body` for streaming upload, and `on_complete(Arc<dyn Executor>, callback)`; the executor is supplied by
-the application and is the only place a completion callback runs. There is no async runtime, no
-`Future`/`Waker`, and no library-owned executor. `ClientHandle` provides `shutdown`,
-`shutdown_with_deadline` and `stats`; calls hold the client alive, and the last handle joins the
-reactors (resolver threads detach at shutdown).
+`Client` is `Clone + Send + Sync` and is a blocking front-end over a shared `Runtime`; it owns no
+threads of its own. `send(request)` blocks through the response head and returns a streamed
+`ClientResponse`; `send_streaming(request)` returns a `ClientExchange` whose `BodyWriter` uploads and
+whose `finish()` blocks for the response. There is no `ClientCall`, `wait`, `on_complete`, callback
+executor, or application `Executor`; the caller is the execution context.
+
+```rust
+let res = client.send(ClientRequest::get(uri).timeout(d))?;
+let mut ex = client.send_streaming(ClientRequest::post(uri))?;
+ex.body().write_all(chunk)?;
+ex.body().finish()?;
+let res = ex.finish()?;
+```
+
+`ClientHandle` provides `shutdown`, `shutdown_with_deadline`, `stats` and `runtime`. A private
+runtime is created by `Client::builder()`; a shared one by `Runtime::builder()...build()?` and
+`rt.client()`. `Runtime` owns reactors, workers, resolver threads, block/timer pools and admission;
+`Server`/`Client` stop only their component, while `RuntimeHandle::shutdown` is the root. Workers and
+resolvers start lazily (client-only starts no workers, server-only starts no resolvers). A server
+handler that calls `send` blocks a worker; the documented deferred pattern frees the worker and does
+the blocking send on the application thread.
 
 Protocol selection is explicit: `http1`, `http2`, `h2c` (prior knowledge), `http3` (opt-in, no
 Alt-Svc/fallback). Pool key is `(scheme, host, port, ALPN)`; no certificate coalescing. h1 opens up
-to 8 connections per host, h2/h3 up to 2, then queues; the pool is capped at 1,024 connections
-and 256 idle globally, in-flight calls at 4,096, buffered queued-body bytes at 64 MiB, and the call
-queue at 1,024. A 9/9 review pass fixed the Arc executor, DNS-cancel, refcounted-handle, atomic
-completion, resolver-mailbox and global-bound issues.
-`start` returns `Overloaded` only when the queue is full; a queued call times out with
-`Timeout(PoolQueue)`. DNS runs on bounded resolver threads with a 60 s cache and Happy Eyeballs
-(250 ms stagger), never on the caller or a reactor. One retry only for a reused connection, before
-response bytes, idempotent method, replayable body. Requests and responses use typed headers through
-the same `Header` trait (`ClientRequest::set(ContentType::json())`,
+to 8 connections per host, h2/h3 up to 2, then queues; the pool is capped at 1,024 connections and
+256 idle globally, in-flight calls at 4,096, buffered queued-body bytes at 64 MiB, and the call queue
+at 1,024. `send` returns `Overloaded` when a cap is hit and `Timeout(PoolQueue)` on queue expiry. DNS
+runs on the runtime resolver threads with a 60 s cache (1,024-entry LRU) and Happy Eyeballs (250 ms
+stagger), never on the caller or a reactor. One retry only for a reused connection, before response
+bytes, idempotent method, replayable body. Requests and responses use typed headers through the same
+`Header` trait (`ClientRequest::set(ContentType::json())`,
 `ClientResponse::headers().get::<ContentType>()`), with raw `header`/`header_value` for custom fields
 and `ClientBuilder::register_header::<T>()` for incoming extension types. Header limits are the fixed
-protocol defaults, not configurable in v1. No redirects, cookies, compression, or CONNECT. Full
-contract in the [client design](2026-10-26-libhttp-client-design.md).
+protocol defaults, not configurable in v1. `CancelToken` can be armed on a request and cancelled from
+another thread; there is no post-send call handle for a blocking `send`. No redirects, cookies,
+compression, or CONNECT. Full contract in the [client design](2026-10-26-libhttp-client-design.md).
 
 ### 6.7 TLS configuration
 
@@ -626,6 +640,16 @@ default build because `ring` is native; this is accepted because QUIC uses the s
 production pure-Rust TLS provider exists. `aws-lc-rs` is not offered in v1.
 
 ---
+
+### 6.8 Testing API
+
+Feature `testing` (off by default) exposes `libhttp::testing::TestServer`; there is no `TestClient`
+and no fake transport. `TestServerBuilder::handler/tls/http1/http2/http3/runtime` plus `spawn()`
+binds loopback TCP port 0 (and the same UDP port for h3), starts `Server::run` on a thread, waits for
+readiness, and exposes `addr()`, `udp_addr()`, `handle()` and deterministic `shutdown()`. Tests use a
+normal `Client` on the same runtime via `handle().runtime().client()`. This exercises the real
+reactors, TLS, ALPN and h1/h2/h3; the harness only removes ephemeral-port/readiness/teardown
+boilerplate. No certificates are generated; TLS fixtures are caller-supplied.
 
 ## 7. The twelve §10 decisions
 
@@ -704,13 +728,14 @@ extrapolated.
 
 - **One published crate** `libhttp`; workspace members `bench/` and `fuzz/` are unpublished and never
   dependencies of it. Public modules as in §6.1; everything else private.
-- **Features:** `server`, `client`, `http1`, `http2`, `http3`, `tls`. Default: all six. `http3`
-  requires `tls`, and at least one of `server`/`client` and one of `http1`/`http2`/`http3` is
-  required; enforced with `compile_error!`. `h2c` requires `http2` (rejected at build with
-  `InvalidConfig`). There is no provider feature in v1 (only `ring`), so
+- **Features:** `server`, `client`, `http1`, `http2`, `http3`, `tls`, `testing`. Default: the first
+  six. `testing` is off by default and requires `server` and `client`; it exposes only the
+  `TestServer` harness. `http3` requires `tls`, and at least one of `server`/`client` and one of
+  `http1`/`http2`/`http3` is required; enforced with `compile_error!`. `h2c` requires `http2`
+  (rejected at build with `InvalidConfig`). There is no provider feature in v1 (only `ring`), so
   `cargo build --all-features` has no ambiguity and a no-TLS build drops rustls and QUIC entirely.
-  The CI feature matrix includes server-only h1, client-only h2, no-TLS, h3, `--all-features`, and a
-  build with every protocol disabled (must fail at compile time).
+  The CI feature matrix includes server-only h1, client-only h2, no-TLS, h3, `testing`,
+  `--all-features`, and a build with every protocol disabled (must fail at compile time).
 - **MSRV:** 1.85.0 (`rust-version = "1.85"`), edition 2024, resolver v3, tested with the actual 1.85
   toolchain on all CI platforms (Linux, macOS, Windows; FreeBSD VM). Raising MSRV requires a minor release and a note; the lockfile is
   MSRV-checked.
@@ -739,10 +764,12 @@ close/cancel, no blocking socket calls on reactors, Windows handoff. Exit: echo 
 
 **M2
 
-**M2 — HTTP/1.1 server and client, workers.** Parser/serializer, streaming bodies, dispatch, queues,
-deadlines, cancellation, keep-alive, pipelining, h1c, smuggling corpus, fuzz targets. Exit: **G1**
-passes; deferred completion works with streaming bodies, typed headers, trailers and h1/h2 ordering;
-client interoperates with external servers.
+**M2 — HTTP/1.1 server and client, Runtime and workers.** Shared `Runtime` (reactors/workers/resolver/
+lazy pools), parser/serializer, streaming bodies, dispatch, queues, deadlines, cancellation,
+keep-alive, pipelining, h1c, smuggling corpus, fuzz targets, blocking `Client::send`/
+`send_streaming`, and the `testing` `TestServer` harness. Exit: **G1** passes; deferred completion
+works with streaming bodies, typed headers, trailers and h1/h2 ordering; client interoperates with
+external servers; server and client share one runtime in a combined test.
 
 **M3 — TLS.** rustls, ALPN, `close_notify`, client roots/certs, handshake timeouts, TLS copy/syscall
 numbers. Exit: h1 over TLS, truncation tests, **G1-TLS** passes.
@@ -883,10 +910,11 @@ and the performance gates (§8).
   60 s; counted detached exchanges as open; enforced `MULTIPLE` on input and synthesised h2/h3
   `Host`; replaced `const NAME` with `fn name()`; made `encode` fallible and caught codec panics;
   moved `Timeouts` to the crate root.
-- **2026-10-26 (client rework):** replaced the blocking-only client with a two-surface design:
-  `start`/`start_streaming` + `ClientCall` (`wait`, `try_wait`, `wait_timeout`, `on_complete`,
-  `cancel_handle`, streaming `body`) plus `send`/`send_with` convenience wrappers. Added
-  `ClientHandle` shutdown/stats, `CancelHandle`, an explicit application `Executor` for completion
-  callbacks, `Timeout(Wait)`, bounded resolver threads with Happy Eyeballs, and configurable h1/h2/h3
-  connection caps (8/2/2). The call queue is 1,024 with a 30 s timeout; no async runtime,
-  `Future`/`Waker` or library-owned executor.
+- **2026-10-27 (client API final):** replaced the call-handle/callback client with a blocking
+  exchange over a public shared `Runtime`. `Client::{send,send_streaming,handle}`;
+  `ClientExchange::{body,finish,cancel}`; request-level `CancelToken`; no `ClientCall`, callback
+  executor, application `Executor`, `try_wait`, or `wait_timeout`. `Runtime` owns reactors/workers/
+  resolver/block/timer pools; `Server`/`Client` are front-ends and share it when built via
+  `rt.server()`/`rt.client()`. Added `TimeoutKind::Wait` removal, feature-gated `testing` with a
+  real-loopback `TestServer`, and public-runtime lifecycle/stats. One blocked caller per outbound
+  call; handlers should defer before a blocking upstream call.

@@ -8,6 +8,28 @@ performance gates, features and milestones; this document settles the runtime co
 
 ---
 
+## Runtime ownership
+
+`Runtime` is the execution owner shared by `Server` and `Client`. It owns the reactor set, worker
+pool, resolver threads, block/timer pools and admission counters. `Server` and `Client` are
+front-ends: they add listeners, handler dispatch, the client pool and protocol configuration, but no
+threads of their own. `Server::builder()`/`Client::builder()` create a private runtime; a shared one
+is built with `Runtime::builder()` and used through `rt.server()`/`rt.client()`.
+
+Reactor threads (`libhttp-reactor-N`) are created at runtime build. Worker threads
+(`libhttp-worker-N`) start lazily on the first server and resolver threads (`libhttp-resolver-N`) on
+the first client; a client-only runtime has no workers, a server-only runtime no resolvers. A
+component shutdown stops only its connections/listeners and leaves the runtime usable;
+`RuntimeHandle::shutdown` is the root and cancels both components. Failure isolation is a second
+runtime, not a hidden per-component pool.
+
+The same reactor hosts server and client connections; role and protocol live on the connection.
+Client `send`/`send_streaming` block the calling thread and consume no reactor or library worker of
+their own. If the caller is a handler worker, that worker is blocked; the documented `Request::defer`
+pattern frees the worker and does the blocking call on the application thread.
+
+---
+
 ## 1. Reactor loop
 
 One reactor thread per reactor. Each iteration:
@@ -29,8 +51,8 @@ queues, all of which the reactor drains without waiting.
 One timer heap per reactor is the single timer authority (§5). One buffer pool per reactor. One
 socket slab per reactor. A reactor also owns the bounded detached-exchange table: a deferred exchange
 keeps its connection slot, body/response queues and deadlines, but consumes no worker; application
-completion or body writes enter through the same coalesced wake as worker output. Client reactors run
-the same loop with client-role engines.
+completion or body writes enter through the same coalesced wake as worker output. Client connections
+run the same loop and reactors with client-role engines; there are no separate client reactors.
 
 ---
 
@@ -177,8 +199,9 @@ per frame. Inside the reactor, the parser and engine use the unique-owner path w
 ### 4.2 Head storage and `HeaderMap`
 
 The reactor parses and validates the raw head (framing fields, name/value syntax, limits). Typed
-header decoding runs **when the exchange is handed to the handler or caller**, on the worker, the
-`ClientCall::wait`/`try_wait` thread, or the `on_complete` executor thread, not on the reactor; a queued exchange therefore holds only its raw head. This keeps
+header decoding runs **when the exchange is handed to the handler or caller**, on the worker or on
+the client's `Client::send`/`ClientExchange::finish` thread, not on the reactor; a queued exchange
+therefore holds only its raw head. This keeps
 the reactor's work bounded and keeps typed-header allocation off the I/O path.
 
 `Request`/`ClientResponse` own one refcounted head block plus a `HeaderMap`. The map is an ordered
@@ -321,10 +344,10 @@ the exchange under its lock, wakes the worker, and the worker returns that outco
 invents a timeout for an exchange the reactor still considers live; there is no second timer
 authority and no race at the deadline instant.
 
-The client call queue is reactor-owned too: `Client::start` enqueues a `ClientCall` and
-`PoolConfig::queue_timeout` is a normal reactor deadline. `ClientCall::wait` is a caller-owned wait
-with an optional `wait_timeout`; it does not own connection deadlines. Once a call is matched to a
-connection, the reactor owns its deadlines.
+The client call queue is reactor-owned too: `Client::send`/`send_streaming` enqueue a call and
+`PoolConfig::queue_timeout` is a normal reactor deadline. The caller blocks on the exchange; it does
+not own connection deadlines. Once a call is matched to a connection, the reactor owns its
+deadlines.
 
 Timer resolution is the backend's: millisecond on epoll/IOCP, kernel-tick on kqueue. Sub-millisecond
 precision is not promised. QUIC's 1 ms timer granularity is respected but not exceeded.

@@ -116,19 +116,19 @@ The client parser enforces the same framing rules for responses: status line, he
 1xx interception (`100` ignored after body send; `103` ignored), chunked decoding, trailers,
 `Content-Length` mismatch → error, no body for `HEAD`/`204`/`304`, and no `101`/CONNECT. Request
 serialization uses `Content-Length` for buffered bodies and chunked for streaming bodies
-(`start_streaming`/`send_with`).
+(`send_streaming`).
 
 **Typed headers.** The client parses the raw response head, then decodes typed headers on the
-`ClientCall::wait`/`try_wait` thread or the `on_complete` executor thread before returning `ClientResponse`; `ClientBuilder::register_header::<T>()` registers application
-types. Unknown fields stay raw. The same `Header`/`HeaderRef`/`HeaderValue` contracts as the server
-apply.
+`Client::send`/`ClientExchange::finish` thread before returning `ClientResponse`;
+`ClientBuilder::register_header::<T>()` registers application types. Unknown fields stay raw. The
+same `Header`/`HeaderRef`/`HeaderValue` contracts as the server apply.
 
 **Early final response.** If the server sends a final response before the request body is finished
 (for example `413`), the client stops the upload: h1 stops writing and may not be able to reuse the
 connection, h2 resets its send side after the response, h3 stops/reset its send stream. The caller's
-body writes fail with `Canceled`, and `send_with` discards the closure's error once a final response
-has arrived, returning that response. A buffered `send` returns the early response directly. The
-response is never lost because the local write failed.
+body writes fail with `Canceled`, and `ClientExchange::finish` returns that response once it has
+arrived. A buffered `send` returns the early response directly. The response is never lost because
+the local write failed.
 
 ---
 
@@ -193,11 +193,11 @@ and framed by the reactor, exactly like a handler-produced response.
   final HEADERS with `END_STREAM`, no pseudo-headers.
 - Unread request body: after the response, reset the stream (`RST_STREAM(CANCEL)`, h3
   `RESET_STREAM`/`STOP_SENDING`) immediately and keep the connection; no drain is attempted.
-- Client response bodies: stream DATA is pulled by the caller (`wait`/`try_wait`) or the
-  `on_complete` executor thread; dropping a response before EOF resets the stream.
+- Client response bodies: stream DATA is pulled by the caller on the `send`/`finish` thread; dropping
+  a response before EOF resets the stream.
 - 1xx: `100` interim responses are allowed before the final response; the client core consumes them
-  (and sends its body after the first `100` only when it chose to wait, which v1 does not) and never
-  exposes a 1xx as a `ClientResponse`. There is exactly one final response.
+  and sends its body immediately, and never exposes a 1xx as a `ClientResponse`. There is exactly one
+  final response.
 
 ### 3.5 h2 security limits
 
