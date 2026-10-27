@@ -423,6 +423,37 @@ mod tests {
     }
 
     #[test]
+    fn re_enabling_both_after_write_interest_reports_pending_data() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut poller = KqueuePoller::new().unwrap();
+        let conn = id(10, 12);
+        poller
+            .add(reader.as_raw_fd(), conn, Interest::Read)
+            .unwrap();
+        poller
+            .modify(reader.as_raw_fd(), conn, Interest::Write)
+            .unwrap();
+
+        // The byte arrives while read interest is disabled.
+        writer.write_all(b"x").unwrap();
+
+        poller
+            .modify(reader.as_raw_fd(), conn, Interest::Both)
+            .unwrap();
+        let mut events = Vec::new();
+        poller
+            .wait(Some(Duration::from_millis(100)), &mut events)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.id == conn && event.readable),
+            "pending data must produce a readable edge when Both is re-armed"
+        );
+    }
+
+    #[test]
     fn peer_close_is_reported_readable() {
         let (reader, writer) = UnixStream::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
