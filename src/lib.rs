@@ -1,6 +1,14 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+mod error;
+mod http;
 mod rt;
+
+pub use error::{Error, ProtocolError, ProtocolErrorKind, TimeoutKind, TlsError};
+pub use http::{
+    AsHeaderName, Header, HeaderError, HeaderMap, HeaderName, HeaderRef, HeaderValue,
+    IntoHeaderName, IntoHeaderValue, Method, MethodExt, StatusCode, Target, Uri, Version,
+};
 
 #[cfg(test)]
 mod tests {
