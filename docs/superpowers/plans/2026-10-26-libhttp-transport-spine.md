@@ -276,7 +276,7 @@ fn stale_timer_generation_is_skipped() {
     let mut h = TimerHeap::new();
     let t = h.insert(key(7, 7), Instant::now());
     h.cancel(t);
-    let newer = h.insert(key(7), Instant::now(), 7);
+    let newer = h.insert(key(7, 7), Instant::now());
     let got = h.pop_expired(Instant::now() + Duration::from_secs(1));
     assert_eq!(got, vec![(7, newer)]);
 }
