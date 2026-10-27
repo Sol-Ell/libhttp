@@ -29,8 +29,20 @@ pub(crate) trait Handler {
 
     /// Called with each plaintext chunk read from `conn`.
     ///
-    /// An error closes the connection.
+    /// An error closes the connection. A handler that cannot enqueue the chunk
+    /// because the outbound queue is full should keep the bytes (for example
+    /// in [`Conn::put_carry`]) and return `Ok(())`; the reactor has already
+    /// paused reads. It retries through [`Self::on_output_ready`] once the
+    /// queue drains.
     fn on_read(&mut self, conn: &mut Conn, data: &[u8]) -> io::Result<()>;
+
+    /// Called after the outbound queue drains, before reads may resume.
+    ///
+    /// A handler that carried output after backpressure retries it here. An
+    /// error closes the connection; the default does nothing.
+    fn on_output_ready(&mut self, _conn: &mut Conn) -> io::Result<()> {
+        Ok(())
+    }
 
     /// Called once when the connection closes.
     ///
@@ -53,18 +65,38 @@ impl Handler for EchoHandler {
     fn on_read(&mut self, conn: &mut Conn, data: &[u8]) -> io::Result<()> {
         match conn.enqueue(data) {
             Ok(()) => Ok(()),
-            // Backpressure must not silently truncate the stream. `enqueue` has
-            // already paused reads; returning `WouldBlock` makes the reactor
-            // close/reset instead of losing this chunk. Task 10 replaces this
-            // with carry/retry backpressure.
-            Err(WriteError::QueueFull) | Err(WriteError::PoolExhausted) => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "echo output queue cannot accept the chunk",
-            )),
+            // The queue refused the chunk. `enqueue` has already set
+            // backpressure (which pauses reads), so the stream is complete as
+            // long as the chunk is retained for a later retry. Returning
+            // `WouldBlock` here would reset the connection and lose it.
+            Err(WriteError::QueueFull) | Err(WriteError::PoolExhausted) => {
+                conn.put_carry(data.to_vec());
+                Ok(())
+            }
             Err(WriteError::Closed) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "cannot echo to a closed connection",
             )),
+        }
+    }
+
+    fn on_output_ready(&mut self, conn: &mut Conn) -> io::Result<()> {
+        let Some(data) = conn.take_carry() else {
+            return Ok(());
+        };
+        match conn.enqueue(&data) {
+            // Still no room (the reactor only retries after a drain, so this is
+            // a pool exhaustion or a chunk larger than the cap): keep it for
+            // the next drain instead of dropping bytes.
+            Err(WriteError::QueueFull) | Err(WriteError::PoolExhausted) => {
+                conn.put_carry(data);
+                Ok(())
+            }
+            Err(WriteError::Closed) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "cannot echo to a closed connection",
+            )),
+            Ok(()) => Ok(()),
         }
     }
 
@@ -86,12 +118,32 @@ mod tests {
     }
 
     #[test]
-    fn echo_handler_errors_when_queue_full() {
+    fn echo_handler_carries_overflow_instead_of_resetting() {
         let mut h = EchoHandler;
-        let mut c = Conn::new_for_test(4);
-        let err = h.on_read(&mut c, b"hello").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(c.is_paused());
+        let mut c = Conn::new_for_test(16);
+        h.on_read(&mut c, b"0123456789").unwrap();
+        assert!(!c.is_paused());
+
+        // The second chunk does not fit; the handler must carry it and let the
+        // reactor pause reads instead of treating the overflow as fatal.
+        h.on_read(&mut c, b"abcdefghij").unwrap();
+        assert!(c.is_backpressured());
+        assert!(!c.is_read_paused());
+        assert!(c.has_carry());
+        assert_eq!(c.take_pending_write(), Some(b"0123456789".to_vec()));
+
+        h.on_output_ready(&mut c).unwrap();
+        assert!(!c.has_carry());
+        assert_eq!(c.take_pending_write(), Some(b"abcdefghij".to_vec()));
+    }
+
+    #[test]
+    fn echo_handler_output_ready_is_a_noop_without_carry() {
+        let mut h = EchoHandler;
+        let mut c = Conn::new_for_test(64);
+        h.on_output_ready(&mut c).unwrap();
+        assert!(!c.has_pending_write());
+        assert!(!c.has_carry());
     }
 
     #[test]

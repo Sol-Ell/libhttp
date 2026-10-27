@@ -41,7 +41,10 @@ use crate::rt::reactor::ReactorCore;
 use crate::rt::slab::ConnId;
 use crate::rt::socket::OwnedSocket;
 #[cfg(test)]
-use crate::rt::test_support::Shutdown;
+use crate::rt::test_support::{
+    CommandKind, ControlChannel, Reply, Shutdown, Spawned, SpawnedInternal, SpawnedWithControl,
+    TestControl,
+};
 use crate::rt::wake::Wake;
 
 /// Per-connection outbound cap. The echo handler reports `WouldBlock` beyond
@@ -62,6 +65,9 @@ const WAKE_ID: ConnId = ConnId {
 
 /// Upper bound on one poller wait, short enough for shutdown responsiveness.
 const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// Default listen backlog, matching the standard library's bind.
+const DEFAULT_BACKLOG: usize = 1_024;
 
 /// Blocks gathered into one `writev` call.
 const MAX_IOVECS: usize = 64;
@@ -99,6 +105,9 @@ pub(crate) struct UnixReactor<H: Handler> {
     /// The interest currently registered for each id. `None` means the id was
     /// removed while paused; a later resume re-adds it.
     registrations: HashMap<ConnId, Interest>,
+    /// Test-only command channel installed by the harness.
+    #[cfg(test)]
+    control: Option<Arc<ControlChannel>>,
 }
 
 impl<H: Handler> UnixReactor<H> {
@@ -109,11 +118,22 @@ impl<H: Handler> UnixReactor<H> {
             poller: None,
             listener: None,
             registrations: HashMap::new(),
+            #[cfg(test)]
+            control: None,
         }
     }
 
     /// Binds a nonblocking listener to `addr` and registers it for accepting.
     pub(crate) fn listen(&mut self, addr: &str) -> io::Result<()> {
+        self.listen_with_backlog(addr, DEFAULT_BACKLOG)
+    }
+
+    /// Binds a listener with an explicit kernel backlog.
+    ///
+    /// The standard library's bind fixes the backlog, so the 10k-idle harness
+    /// re-issues `listen(2)` on the bound descriptor. `listen` on a listening
+    /// socket only updates the queue limit.
+    pub(crate) fn listen_with_backlog(&mut self, addr: &str, backlog: usize) -> io::Result<()> {
         if self.listener.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -124,6 +144,12 @@ impl<H: Handler> UnixReactor<H> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let fd = listener.as_raw_fd();
+        let backlog = libc::c_int::try_from(backlog).unwrap_or(libc::c_int::MAX);
+        // SAFETY: `fd` is a live listening socket; `listen(2)` only updates the
+        // backlog bound and does not read or write memory.
+        if unsafe { libc::listen(fd, backlog) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         self.register(LISTEN_ID, fd, Interest::Read)?;
         self.listener = Some(listener);
         Ok(())
@@ -143,7 +169,7 @@ impl<H: Handler> UnixReactor<H> {
             .conn_fd(id)
             .expect("connection was just inserted into the slab");
         if let Err(err) = self.register(id, fd, Interest::Read) {
-            self.core.close(id);
+            self.core.close(id, "register-failed");
             return Err(err);
         }
 
@@ -179,10 +205,29 @@ impl<H: Handler> UnixReactor<H> {
 
         let mut events = Vec::with_capacity(64);
         loop {
+            // Commands may have been queued before the loop started.
+            #[cfg(test)]
+            self.apply_control_commands();
+
             let timeout = self.poll_timeout();
             self.poller_mut()?.wait(Some(timeout), &mut events)?;
 
             if events.iter().any(|event| event.id == WAKE_ID) {
+                #[cfg(test)]
+                {
+                    if let Some(control) = self.control.clone() {
+                        if control.stop() {
+                            return Ok(());
+                        }
+                        // The wake fd is edge-triggered: drain it or later
+                        // commands would never raise another edge.
+                        let _ = control.drain_wake();
+                        self.apply_control_commands();
+                    } else {
+                        return Ok(());
+                    }
+                }
+                #[cfg(not(test))]
                 return Ok(());
             }
 
@@ -190,6 +235,46 @@ impl<H: Handler> UnixReactor<H> {
                 self.dispatch(event)?;
             }
             self.fire_timers();
+        }
+    }
+
+    /// Applies every command the test control handle queued.
+    #[cfg(test)]
+    fn apply_control_commands(&mut self) {
+        let Some(control) = self.control.clone() else {
+            return;
+        };
+        for command in control.take_commands() {
+            let reply = match command.kind {
+                CommandKind::Pause => {
+                    for id in control.ids() {
+                        if let Some(conn) = self.core.conn_mut(id) {
+                            conn.pause_read();
+                        }
+                        let _ = self.update_interest(id);
+                    }
+                    Reply::Done
+                }
+                CommandKind::Resume => {
+                    for id in control.ids() {
+                        if let Some(conn) = self.core.conn_mut(id) {
+                            conn.resume_read();
+                        }
+                        let _ = self.update_interest(id);
+                    }
+                    Reply::Done
+                }
+                CommandKind::Close(id) => {
+                    self.close_conn(id);
+                    Reply::Done
+                }
+                CommandKind::PendingOps(id) => {
+                    // Readiness backends have no outstanding kernel operation.
+                    let _ = id;
+                    Reply::Count(0)
+                }
+            };
+            let _ = command.ack.send(reply);
         }
     }
 
@@ -319,6 +404,8 @@ impl<H: Handler> UnixReactor<H> {
                     return Ok(());
                 }
                 Ok(n) => {
+                    #[cfg(test)]
+                    self.core.note_read(n);
                     if self.core.on_read_ready(id, &buf[..n]).is_err() {
                         // Handler failure (echo overflow included) is fatal
                         // for this connection; nothing is retried.
@@ -352,9 +439,16 @@ impl<H: Handler> UnixReactor<H> {
                 .is_some_and(|conn| conn.has_pending_write());
             if !has_pending {
                 // The queue is empty, including on entry: this is the point
-                // where a deferred EOF close runs and paused reads resume.
+                // where a deferred EOF close runs and backpressure clears. The
+                // handler may retry carried output into the empty queue here.
                 self.core.on_write_ready(id)?;
-                return Ok(());
+                if self
+                    .core
+                    .conn(id)
+                    .is_none_or(|conn| !conn.has_pending_write())
+                {
+                    return Ok(());
+                }
             }
 
             let mut iovecs = [libc::iovec {
@@ -419,6 +513,15 @@ impl<H: Handler> UnixReactor<H> {
 
             if drained {
                 self.core.on_write_ready(id)?;
+                // The handler may have retried a carried chunk into the queue;
+                // write it now instead of waiting for another edge.
+                if self
+                    .core
+                    .conn(id)
+                    .is_some_and(|conn| conn.has_pending_write())
+                {
+                    continue;
+                }
                 return Ok(());
             }
             if written < batch_len {
@@ -444,7 +547,7 @@ impl<H: Handler> UnixReactor<H> {
         } else {
             self.registrations.remove(&id);
         }
-        self.core.close(id);
+        self.core.close(id, "reactor-close");
     }
 
     /// Reconciles the registered interest with the connection's state.
@@ -497,20 +600,56 @@ impl<H: Handler + Send + 'static> UnixReactor<H> {
     ///
     /// The returned [`Shutdown`] wakes the loop; the join handle carries the
     /// loop's result.
-    pub(crate) fn spawn_for_test_on(
+    pub(crate) fn spawn_for_test_on(self, addr: &str) -> io::Result<Spawned> {
+        let (addr, shutdown, join, _) = self.spawn_inner(addr, None, false)?;
+        Ok((addr, shutdown, join))
+    }
+
+    /// Binds `addr`, then moves the reactor onto a background thread with a
+    /// [`TestControl`] handle.
+    pub(crate) fn spawn_with_control_on(self, addr: &str) -> io::Result<SpawnedWithControl> {
+        let (addr, shutdown, join, control) = self.spawn_inner(addr, None, true)?;
+        Ok((
+            addr,
+            shutdown,
+            join,
+            control.expect("control spawn always returns a handle"),
+        ))
+    }
+
+    /// Binds `addr` with an explicit listen backlog and moves the reactor onto
+    /// a background thread.
+    pub(crate) fn spawn_with_backlog_on(self, addr: &str, backlog: usize) -> io::Result<Spawned> {
+        let (addr, shutdown, join, _) = self.spawn_inner(addr, Some(backlog), false)?;
+        Ok((addr, shutdown, join))
+    }
+
+    /// Shared spawn path for the plain, control and backlog harness variants.
+    fn spawn_inner(
         mut self,
         addr: &str,
-    ) -> io::Result<(
-        SocketAddr,
-        Shutdown,
-        std::thread::JoinHandle<io::Result<()>>,
-    )> {
-        self.listen(addr)?;
+        backlog: Option<usize>,
+        with_control: bool,
+    ) -> io::Result<SpawnedInternal> {
+        match backlog {
+            Some(backlog) => self.listen_with_backlog(addr, backlog)?,
+            None => self.listen(addr)?,
+        }
         let local = self.local_addr()?;
         let wake = Arc::new(Wake::new()?);
-        let shutdown = Shutdown::new(Arc::clone(&wake));
+        let (shutdown, control) = if with_control {
+            let channel = ControlChannel::new(Arc::clone(&wake));
+            self.core.attach_control(Arc::clone(&channel));
+            self.control = Some(Arc::clone(&channel));
+            (
+                Shutdown::with_control(Arc::clone(&wake), Arc::clone(&channel)),
+                Some(TestControl::new(channel)),
+            )
+        } else {
+            (Shutdown::new(Arc::clone(&wake)), None)
+        };
         let join = std::thread::spawn(move || self.run_until(&wake));
-        Ok((local, shutdown, join))
+        Ok((local, shutdown, join, control))
     }
 }
 
@@ -538,6 +677,11 @@ mod tests {
     use crate::rt::poller::{Interest, Poller};
     #[cfg(target_os = "linux")]
     use crate::rt::slab::ConnId;
+    #[cfg(target_os = "linux")]
+    use crate::rt::test_support::{
+        library_bytes, raise_nofile, spawn_echo_with_backlog, spawn_echo_with_control,
+        spawn_echo_with_control_on, wait_for_connections,
+    };
     use crate::rt::test_support::{spawn_echo, spawn_echo_on};
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -693,5 +837,104 @@ mod tests {
         let mut conn = Conn::new_for_test(64);
         conn.pause_read();
         assert_eq!(desired_interest(&conn), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pause_stops_reads_until_resume() {
+        let (addr, shutdown, join, control) = spawn_echo_with_control();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(&vec![7u8; 64 * 1024]).unwrap();
+        assert!(control.wait_for_read_bytes(1, Duration::from_secs(2)));
+        control.pause();
+        let paused = control.total_read_bytes();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            control.total_read_bytes(),
+            paused,
+            "reactor kept reading while paused"
+        );
+        client.write_all(&vec![8u8; 16 * 1024]).unwrap();
+        control.resume();
+        assert!(control.wait_for_read_bytes(paused + 16 * 1024, Duration::from_secs(2)));
+        drop(client);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_cancels_pending_operation() {
+        let (addr, shutdown, join, control) = spawn_echo_with_control();
+        let client = TcpStream::connect(addr).unwrap();
+        assert!(control.wait_for_connections(1, Duration::from_secs(2)));
+        let id = control.first_connection();
+        control.close(id);
+        assert!(control.wait_for_connections(0, Duration::from_secs(2)));
+        assert_eq!(control.pending_ops(id), 0);
+        drop(client);
+
+        let mut second = TcpStream::connect(addr).unwrap();
+        second.write_all(b"ok").unwrap();
+        let mut buf = [0u8; 2];
+        second.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ok");
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accept_ipv4_ipv6() {
+        let (addr4, shutdown4, join4, control4) =
+            spawn_echo_with_control_on("127.0.0.1:0").unwrap();
+        let mut c4 = TcpStream::connect(addr4).unwrap();
+        assert!(control4.wait_for_connections(1, Duration::from_secs(2)));
+        let id4 = control4.first_connection();
+        assert_eq!(control4.local_addr(id4), addr4);
+        assert_eq!(control4.peer_addr(id4), c4.local_addr().unwrap());
+        c4.write_all(b"v4").unwrap();
+        let mut b4 = [0u8; 2];
+        c4.read_exact(&mut b4).unwrap();
+        assert_eq!(&b4, b"v4");
+        shutdown4.shutdown();
+        join4.join().unwrap().unwrap();
+
+        if let Ok((addr6, shutdown6, join6, control6)) = spawn_echo_with_control_on("[::1]:0") {
+            let mut c6 = TcpStream::connect(addr6).unwrap();
+            assert!(control6.wait_for_connections(1, Duration::from_secs(2)));
+            let id6 = control6.first_connection();
+            assert_eq!(control6.local_addr(id6), addr6);
+            assert_eq!(control6.peer_addr(id6), c6.local_addr().unwrap());
+            c6.write_all(b"v6").unwrap();
+            let mut b6 = [0u8; 2];
+            c6.read_exact(&mut b6).unwrap();
+            assert_eq!(&b6, b"v6");
+            shutdown6.shutdown();
+            join6.join().unwrap().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_10k_alloc_budget() {
+        raise_nofile(65_536);
+        let before = library_bytes();
+        let (addr, shutdown, join) = spawn_echo_with_backlog(1_024);
+        let clients: Vec<TcpStream> = (0..10_000)
+            .map(|_| TcpStream::connect(addr).unwrap())
+            .collect();
+        assert!(wait_for_connections(10_000, Duration::from_secs(5)));
+        let after = library_bytes();
+        // Other tests may release reactor memory between the two samples, so
+        // the delta is a lower bound on this reactor's growth.
+        let per_conn = after.saturating_sub(before) / 10_000;
+        assert!(
+            per_conn < 1024,
+            "library allocated {per_conn} bytes per idle connection"
+        );
+        drop(clients);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
     }
 }

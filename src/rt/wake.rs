@@ -85,7 +85,7 @@ impl Wake {
     }
 
     /// Drains all pending wakes. Returns `true` if at least one was pending.
-    pub(crate) fn drain(&mut self) -> io::Result<bool> {
+    pub(crate) fn drain(&self) -> io::Result<bool> {
         // An eventfd read consumes 8 bytes, but a pipe may hold many wake
         // bytes; one stack buffer serves both.
         let mut buf = [0u8; 64];
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn wake_then_drain() {
-        let mut w = Wake::new().unwrap();
+        let w = Wake::new().unwrap();
         w.wake().unwrap();
         assert!(w.drain().unwrap());
         assert!(!w.drain().unwrap());
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn many_wakes_coalesce() {
-        let mut w = Wake::new().unwrap();
+        let w = Wake::new().unwrap();
         for _ in 0..64 {
             w.wake().unwrap();
         }
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn wake_before_poll_is_seen() {
-        let mut w = Wake::new().unwrap();
+        let w = Wake::new().unwrap();
 
         // The brief's raw-fd write cannot work on either backend: eventfd
         // requires an 8-byte value, and a pipe's pollable fd is its read end.

@@ -42,6 +42,8 @@ impl<T> Slab<T> {
 
     /// Inserts `value` into a free slot and returns its generation-checked id.
     pub(crate) fn insert(&mut self, value: T) -> ConnId {
+        #[cfg(test)]
+        let before = self.capacity_bytes();
         let index = match self.free.pop() {
             Some(index) => index as usize,
             None => {
@@ -60,10 +62,13 @@ impl<T> Slab<T> {
         );
         slot.value = Some(value);
         self.live += 1;
-        ConnId {
+        let id = ConnId {
             slot: u32::try_from(index).expect("slab slot index exceeds u32"),
             generation: slot.generation,
-        }
+        };
+        #[cfg(test)]
+        self.report_capacity(before);
+        id
     }
 
     /// Returns the value at `id`, or `None` if the id is stale or out of range.
@@ -90,6 +95,15 @@ impl<T> Slab<T> {
     /// Returns `None` for a stale or out-of-range id, leaving every occupant
     /// untouched.
     pub(crate) fn remove(&mut self, id: ConnId) -> Option<T> {
+        #[cfg(test)]
+        let before = self.capacity_bytes();
+        let removed = self.remove_at(id);
+        #[cfg(test)]
+        self.report_capacity(before);
+        removed
+    }
+
+    fn remove_at(&mut self, id: ConnId) -> Option<T> {
         let slot = self.slots.get_mut(id.slot as usize)?;
         if slot.generation != id.generation {
             return None;
@@ -109,6 +123,27 @@ impl<T> Slab<T> {
     /// Whether the slab holds no values.
     pub(crate) fn is_empty(&self) -> bool {
         self.live == 0
+    }
+
+    /// Heap bytes currently owned by the slot table and free list.
+    #[cfg(test)]
+    fn capacity_bytes(&self) -> usize {
+        self.slots.capacity() * std::mem::size_of::<Slot<T>>()
+            + self.free.capacity() * std::mem::size_of::<u32>()
+    }
+
+    /// Reports capacity growth since `before` to the library-byte counter.
+    #[cfg(test)]
+    fn report_capacity(&self, before: usize) {
+        let after = self.capacity_bytes();
+        crate::rt::test_support::add_library_bytes(after as isize - before as isize);
+    }
+}
+
+#[cfg(test)]
+impl<T> Drop for Slab<T> {
+    fn drop(&mut self) {
+        crate::rt::test_support::add_library_bytes(-(self.capacity_bytes() as isize));
     }
 }
 

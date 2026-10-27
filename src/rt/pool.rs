@@ -47,6 +47,8 @@ impl BlockPool {
                         return None;
                     }
                     state.allocated += 1;
+                    #[cfg(test)]
+                    note_library_bytes(block_bytes() as isize);
                     None
                 }
             }
@@ -84,10 +86,40 @@ impl BlockPool {
             // while the accounting is consistent. If it ever happens, let the
             // allocation drop and keep the capacity counter truthful.
             state.allocated -= 1;
+            #[cfg(test)]
+            note_library_bytes(-(block_bytes() as isize));
         }
     }
 
     fn state(&self) -> MutexGuard<'_, PoolState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Bytes one pool allocation owns: the block plus its shared header.
+#[cfg(test)]
+fn block_bytes() -> usize {
+    BLOCK_SIZE + std::mem::size_of::<BlockInner>()
+}
+
+#[cfg(test)]
+fn note_library_bytes(delta: isize) {
+    crate::rt::test_support::add_library_bytes(delta);
+}
+
+/// Test-only accounting: parked allocations are freed when the pool drops.
+///
+/// Checked-out blocks may outlive the pool (they only hold a weak origin), so
+/// this deliberately subtracts just the parked count rather than the total
+/// ever allocated.
+#[cfg(test)]
+impl Drop for BlockPool {
+    fn drop(&mut self) {
+        let parked = self
+            .state
+            .get_mut()
+            .map(|state| state.free.len())
+            .unwrap_or(0);
+        note_library_bytes(-((parked * block_bytes()) as isize));
     }
 }

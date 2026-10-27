@@ -15,6 +15,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets
+      # Task 10: pause/resume, close/cancel, stale completions and the 10k-idle
+      # allocation budget. Linux runs the unix lifecycle tests and Windows the
+      # IOCP close/stale tests; the filter matches both.
+      - name: backpressure, close/cancel and idle budget
+        run: cargo test --lib rt::reactor
   freebsd:
     runs-on: ubuntu-latest
     steps:

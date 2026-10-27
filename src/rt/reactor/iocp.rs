@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, AcceptEx, INVALID_SOCKET, SOCKADDR_STORAGE, SOCKET,
-    SOCKET_ERROR, WSA_IO_PENDING, WSABUF, WSARecv, WSASend,
+    SOCKET_ERROR, WSA_IO_PENDING, WSABUF, WSARecv, WSASend, listen,
 };
 use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_ENTRY};
 
@@ -45,7 +45,10 @@ use crate::rt::reactor::ReactorCore;
 use crate::rt::slab::ConnId;
 use crate::rt::socket::OwnedSocket;
 #[cfg(test)]
-use crate::rt::test_support::Shutdown;
+use crate::rt::test_support::{
+    CommandKind, ControlChannel, Reply, Shutdown, Spawned, SpawnedInternal, SpawnedWithControl,
+    TestControl,
+};
 use crate::rt::wake::Wake;
 
 /// Per-connection outbound cap. The echo handler reports `WouldBlock` beyond
@@ -66,6 +69,9 @@ const MAX_IOVECS: usize = 64;
 
 /// Upper bound on one completion wait, short enough for shutdown and timers.
 const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// Default listen backlog, matching the standard library's bind.
+const DEFAULT_BACKLOG: usize = 1_024;
 
 /// How long dropping the reactor waits for canceled operations to complete.
 const DROP_WAIT: Duration = Duration::from_secs(2);
@@ -257,6 +263,9 @@ pub(crate) struct IocpReactor<H: Handler> {
     connect_result: Option<(usize, io::Result<SOCKET>)>,
     /// Set when the wake sentinel is dequeued.
     stop: bool,
+    /// Test-only command channel installed by the harness.
+    #[cfg(test)]
+    control: Option<Arc<ControlChannel>>,
 }
 
 impl<H: Handler> IocpReactor<H> {
@@ -271,11 +280,22 @@ impl<H: Handler> IocpReactor<H> {
             posted: HashMap::new(),
             connect_result: None,
             stop: false,
+            #[cfg(test)]
+            control: None,
         }
     }
 
     /// Binds a listener to `addr` and posts a bounded `AcceptEx` pool.
     pub(crate) fn listen(&mut self, addr: &str) -> io::Result<()> {
+        self.listen_with_backlog(addr, DEFAULT_BACKLOG)
+    }
+
+    /// Binds a listener with an explicit kernel backlog.
+    ///
+    /// The standard library's bind fixes the backlog, so the 10k-idle harness
+    /// re-issues `listen` on the bound socket. Windows only updates the queue
+    /// limit for a socket that is already listening.
+    pub(crate) fn listen_with_backlog(&mut self, addr: &str, backlog: usize) -> io::Result<()> {
         if self.listener.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -287,6 +307,12 @@ impl<H: Handler> IocpReactor<H> {
         let local = listener.local_addr()?;
         let family = if local.is_ipv4() { AF_INET } else { AF_INET6 };
         let raw = listener.as_raw_socket() as SOCKET;
+        let backlog = i32::try_from(backlog).unwrap_or(i32::MAX);
+        // SAFETY: `raw` is a live listening socket; `listen` only updates the
+        // backlog bound and does not read or write memory.
+        if unsafe { listen(raw, backlog) } == SOCKET_ERROR {
+            return Err(last_wsa_error());
+        }
 
         self.poller_mut()?.associate(raw, LISTEN_KEY)?;
         self.listener = Some(listener);
@@ -334,6 +360,8 @@ impl<H: Handler> IocpReactor<H> {
 
         let mut entries = [OVERLAPPED_ENTRY::default(); MAX_COMPLETIONS];
         while !self.stop {
+            #[cfg(test)]
+            self.apply_control_commands();
             let timeout = self.poll_timeout();
             let count = self
                 .poller
@@ -376,9 +404,126 @@ impl<H: Handler> IocpReactor<H> {
         let _ = self.core.timers_mut().pop_expired(Instant::now());
     }
 
+    /// Applies every command the test control handle queued.
+    #[cfg(test)]
+    fn apply_control_commands(&mut self) {
+        let Some(control) = self.control.clone() else {
+            return;
+        };
+        for command in control.take_commands() {
+            let reply = match command.kind {
+                CommandKind::Pause => {
+                    for id in control.ids() {
+                        if let Some(conn) = self.core.conn_mut(id) {
+                            conn.pause_read();
+                        }
+                    }
+                    Reply::Done
+                }
+                CommandKind::Resume => {
+                    for id in control.ids() {
+                        if let Some(conn) = self.core.conn_mut(id) {
+                            conn.resume_read();
+                        }
+                        self.resume_io(id);
+                    }
+                    Reply::Done
+                }
+                CommandKind::Close(id) => {
+                    self.begin_close(id);
+                    Reply::Done
+                }
+                CommandKind::PendingOps(id) => {
+                    Reply::Count(self.conns.get(&id).map_or(0, ConnOps::pending))
+                }
+                CommandKind::CloseNoWait(id) => {
+                    self.begin_close(id);
+                    Reply::Done
+                }
+                CommandKind::MarkReusable(id) => {
+                    self.mark_connection_reusable(id);
+                    Reply::Done
+                }
+                CommandKind::DeliverStale(id) => {
+                    self.deliver_stale(id);
+                    Reply::Done
+                }
+            };
+            let _ = command.ack.send(reply);
+        }
+    }
+
+    /// Re-arms reading after an explicit resume, first delivering a read that
+    /// completed while the connection was paused.
+    #[cfg(test)]
+    fn resume_io(&mut self, id: ConnId) {
+        let Some(ops) = self.conns.get(&id) else {
+            return;
+        };
+        let has_ready_read = ops.recv_ready.is_some();
+        let send_posted = ops.send_posted;
+        if has_ready_read && !send_posted {
+            self.process_ready_read(id);
+        } else {
+            self.post_recv(id);
+        }
+    }
+
+    /// Test-only: free the slab slot while canceled completions are pending.
+    #[cfg(test)]
+    fn mark_connection_reusable(&mut self, id: ConnId) {
+        if self.conns.get(&id).is_some_and(|ops| ops.send_posted) {
+            // Freeing the connection would invalidate the blocks a posted send
+            // still points at; refuse rather than risk use-after-free.
+            debug_assert!(false, "cannot free a slot whose send is posted");
+            return;
+        }
+        self.conns.remove(&id);
+        self.core.close(id, "test-reuse");
+    }
+
+    /// Test-only: wait for the real canceled completions for `id` and route
+    /// them through the normal dispatch path. The generation check must discard
+    /// them.
+    ///
+    /// The operation box may only be freed once the kernel has dequeued its
+    /// completion, so this cannot synthesize a completion; `close_no_wait`
+    /// already called `CancelIoEx`, and the aborted completion follows.
+    #[cfg(test)]
+    fn deliver_stale(&mut self, id: ConnId) {
+        let mut entries = [OVERLAPPED_ENTRY::default(); MAX_COMPLETIONS];
+        let deadline = Instant::now() + DROP_WAIT;
+        while self.posted.values().any(|posted| posted.id() == Some(id))
+            && Instant::now() < deadline
+            && !self.stop
+        {
+            let count = match self.poller.as_ref() {
+                Some(poller) => match poller.wait(Some(Duration::from_millis(20)), &mut entries) {
+                    Ok(count) => count,
+                    Err(_) => return,
+                },
+                None => return,
+            };
+            for entry in entries.iter().take(count) {
+                if self.handle_entry(entry).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     /// Applies one dequeued completion packet.
     fn handle_entry(&mut self, entry: &OVERLAPPED_ENTRY) -> io::Result<()> {
         if entry.lpCompletionKey == WAKE_KEY {
+            #[cfg(test)]
+            if let Some(control) = self.control.clone() {
+                if control.stop() {
+                    self.stop = true;
+                } else {
+                    self.apply_control_commands();
+                }
+                return Ok(());
+            }
             self.stop = true;
             return Ok(());
         }
@@ -781,13 +926,15 @@ impl<H: Handler> IocpReactor<H> {
                 return;
             }
             self.core.on_eof(id);
-            if self.core.conn(id).is_none() {
-                self.conns.remove(&id);
-            }
+            self.flush_deferred_eof(id);
             return;
         }
 
-        if self.conns.get(&id).is_some_and(|ops| ops.send_posted) {
+        // Reading is paused (explicitly or by backpressure), or a send is in
+        // flight: hold the completed bytes instead of delivering them. A pause
+        // command synchronous with this reactor must not race a new read.
+        let paused = self.core.conn(id).is_some_and(|conn| conn.is_paused());
+        if paused || self.conns.get(&id).is_some_and(|ops| ops.send_posted) {
             if let Some(ops) = self.conns.get_mut(&id) {
                 ops.recv = Some(op);
                 ops.recv_ready = Some(bytes);
@@ -803,6 +950,8 @@ impl<H: Handler> IocpReactor<H> {
         if self.core.conn(id).is_none() {
             return;
         }
+        #[cfg(test)]
+        self.core.note_read(len);
         if self.core.on_read_ready(id, &op.buf[..len]).is_err() {
             // A handler error is terminal; the core closed the connection. No
             // operation is posted on either side at this point.
@@ -816,6 +965,32 @@ impl<H: Handler> IocpReactor<H> {
         ops.recv = Some(op);
         self.post_send(id);
         self.post_recv(id);
+    }
+
+    /// Completes an EOF that arrived while a deferred flush was outstanding.
+    ///
+    /// A carried handler chunk counts as outbound work: retry it into the queue
+    /// (the core sets `close_after_flush` instead of closing) and post its
+    /// send. The close then happens when that send completes.
+    fn flush_deferred_eof(&mut self, id: ConnId) {
+        if self.core.conn(id).is_none() {
+            self.conns.remove(&id);
+            return;
+        }
+        if self.core.conn(id).is_some_and(|conn| conn.has_carry()) {
+            let _ = self.core.on_write_ready(id);
+        }
+        if self.core.conn(id).is_none() {
+            self.conns.remove(&id);
+            return;
+        }
+        if self
+            .core
+            .conn(id)
+            .is_some_and(|conn| conn.has_pending_write())
+        {
+            self.post_send(id);
+        }
     }
 
     /// Processes a read that was held while a send was in flight.
@@ -892,15 +1067,21 @@ impl<H: Handler> IocpReactor<H> {
             self.conns.remove(&id);
             return;
         }
+        // The handler may have retried a carried chunk into the empty queue.
+        if self
+            .core
+            .conn(id)
+            .is_some_and(|conn| conn.has_pending_write())
+        {
+            self.post_send(id);
+        }
 
         if self.conns.get(&id).is_some_and(|ops| ops.eof_pending) {
             if let Some(ops) = self.conns.get_mut(&id) {
                 ops.eof_pending = false;
             }
             self.core.on_eof(id);
-            if self.core.conn(id).is_none() {
-                self.conns.remove(&id);
-            }
+            self.flush_deferred_eof(id);
             return;
         }
 
@@ -919,7 +1100,7 @@ impl<H: Handler> IocpReactor<H> {
     /// completions.
     fn begin_close(&mut self, id: ConnId) {
         let Some(ops) = self.conns.get_mut(&id) else {
-            self.core.close(id);
+            self.core.close(id, "not-live");
             return;
         };
         if ops.closing {
@@ -961,7 +1142,7 @@ impl<H: Handler> IocpReactor<H> {
             "freeing a connection with posted operations"
         );
         self.conns.remove(&id);
-        self.core.close(id);
+        self.core.close(id, "reactor-close");
     }
 }
 
@@ -971,15 +1152,41 @@ impl<H: Handler + Send + 'static> IocpReactor<H> {
     ///
     /// The returned [`Shutdown`] posts the wake sentinel; the join handle carries
     /// the loop's result.
-    pub(crate) fn spawn_for_test_on(
+    pub(crate) fn spawn_for_test_on(self, addr: &str) -> io::Result<Spawned> {
+        let (addr, shutdown, join, _) = self.spawn_inner(addr, None, false)?;
+        Ok((addr, shutdown, join))
+    }
+
+    /// Binds `addr`, then moves the reactor onto a background thread with a
+    /// [`TestControl`] handle.
+    pub(crate) fn spawn_with_control_on(self, addr: &str) -> io::Result<SpawnedWithControl> {
+        let (addr, shutdown, join, control) = self.spawn_inner(addr, None, true)?;
+        Ok((
+            addr,
+            shutdown,
+            join,
+            control.expect("control spawn always returns a handle"),
+        ))
+    }
+
+    /// Binds `addr` with an explicit listen backlog and moves the reactor onto
+    /// a background thread.
+    pub(crate) fn spawn_with_backlog_on(self, addr: &str, backlog: usize) -> io::Result<Spawned> {
+        let (addr, shutdown, join, _) = self.spawn_inner(addr, Some(backlog), false)?;
+        Ok((addr, shutdown, join))
+    }
+
+    /// Shared spawn path for the plain, control and backlog harness variants.
+    fn spawn_inner(
         mut self,
         addr: &str,
-    ) -> io::Result<(
-        SocketAddr,
-        Shutdown,
-        std::thread::JoinHandle<io::Result<()>>,
-    )> {
-        self.listen(addr)?;
+        backlog: Option<usize>,
+        with_control: bool,
+    ) -> io::Result<SpawnedInternal> {
+        match backlog {
+            Some(backlog) => self.listen_with_backlog(addr, backlog)?,
+            None => self.listen(addr)?,
+        }
         let local = self.local_addr()?;
         let port = self
             .poller
@@ -987,9 +1194,19 @@ impl<H: Handler + Send + 'static> IocpReactor<H> {
             .expect("listen created the completion port")
             .raw_handle();
         let wake = Arc::new(Wake::new(port)?);
-        let shutdown = Shutdown::new(Arc::clone(&wake));
+        let (shutdown, control) = if with_control {
+            let channel = ControlChannel::new(Arc::clone(&wake));
+            self.core.attach_control(Arc::clone(&channel));
+            self.control = Some(Arc::clone(&channel));
+            (
+                Shutdown::with_control(Arc::clone(&wake), Arc::clone(&channel)),
+                Some(TestControl::new(channel)),
+            )
+        } else {
+            (Shutdown::new(Arc::clone(&wake)), None)
+        };
         let join = std::thread::spawn(move || self.run_until(&wake));
-        Ok((local, shutdown, join))
+        Ok((local, shutdown, join, control))
     }
 }
 
@@ -1055,7 +1272,7 @@ impl<H: Handler> Drop for IocpReactor<H> {
 
 #[cfg(test)]
 mod tests {
-    use crate::rt::test_support::{spawn_echo, spawn_echo_on};
+    use crate::rt::test_support::{spawn_echo, spawn_echo_on, spawn_echo_with_control};
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -1096,6 +1313,45 @@ mod tests {
         let (addr, shutdown, join) = spawn_echo_on("127.0.0.1:0").unwrap();
         assert!(addr.ip().is_loopback());
         assert_ne!(addr.port(), 0);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn stale_completion_after_reuse_is_ignored() {
+        let (addr, shutdown, join, control) = spawn_echo_with_control();
+        let first = TcpStream::connect(addr).unwrap();
+        assert!(control.wait_for_connections(1, std::time::Duration::from_secs(2)));
+        let old = control.first_connection();
+        // Posts CancelIoEx but leaves the completion to be delivered.
+        control.close_no_wait(old);
+        // Test-only: free the slot while the completion is still pending.
+        control.mark_connection_reusable(old);
+        let mut second = TcpStream::connect(addr).unwrap();
+        assert!(control.wait_for_connections(1, std::time::Duration::from_secs(2)));
+        let new = control.last_connection();
+        assert_eq!(new.slot, old.slot, "test did not reuse the old slot");
+        // Force the old completion after the new connection exists.
+        control.deliver_stale(old);
+        second.write_all(b"new").unwrap();
+        let mut buf = [0u8; 3];
+        second.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"new", "stale completion affected the reused slot");
+        drop(first);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn cancel_io_on_close() {
+        let (addr, shutdown, join, control) = spawn_echo_with_control();
+        let client = TcpStream::connect(addr).unwrap();
+        assert!(control.wait_for_connections(1, std::time::Duration::from_secs(2)));
+        let id = control.first_connection();
+        control.close(id);
+        assert!(control.wait_for_connections(0, std::time::Duration::from_secs(2)));
+        assert_eq!(control.pending_ops(id), 0);
+        drop(client);
         shutdown.shutdown();
         join.join().unwrap().unwrap();
     }

@@ -26,6 +26,20 @@ pub(crate) enum WriteError {
 }
 
 /// Reactor-side state for one connection.
+///
+/// Three independent flags decide whether the reactor may read:
+///
+/// - [`Conn::pause_read`] is the explicit pause: a caller or [`TestControl`]
+///   request that only [`Conn::resume_read`] clears.
+/// - backpressure is set when the outbound queue cannot accept more data; it is
+///   cleared only after the queue (and any carried chunk) has drained.
+/// - a closed connection never reads again, whatever the other two flags say.
+///
+/// Keeping them separate is what lets an explicit resume stay explicit: it
+/// must not silently override a full outbound queue or a closed socket.
+/// [`Conn::is_paused`] is the composite question the reactor asks.
+///
+/// [`TestControl`]: super::test_support::TestControl
 pub(crate) struct Conn {
     /// `None` only for connections built by the test constructor.
     socket: Option<OwnedSocket>,
@@ -39,7 +53,12 @@ pub(crate) struct Conn {
     pending_write: VecDeque<Block>,
     /// Total bytes queued in `pending_write`; also the byte-cap accounting.
     pending_bytes: usize,
-    paused: bool,
+    /// Bytes the handler could not enqueue yet, retried after the queue drains.
+    carry: Vec<u8>,
+    /// Explicit pause: only [`Self::resume_read`] clears it.
+    read_paused: bool,
+    /// The outbound queue or block pool refused new output.
+    backpressured: bool,
     closed: bool,
     /// Close as soon as the outbound queue drains (peer EOF with output queued).
     close_after_flush: bool,
@@ -62,7 +81,9 @@ impl Conn {
             pool,
             pending_write: VecDeque::new(),
             pending_bytes: 0,
-            paused: false,
+            carry: Vec::new(),
+            read_paused: false,
+            backpressured: false,
             closed: false,
             close_after_flush: false,
         })
@@ -84,7 +105,9 @@ impl Conn {
             pool,
             pending_write: VecDeque::new(),
             pending_bytes: 0,
-            paused: false,
+            carry: Vec::new(),
+            read_paused: false,
+            backpressured: false,
             closed: false,
             close_after_flush: false,
         }
@@ -139,12 +162,12 @@ impl Conn {
         let total = match self.pending_bytes.checked_add(data.len()) {
             Some(total) => total,
             None => {
-                self.paused = true;
+                self.set_backpressure();
                 return Err(WriteError::QueueFull);
             }
         };
         if total > self.write_cap {
-            self.paused = true;
+            self.set_backpressure();
             return Err(WriteError::QueueFull);
         }
 
@@ -156,7 +179,7 @@ impl Conn {
             match self.pool.alloc() {
                 Some(block) => blocks.push(block),
                 None => {
-                    self.paused = true;
+                    self.set_backpressure();
                     return Err(WriteError::PoolExhausted);
                 }
             }
@@ -253,31 +276,85 @@ impl Conn {
         self.pending_bytes != 0
     }
 
-    /// Stops reading from this connection.
-    pub(crate) fn pause_read(&mut self) {
-        self.paused = true;
-    }
-
-    /// Allows reading again, including after outbound backpressure.
-    pub(crate) fn resume_read(&mut self) {
-        self.paused = false;
-    }
-
-    /// Whether reads are suspended, explicitly or by backpressure.
-    pub(crate) fn is_paused(&self) -> bool {
-        self.paused
-    }
-
-    /// Closes the connection immediately: drops the socket and queued output,
-    /// and leaves reads paused.
+    /// Stops reading from this connection explicitly.
     ///
-    /// Any graceful sequence (flush, `shutdown_write`, read-to-FIN) belongs to
-    /// the reactor and must happen before this call.
+    /// This does not touch backpressure: a later [`Self::resume_read`] clears
+    /// only this request.
+    pub(crate) fn pause_read(&mut self) {
+        self.read_paused = true;
+    }
+
+    /// Clears the explicit read pause, leaving backpressure and close alone.
+    pub(crate) fn resume_read(&mut self) {
+        self.read_paused = false;
+    }
+
+    /// Whether an explicit [`Self::pause_read`] is in effect.
+    pub(crate) fn is_read_paused(&self) -> bool {
+        self.read_paused
+    }
+
+    /// Records that outbound backpressure stopped new reads.
+    pub(crate) fn set_backpressure(&mut self) {
+        self.backpressured = true;
+    }
+
+    /// Clears backpressure once the outbound queue has room again.
+    pub(crate) fn clear_backpressure(&mut self) {
+        self.backpressured = false;
+    }
+
+    /// Whether outbound backpressure stopped new reads.
+    pub(crate) fn is_backpressured(&self) -> bool {
+        self.backpressured
+    }
+
+    /// Whether reads are suspended, explicitly, by backpressure or by close.
+    pub(crate) fn is_paused(&self) -> bool {
+        self.read_paused || self.backpressured || self.closed
+    }
+
+    /// Stores a handler chunk that could not be queued yet.
+    ///
+    /// The reactor retries the carry through the handler once the queue has
+    /// drained; at most one read chunk is held, because reads stay paused while
+    /// a carry is outstanding.
+    pub(crate) fn put_carry(&mut self, data: Vec<u8>) {
+        if self.carry.is_empty() {
+            self.carry = data;
+        } else {
+            // Reads are supposed to be paused while a carry is outstanding, so
+            // this is defensive: append instead of losing the older chunk.
+            debug_assert!(false, "carry already holds a chunk");
+            self.carry.extend_from_slice(&data);
+        }
+    }
+
+    /// Takes the carried chunk, leaving the carry empty.
+    pub(crate) fn take_carry(&mut self) -> Option<Vec<u8>> {
+        if self.carry.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.carry))
+        }
+    }
+
+    /// Whether a handler chunk is waiting for room in the outbound queue.
+    pub(crate) fn has_carry(&self) -> bool {
+        !self.carry.is_empty()
+    }
+
+    /// Closes the connection immediately: drops the socket, queued output and
+    /// any carried chunk.
+    ///
+    /// The closed flag is independent of the pause flags; [`Self::is_paused`]
+    /// reports true regardless. Any graceful sequence (flush, `shutdown_write`,
+    /// read-to-FIN) belongs to the reactor and must happen before this call.
     pub(crate) fn close(&mut self) {
         self.closed = true;
-        self.paused = true;
         self.pending_write.clear();
         self.pending_bytes = 0;
+        self.carry.clear();
         if let Some(socket) = self.socket.take() {
             socket.close();
         }
@@ -326,9 +403,52 @@ mod tests {
         let mut c = Conn::new_for_test(64);
         assert!(!c.is_paused());
         c.pause_read();
+        assert!(c.is_read_paused());
         assert!(c.is_paused());
         c.resume_read();
+        assert!(!c.is_read_paused());
         assert!(!c.is_paused());
+    }
+
+    #[test]
+    fn explicit_resume_clears_only_the_explicit_pause() {
+        let mut c = Conn::new_for_test(4);
+        assert_eq!(c.enqueue(b"hello"), Err(WriteError::QueueFull));
+        assert!(c.is_backpressured());
+        assert!(!c.is_read_paused());
+
+        c.pause_read();
+        assert!(c.is_read_paused());
+        c.resume_read();
+        assert!(!c.is_read_paused());
+        assert!(
+            c.is_backpressured(),
+            "explicit resume must not clear backpressure"
+        );
+        assert!(c.is_paused());
+
+        c.clear_backpressure();
+        assert!(!c.is_paused());
+
+        c.close();
+        c.resume_read();
+        assert!(c.is_closed());
+        assert!(
+            c.is_paused(),
+            "explicit resume must not clear a closed connection"
+        );
+    }
+
+    #[test]
+    fn carry_round_trips_handler_data() {
+        let mut c = Conn::new_for_test(64);
+        assert!(!c.has_carry());
+
+        c.put_carry(b"abc".to_vec());
+        assert!(c.has_carry());
+        assert_eq!(c.take_carry(), Some(b"abc".to_vec()));
+        assert!(!c.has_carry());
+        assert_eq!(c.take_carry(), None);
     }
 
     #[test]

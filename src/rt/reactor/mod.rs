@@ -39,6 +39,9 @@ pub(crate) struct ReactorCore<H: Handler> {
     pool: Arc<BlockPool>,
     timers: TimerHeap,
     handler: H,
+    /// Test-only command/observation channel installed by the harness.
+    #[cfg(test)]
+    control: Option<Arc<crate::rt::test_support::ControlChannel>>,
 }
 
 impl<H: Handler> ReactorCore<H> {
@@ -49,6 +52,22 @@ impl<H: Handler> ReactorCore<H> {
             pool: BlockPool::new(DEFAULT_POOL_BYTES),
             timers: TimerHeap::new(),
             handler,
+            #[cfg(test)]
+            control: None,
+        }
+    }
+
+    /// Installs a test control channel. The harness shares it with the reactor.
+    #[cfg(test)]
+    pub(crate) fn attach_control(&mut self, control: Arc<crate::rt::test_support::ControlChannel>) {
+        self.control = Some(control);
+    }
+
+    /// Records delivered plaintext bytes in the test control channel, if any.
+    #[cfg(test)]
+    pub(crate) fn note_read(&mut self, bytes: usize) {
+        if let Some(control) = &self.control {
+            control.note_read(bytes);
         }
     }
 
@@ -91,7 +110,17 @@ impl<H: Handler> ReactorCore<H> {
     /// [`Self::on_accept`] or [`Self::on_connect`] after the platform reactor
     /// has registered the socket.
     pub(crate) fn insert(&mut self, conn: Conn) -> ConnId {
-        self.conns.insert(conn)
+        #[cfg(test)]
+        let addresses = (conn.local_addr(), conn.peer_addr());
+        let id = self.conns.insert(conn);
+        #[cfg(test)]
+        {
+            crate::rt::test_support::note_connection_opened();
+            if let Some(control) = &self.control {
+                control.note_open(id, addresses.0, addresses.1);
+            }
+        }
+        id
     }
 
     /// Looks up a live connection.
@@ -140,24 +169,50 @@ impl<H: Handler> ReactorCore<H> {
     /// Applies the post-write state rules after the platform flushed output.
     ///
     /// The platform reactor performs the actual socket writes and calls this
-    /// helper only once the queue has drained. If EOF was seen while output was
-    /// still queued, the deferred close now runs; otherwise reads paused by
-    /// backpressure can resume. This helper performs no I/O.
+    /// helper once the queue has drained. If EOF was seen while output was
+    /// still queued, the deferred close now runs. Otherwise the handler gets a
+    /// chance to retry output it carried during backpressure; when nothing is
+    /// queued or carried, backpressure is cleared so the reactor can re-arm
+    /// reads. An explicit pause is never cleared here. This helper performs no
+    /// I/O.
     pub(crate) fn on_write_ready(&mut self, id: ConnId) -> io::Result<()> {
-        let close_now = match self.conns.get_mut(id) {
-            Some(conn) if !conn.has_pending_write() => {
-                if conn.is_close_after_flush() {
-                    true
-                } else {
-                    conn.resume_read();
-                    false
-                }
-            }
-            _ => false,
+        let Some(conn) = self.conns.get(id) else {
+            return Ok(());
         };
+        if conn.has_pending_write() {
+            return Ok(());
+        }
 
-        if close_now {
-            self.close(id);
+        // The handler may have carried a chunk it could not enqueue. Retry it
+        // now that there is room; a deferred EOF close must not drop it.
+        let retried = match self.conns.get_mut(id) {
+            Some(conn) => Some(self.handler.on_output_ready(conn)),
+            None => None,
+        };
+        if let Some(Err(err)) = retried {
+            // A failed retry is terminal for this connection only.
+            let _ = self.finish(id, Err(err));
+            return Ok(());
+        }
+
+        let (pending, carry, close_after_flush) = match self.conns.get(id) {
+            Some(conn) => (
+                conn.has_pending_write(),
+                conn.has_carry(),
+                conn.is_close_after_flush(),
+            ),
+            None => return Ok(()),
+        };
+        if close_after_flush {
+            if !pending && !carry {
+                self.close(id, "peer-eof");
+            }
+            return Ok(());
+        }
+        if !pending && !carry {
+            if let Some(conn) = self.conns.get_mut(id) {
+                conn.clear_backpressure();
+            }
         }
         Ok(())
     }
@@ -169,12 +224,14 @@ impl<H: Handler> ReactorCore<H> {
     /// Closing immediately would discard the queued bytes.
     pub(crate) fn on_eof(&mut self, id: ConnId) {
         if let Some(conn) = self.conns.get_mut(id) {
-            if conn.has_pending_write() {
+            // A carried chunk is outbound work even though it is not in the
+            // queue yet; closing now would truncate the echo.
+            if conn.has_pending_write() || conn.has_carry() {
                 conn.close_after_flush();
                 return;
             }
         }
-        self.close(id);
+        self.close(id, "peer-eof");
     }
 
     /// Closes `id`, releasing its socket and queued output, then reports it.
@@ -182,11 +239,19 @@ impl<H: Handler> ReactorCore<H> {
     /// Removing the slab entry first bumps the generation, so late events for
     /// this connection are ignored even while `on_close` runs. A stale id is a
     /// no-op.
-    pub(crate) fn close(&mut self, id: ConnId) {
+    pub(crate) fn close(&mut self, id: ConnId, reason: &'static str) {
+        debug_assert!(!reason.is_empty(), "close reason must be non-empty");
         let Some(mut conn) = self.conns.remove(id) else {
             return;
         };
         conn.close();
+        #[cfg(test)]
+        {
+            crate::rt::test_support::note_connection_closed();
+            if let Some(control) = &self.control {
+                control.note_closed(id);
+            }
+        }
         self.handler.on_close(id);
     }
 
@@ -195,7 +260,7 @@ impl<H: Handler> ReactorCore<H> {
         match result {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.close(id);
+                self.close(id, "handler-error");
                 Err(err)
             }
         }
@@ -270,7 +335,7 @@ mod tests {
 
         core.on_accept(id).unwrap();
         core.on_connect(id).unwrap();
-        core.close(id);
+        core.close(id, "test");
 
         assert!(core.is_empty());
         assert!(core.conn(id).is_none());
@@ -336,14 +401,34 @@ mod tests {
     }
 
     #[test]
-    fn echo_backpressure_closes_instead_of_dropping_the_chunk() {
+    fn echo_overflow_pauses_and_carries_instead_of_resetting() {
         let mut core = ReactorCore::new(EchoHandler);
-        let id = core.insert(Conn::new_for_test(4));
+        let id = core.insert(Conn::new_for_test(8));
 
-        let err = core.on_read_ready(id, b"hello").unwrap_err();
+        core.on_read_ready(id, b"12345").unwrap();
+        core.on_read_ready(id, b"67890").unwrap();
 
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert!(core.is_empty(), "backpressure must reset, not keep a gap");
+        let conn = core.conn(id).unwrap();
+        assert!(conn.is_backpressured());
+        assert!(!conn.is_read_paused());
+        assert!(conn.has_carry());
+        assert_eq!(core.len(), 1, "overflow must pause, not reset");
+        assert_eq!(
+            core.conn_mut(id).unwrap().take_pending_write(),
+            Some(b"12345".to_vec())
+        );
+
+        // Draining the queue retries the carried chunk through the handler.
+        core.on_write_ready(id).unwrap();
+        assert_eq!(
+            core.conn_mut(id).unwrap().take_pending_write(),
+            Some(b"67890".to_vec())
+        );
+        assert_eq!(core.len(), 1, "retry must not lose the connection");
+
+        core.on_write_ready(id).unwrap();
+        assert!(!core.conn(id).unwrap().is_backpressured());
+        assert!(!core.conn(id).unwrap().is_paused());
     }
 
     #[test]
@@ -380,7 +465,31 @@ mod tests {
     }
 
     #[test]
-    fn write_ready_keeps_reads_paused_until_the_queue_drains() {
+    fn eof_with_carried_output_defers_close_until_the_retry_flushes() {
+        let mut core = ReactorCore::new(EchoHandler);
+        let id = core.insert(Conn::new_for_test(8));
+        core.on_read_ready(id, b"12345").unwrap();
+        core.on_read_ready(id, b"67890").unwrap();
+
+        core.on_eof(id);
+        assert_eq!(core.len(), 1, "EOF must keep the carried chunk alive");
+
+        // The queued chunk drains; the retry then moves the carry into the
+        // queue, so the deferred close still waits.
+        core.conn_mut(id).unwrap().take_pending_write();
+        core.on_write_ready(id).unwrap();
+        assert_eq!(
+            core.conn_mut(id).unwrap().take_pending_write(),
+            Some(b"67890".to_vec())
+        );
+        assert_eq!(core.len(), 1, "the retried carry must be flushed first");
+
+        core.on_write_ready(id).unwrap();
+        assert!(core.is_empty());
+    }
+
+    #[test]
+    fn explicit_pause_survives_a_drained_write_queue() {
         let mut core = ReactorCore::new(EchoHandler);
         let id = core.insert(Conn::new_for_test(8));
         {
@@ -394,6 +503,13 @@ mod tests {
 
         core.conn_mut(id).unwrap().take_pending_write();
         core.on_write_ready(id).unwrap();
+        assert!(
+            core.conn(id).unwrap().is_paused(),
+            "draining output must not clear an explicit pause"
+        );
+
+        core.conn_mut(id).unwrap().resume_read();
+        core.on_write_ready(id).unwrap();
         assert!(!core.conn(id).unwrap().is_paused());
     }
 
@@ -401,7 +517,7 @@ mod tests {
     fn stale_ids_are_ignored_by_every_helper() {
         let mut core = ReactorCore::new(FailingHandler::new());
         let id = core.insert(Conn::new_for_test(64));
-        core.close(id);
+        core.close(id, "test");
 
         assert!(core.on_read_ready(id, b"x").is_ok());
         assert!(core.on_accept(id).is_ok());
