@@ -1,5 +1,7 @@
 # libhttp
 
+[![CI](https://github.com/Sol-Ell/libhttp/actions/workflows/ci.yml/badge.svg)](https://github.com/Sol-Ell/libhttp/actions/workflows/ci.yml)
+
 A synchronous Rust HTTP library — not a framework — with a sans-I/O protocol core and native
 readiness/completion transports on Linux, macOS, FreeBSD and Windows.
 
@@ -10,8 +12,10 @@ backends. The full server/client design lives in `docs/superpowers/specs/`.
 
 ## Status
 
-- M1 transport spine: in progress (Tasks 1–9 complete; backpressure/close and outbound connect
-  follow).
+- **M1 transport spine: complete.** Blocks/pool, timers, wakeup, sockets, generation slab,
+  connection state, handler/echo, epoll, kqueue, IOCP, backpressure, close/cancel, the 10k-idle
+  budget, and nonblocking outbound connect. 95 tests pass locally; CI is green on Ubuntu, macOS,
+  Windows, FreeBSD and MSRV 1.85.
 - M2+ HTTP server/client, TLS, HTTP/2 and HTTP/3: design complete, implementation not started.
 
 ## Requirements
