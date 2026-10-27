@@ -25,9 +25,10 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::ERROR_CONNECTION_REFUSED;
 use windows_sys::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, AcceptEx, INVALID_SOCKET, SOCKADDR_STORAGE, SOCKET,
-    SOCKET_ERROR, WSA_IO_PENDING, WSABUF, WSARecv, WSASend, listen,
+    SOCKET_ERROR, WSA_IO_PENDING, WSABUF, WSAECONNREFUSED, WSARecv, WSASend, listen,
 };
 use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_ENTRY};
 
@@ -177,6 +178,22 @@ impl ConnectOp {
 impl Drop for ConnectOp {
     fn drop(&mut self) {
         close_socket(self.socket);
+    }
+}
+
+/// Maps the refusal codes a failed `ConnectEx` can report to `ConnectionRefused`.
+///
+/// The completion layer is inconsistent: `GetOverlappedResult`/`GetLastError`
+/// can surface the Win32 `ERROR_CONNECTION_REFUSED` (1225), while a synchronous
+/// `ConnectEx` failure goes through `WSAGetLastError` and reports
+/// `WSAECONNREFUSED` (10061). Neither code lands on `ConnectionRefused` through
+/// `io::Error`'s Windows mapping on every layer, so both are normalized here.
+fn normalize_connect_error(err: io::Error) -> io::Error {
+    match err.raw_os_error() {
+        Some(code) if code == WSAECONNREFUSED || code == ERROR_CONNECTION_REFUSED as i32 => {
+            io::Error::new(io::ErrorKind::ConnectionRefused, err)
+        }
+        _ => err,
     }
 }
 
@@ -657,7 +674,7 @@ impl<H: Handler> IocpReactor<H> {
                     Ok(_) => Ok(socket),
                     Err(err) => {
                         close_socket(socket);
-                        Err(err)
+                        Err(normalize_connect_error(err))
                     }
                 };
                 self.connect_result = Some((key, result));
@@ -670,7 +687,7 @@ impl<H: Handler> IocpReactor<H> {
                     Ok(_) => self.finish_connect(socket),
                     Err(err) => {
                         close_socket(socket);
-                        Err(err)
+                        Err(normalize_connect_error(err))
                     }
                 };
                 let _ = ack.send(Reply::Connect(reply));
@@ -816,7 +833,7 @@ impl<H: Handler> IocpReactor<H> {
             if err.raw_os_error() != Some(WSA_IO_PENDING) {
                 let socket = op.take_socket();
                 close_socket(socket);
-                return Err(err);
+                return Err(normalize_connect_error(err));
             }
         }
 
@@ -943,7 +960,7 @@ impl<H: Handler> IocpReactor<H> {
             if err.raw_os_error() != Some(WSA_IO_PENDING) {
                 let socket = op.take_socket();
                 close_socket(socket);
-                let _ = ack.send(Reply::Connect(Err(err)));
+                let _ = ack.send(Reply::Connect(Err(normalize_connect_error(err))));
                 return;
             }
         }
@@ -1539,6 +1556,24 @@ mod tests {
         assert_ne!(addr.port(), 0);
         shutdown.shutdown();
         join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn normalizes_wsa_and_win32_connection_refused() {
+        // WSAGetLastError on a synchronous ConnectEx failure.
+        assert_eq!(
+            super::normalize_connect_error(io::Error::from_raw_os_error(10061)).kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+        // GetLastError/GetOverlappedResult on a completed failed operation.
+        assert_eq!(
+            super::normalize_connect_error(io::Error::from_raw_os_error(1225)).kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+        // Unrelated errors keep their original code and kind.
+        let unrelated = super::normalize_connect_error(io::Error::from_raw_os_error(10060));
+        assert_eq!(unrelated.raw_os_error(), Some(10060));
+        assert_ne!(unrelated.kind(), io::ErrorKind::ConnectionRefused);
     }
 
     #[test]
