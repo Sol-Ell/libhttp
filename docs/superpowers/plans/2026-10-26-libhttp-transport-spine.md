@@ -223,11 +223,11 @@ git commit -m "feat(rt): refcounted 16 KiB blocks and bounded pool"
 
 **Interfaces:**
 - Produces:
-  - `pub(crate) struct TimerKey { slot: u32, generation: u32, exchange_seq: u32 }`
+  - `pub(crate) struct TimerKey { slot: u32, generation: u32, exchange_seq: u32, kind: u16 }`
   - `pub(crate) struct TimerToken { key: TimerKey, timer_generation: u32 }`
   - `pub(crate) struct TimerHeap`
   - `TimerHeap::new()`
-  - `TimerHeap::insert(&mut self, key: TimerKey, deadline: Instant, kind: u16) -> TimerToken`
+  - `TimerHeap::insert(&mut self, key: TimerKey, deadline: Instant) -> TimerToken`
   - `TimerHeap::cancel(&mut self, token: TimerToken)`
   - `TimerHeap::next_deadline(&self) -> Option<Instant>`
   - `TimerHeap::pop_expired(&mut self, now: Instant) -> Vec<(u16, TimerToken)>`
@@ -237,16 +237,16 @@ git commit -m "feat(rt): refcounted 16 KiB blocks and bounded pool"
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-fn key(slot: u32) -> TimerKey {
-    TimerKey { slot, generation: 0, exchange_seq: 0 }
+fn key(slot: u32, kind: u16) -> TimerKey {
+    TimerKey { slot, generation: 0, exchange_seq: 0, kind }
 }
 
 #[test]
 fn pops_in_deadline_order() {
     let mut h = TimerHeap::new();
     let base = Instant::now();
-    let later = h.insert(key(1), base + Duration::from_millis(20), 1);
-    let sooner = h.insert(key(2), base + Duration::from_millis(10), 2);
+    let later = h.insert(key(1, 1), base + Duration::from_millis(20));
+    let sooner = h.insert(key(2, 2), base + Duration::from_millis(10));
     let got = h.pop_expired(base + Duration::from_millis(30));
     assert_eq!(got, vec![(2, sooner), (1, later)]);
 }
@@ -254,7 +254,7 @@ fn pops_in_deadline_order() {
 #[test]
 fn cancel_skips_the_entry() {
     let mut h = TimerHeap::new();
-    let t = h.insert(key(7), Instant::now(), 7);
+    let t = h.insert(key(7, 7), Instant::now());
     h.cancel(t);
     assert!(h.pop_expired(Instant::now() + Duration::from_secs(1)).is_empty());
 }
@@ -262,8 +262,8 @@ fn cancel_skips_the_entry() {
 #[test]
 fn timer_reinsert_cancels_previous() {
     let mut h = TimerHeap::new();
-    let old = h.insert(key(7), Instant::now(), 7);
-    let new = h.insert(key(7), Instant::now() + Duration::from_secs(10), 7);
+    let old = h.insert(key(7, 7), Instant::now());
+    let new = h.insert(key(7, 7), Instant::now() + Duration::from_secs(10));
     let got = h.pop_expired(Instant::now() + Duration::from_secs(1));
     assert!(got.is_empty());
     let got = h.pop_expired(Instant::now() + Duration::from_secs(11));
@@ -274,7 +274,7 @@ fn timer_reinsert_cancels_previous() {
 #[test]
 fn stale_timer_generation_is_skipped() {
     let mut h = TimerHeap::new();
-    let t = h.insert(key(7), Instant::now(), 7);
+    let t = h.insert(key(7, 7), Instant::now());
     h.cancel(t);
     let newer = h.insert(key(7), Instant::now(), 7);
     let got = h.pop_expired(Instant::now() + Duration::from_secs(1));
@@ -289,7 +289,7 @@ Expected: FAIL with unresolved `TimerHeap`.
 
 - [ ] **Step 3: Implement the heap**
 
-Use `BinaryHeap<Reverse<TimerEntry>>` plus `HashMap<TimerKey, u32>` of the live `timer_generation` per key. `insert` bumps the timer generation for that key and stores it; `cancel` removes the live generation; `pop_expired` skips entries whose key/timer generation is stale and returns `(kind, token)` in deadline order. `next_deadline` peeks and skips stale entries without popping them.
+Use `BinaryHeap<Reverse<TimerEntry>>` plus `HashMap<TimerKey, u32>` of the live `timer_generation` per key. `kind` is part of `TimerKey`, so header/body/write timers for one exchange coexist. `insert` bumps the timer generation for that key and stores it; `cancel` removes the live generation; `pop_expired` skips entries whose key/timer generation is stale and returns `(kind, token)` in deadline order. `next_deadline` peeks and skips stale entries without popping them.
 
 - [ ] **Step 4: Run tests and checks**
 
