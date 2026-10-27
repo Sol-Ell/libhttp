@@ -39,6 +39,13 @@ pub(crate) struct ReactorCore<H: Handler> {
     pool: Arc<BlockPool>,
     timers: TimerHeap,
     handler: H,
+    /// Connections whose handler carried output that still needs a retry.
+    ///
+    /// A retry only happens when the outbound queue is empty. If that retry
+    /// fails (pool exhausted, or a chunk larger than the cap), no socket event
+    /// will necessarily follow, so the platform loop polls this list every
+    /// loop slice and retries instead of leaving the connection stalled.
+    carry_retries: Vec<ConnId>,
     /// Test-only command/observation channel installed by the harness.
     #[cfg(test)]
     control: Option<Arc<crate::rt::test_support::ControlChannel>>,
@@ -47,14 +54,26 @@ pub(crate) struct ReactorCore<H: Handler> {
 impl<H: Handler> ReactorCore<H> {
     /// Builds a core with an empty slab, an empty timer heap and a fresh pool.
     pub(crate) fn new(handler: H) -> Self {
+        Self::with_pool(handler, BlockPool::new(DEFAULT_POOL_BYTES))
+    }
+
+    /// Builds a core around an existing pool.
+    fn with_pool(handler: H, pool: Arc<BlockPool>) -> Self {
         Self {
             conns: Slab::new(),
-            pool: BlockPool::new(DEFAULT_POOL_BYTES),
+            pool,
             timers: TimerHeap::new(),
             handler,
+            carry_retries: Vec::new(),
             #[cfg(test)]
             control: None,
         }
+    }
+
+    /// Builds a core around a caller-supplied pool, for backpressure tests.
+    #[cfg(test)]
+    pub(crate) fn new_with_pool(handler: H, pool: Arc<BlockPool>) -> Self {
+        Self::with_pool(handler, pool)
     }
 
     /// Installs a test control channel. The harness shares it with the reactor.
@@ -163,6 +182,13 @@ impl<H: Handler> ReactorCore<H> {
             Some(conn) => self.handler.on_read(conn, data),
             None => return Ok(()),
         };
+        // A handler that could not enqueue keeps the chunk in `Conn::carry`.
+        // Schedule a reactor-level retry: clearing read interest (Unix) or not
+        // reposting the recv (IOCP) means no socket event may follow to retry
+        // it from the write path.
+        if result.is_ok() && self.conns.get(id).is_some_and(|conn| conn.has_carry()) {
+            self.queue_carry_retry(id);
+        }
         self.finish(id, result)
     }
 
@@ -176,23 +202,32 @@ impl<H: Handler> ReactorCore<H> {
     /// reads. An explicit pause is never cleared here. This helper performs no
     /// I/O.
     pub(crate) fn on_write_ready(&mut self, id: ConnId) -> io::Result<()> {
-        let Some(conn) = self.conns.get(id) else {
-            return Ok(());
-        };
-        if conn.has_pending_write() {
-            return Ok(());
+        match self.conns.get(id) {
+            Some(conn) if !conn.has_pending_write() => {
+                let _ = self.retry_output(id);
+            }
+            _ => {}
         }
+        Ok(())
+    }
 
-        // The handler may have carried a chunk it could not enqueue. Retry it
-        // now that there is room; a deferred EOF close must not drop it.
+    /// Retries a connection's carried handler output when the queue is empty.
+    ///
+    /// Returns whether the retry queued output the platform must write. A
+    /// carried chunk that still does not fit is re-queued on the retry list;
+    /// the deferred EOF close and backpressure rules are applied here too.
+    fn retry_output(&mut self, id: ConnId) -> bool {
         let retried = match self.conns.get_mut(id) {
             Some(conn) => Some(self.handler.on_output_ready(conn)),
-            None => None,
+            None => {
+                self.dequeue_carry_retry(id);
+                return false;
+            }
         };
         if let Some(Err(err)) = retried {
             // A failed retry is terminal for this connection only.
             let _ = self.finish(id, Err(err));
-            return Ok(());
+            return false;
         }
 
         let (pending, carry, close_after_flush) = match self.conns.get(id) {
@@ -201,20 +236,69 @@ impl<H: Handler> ReactorCore<H> {
                 conn.has_carry(),
                 conn.is_close_after_flush(),
             ),
-            None => return Ok(()),
+            None => return false,
         };
+        if carry {
+            self.queue_carry_retry(id);
+        } else {
+            self.dequeue_carry_retry(id);
+        }
         if close_after_flush {
             if !pending && !carry {
                 self.close(id, "peer-eof");
             }
-            return Ok(());
+            return pending;
         }
         if !pending && !carry {
             if let Some(conn) = self.conns.get_mut(id) {
                 conn.clear_backpressure();
             }
         }
-        Ok(())
+        pending
+    }
+
+    /// Retries every carried chunk that failed its write-path retry.
+    ///
+    /// Platform loops call this once per loop slice (after the poll/completion
+    /// wait). Returns the connections whose retry queued output, in insertion
+    /// order, so the caller can flush it or post its send.
+    pub(crate) fn retry_carry(&mut self) -> Vec<ConnId> {
+        let ids = std::mem::take(&mut self.carry_retries);
+        let mut ready = Vec::new();
+        for id in ids {
+            let (live, pending, carry) = match self.conns.get(id) {
+                Some(conn) => (true, conn.has_pending_write(), conn.has_carry()),
+                None => (false, false, false),
+            };
+            if !live {
+                continue;
+            }
+            if pending {
+                // Already queued; the normal write path retries the carry once
+                // it drains. Keep the id so a failed retry is not forgotten.
+                self.queue_carry_retry(id);
+                continue;
+            }
+            if !carry {
+                continue;
+            }
+            if self.retry_output(id) {
+                ready.push(id);
+            }
+        }
+        ready
+    }
+
+    /// Adds `id` to the carry-retry list, without duplicates.
+    fn queue_carry_retry(&mut self, id: ConnId) {
+        if !self.carry_retries.contains(&id) {
+            self.carry_retries.push(id);
+        }
+    }
+
+    /// Removes `id` from the carry-retry list.
+    fn dequeue_carry_retry(&mut self, id: ConnId) {
+        self.carry_retries.retain(|&queued| queued != id);
     }
 
     /// Handles peer EOF.
@@ -245,6 +329,7 @@ impl<H: Handler> ReactorCore<H> {
             return;
         };
         conn.close();
+        self.dequeue_carry_retry(id);
         #[cfg(test)]
         {
             crate::rt::test_support::note_connection_closed();
@@ -263,6 +348,18 @@ impl<H: Handler> ReactorCore<H> {
                 self.close(id, "handler-error");
                 Err(err)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+impl<H: Handler> Drop for ReactorCore<H> {
+    fn drop(&mut self) {
+        // A dropped core releases its slab without calling `close` for each
+        // entry; keep the process-wide live-connection count truthful so
+        // `wait_for_connections` cannot be fooled by abandoned test cores.
+        for _ in 0..self.conns.len() {
+            crate::rt::test_support::note_connection_closed();
         }
     }
 }
@@ -511,6 +608,40 @@ mod tests {
         core.conn_mut(id).unwrap().resume_read();
         core.on_write_ready(id).unwrap();
         assert!(!core.conn(id).unwrap().is_paused());
+    }
+
+    #[test]
+    fn pooled_carry_is_retried_after_the_pool_frees_a_block() {
+        use crate::rt::block::BLOCK_SIZE;
+        use crate::rt::pool::BlockPool;
+
+        // One block total: the holder keeps it checked out, so the second
+        // connection cannot allocate its echo and has to carry it.
+        let pool = BlockPool::new(BLOCK_SIZE);
+        let mut core = ReactorCore::new_with_pool(EchoHandler, Arc::clone(&pool));
+        let holder = core.insert(Conn::new_for_test_with_pool(64, Arc::clone(&pool)));
+        let blocked = core.insert(Conn::new_for_test_with_pool(64, Arc::clone(&pool)));
+
+        core.on_read_ready(holder, b"held").unwrap();
+        core.on_read_ready(blocked, b"wait").unwrap();
+        assert!(core.conn(blocked).unwrap().is_backpressured());
+        assert!(core.conn(blocked).unwrap().has_carry());
+
+        // A retry while the only block is still checked out makes no progress
+        // but must keep the connection queued for the next loop slice.
+        assert!(core.retry_carry().is_empty());
+        assert!(core.conn(blocked).unwrap().has_carry());
+
+        // Releasing the holder's queue returns the block, so the next retry
+        // can enqueue the carried chunk instead of stalling forever.
+        core.conn_mut(holder).unwrap().take_pending_write();
+        assert_eq!(core.retry_carry(), vec![blocked]);
+        assert_eq!(
+            core.conn_mut(blocked).unwrap().take_pending_write(),
+            Some(b"wait".to_vec())
+        );
+        core.on_write_ready(blocked).unwrap();
+        assert!(!core.conn(blocked).unwrap().is_backpressured());
     }
 
     #[test]

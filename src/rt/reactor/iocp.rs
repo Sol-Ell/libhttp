@@ -287,6 +287,13 @@ pub(crate) struct IocpReactor<H: Handler> {
     /// Test-only command channel installed by the harness.
     #[cfg(test)]
     control: Option<Arc<ControlChannel>>,
+    /// Test-only operations pulled out of `posted` before their cancellation
+    /// completion was dequeued. The box stays alive here.
+    #[cfg(test)]
+    stale_held: HashMap<usize, Posted>,
+    /// Keys in `stale_held` whose kernel completion has been dequeued.
+    #[cfg(test)]
+    stale_completed: std::collections::HashSet<usize>,
 }
 
 impl<H: Handler> IocpReactor<H> {
@@ -303,6 +310,10 @@ impl<H: Handler> IocpReactor<H> {
             stop: false,
             #[cfg(test)]
             control: None,
+            #[cfg(test)]
+            stale_held: HashMap::new(),
+            #[cfg(test)]
+            stale_completed: std::collections::HashSet::new(),
         }
     }
 
@@ -398,6 +409,7 @@ impl<H: Handler> IocpReactor<H> {
                     }
                 }
             }
+            self.post_carried_output();
             self.fire_timers();
         }
         Ok(())
@@ -423,6 +435,16 @@ impl<H: Handler> IocpReactor<H> {
     /// Discards expired timers. M1 has no timer callbacks yet.
     fn fire_timers(&mut self) {
         let _ = self.core.timers_mut().pop_expired(Instant::now());
+    }
+
+    /// Retries carried handler output after a failed write-path retry.
+    ///
+    /// Pausing stops the recv repost, so a pool-exhausted retry would otherwise
+    /// leave no operation to wake the reactor. Called once per loop slice.
+    fn post_carried_output(&mut self) {
+        for id in self.core.retry_carry() {
+            self.post_send(id);
+        }
     }
 
     /// Applies every command the test control handle queued.
@@ -457,10 +479,7 @@ impl<H: Handler> IocpReactor<H> {
                 CommandKind::PendingOps(id) => {
                     Reply::Count(self.conns.get(&id).map_or(0, ConnOps::pending))
                 }
-                CommandKind::CloseNoWait(id) => {
-                    self.begin_close(id);
-                    Reply::Done
-                }
+                CommandKind::CloseNoWait(id) => Reply::Count(self.close_no_wait_and_reuse(id)),
                 CommandKind::MarkReusable(id) => {
                     self.mark_connection_reusable(id);
                     Reply::Done
@@ -509,31 +528,79 @@ impl<H: Handler> IocpReactor<H> {
         self.core.close(id, "test-reuse");
     }
 
-    /// Test-only: wait for the real canceled completions for `id` and route
-    /// them through the normal dispatch path. The generation check must discard
-    /// them.
+    /// Test-only: cancel the posted operations and free the slab slot before
+    /// the command is acknowledged.
     ///
-    /// The operation box may only be freed once the kernel has dequeued its
-    /// completion, so this cannot synthesize a completion; `close_no_wait`
-    /// already called `CancelIoEx`, and the aborted completion follows.
+    /// The operations are moved to [`Self::stale_held`] so their boxes stay
+    /// alive until the kernel completion is dequeued. Because the slot is freed
+    /// before the ACK, the next accept deterministically reuses it. Returns how
+    /// many old operations were still posted when the slot was freed.
+    #[cfg(test)]
+    fn close_no_wait_and_reuse(&mut self, id: ConnId) -> usize {
+        self.begin_close(id);
+        self.mark_connection_reusable(id);
+        let keys: Vec<usize> = self
+            .posted
+            .iter()
+            .filter(|(_, posted)| posted.id() == Some(id))
+            .map(|(key, _)| *key)
+            .collect();
+        let still_posted = keys.len();
+        for key in keys {
+            if let Some(posted) = self.posted.remove(&key) {
+                self.stale_held.insert(key, posted);
+            }
+        }
+        still_posted
+    }
+
+    /// Test-only: deliver the held stale completions for `id` after its slot
+    /// has been reused.
+    ///
+    /// The generation check in [`Self::handle_recv_completion`] must discard
+    /// them. A held operation is only routed once its real completion has been
+    /// dequeued; otherwise dropping the operation box would race the kernel.
     #[cfg(test)]
     fn deliver_stale(&mut self, id: ConnId) {
+        let keys: Vec<usize> = self
+            .stale_held
+            .iter()
+            .filter(|(_, posted)| posted.id() == Some(id))
+            .map(|(key, _)| *key)
+            .collect();
         let mut entries = [OVERLAPPED_ENTRY::default(); MAX_COMPLETIONS];
         let deadline = Instant::now() + DROP_WAIT;
-        while self.posted.values().any(|posted| posted.id() == Some(id))
+        while !keys.iter().all(|key| self.stale_completed.contains(key))
             && Instant::now() < deadline
             && !self.stop
         {
             let count = match self.poller.as_ref() {
                 Some(poller) => match poller.wait(Some(Duration::from_millis(20)), &mut entries) {
                     Ok(count) => count,
-                    Err(_) => return,
+                    Err(_) => break,
                 },
-                None => return,
+                None => break,
             };
             for entry in entries.iter().take(count) {
                 if self.handle_entry(entry).is_err() {
-                    return;
+                    break;
+                }
+            }
+        }
+        for key in keys {
+            // A completion that never arrived stays held; reactor `Drop`
+            // forgets it rather than freeing memory the kernel may still use.
+            if !self.stale_completed.contains(&key) {
+                continue;
+            }
+            if let Some(posted) = self.stale_held.remove(&key) {
+                self.stale_completed.remove(&key);
+                match posted {
+                    Posted::Recv { id, op } => self.handle_recv_completion(id, op),
+                    Posted::Send { id, op } => self.handle_send_completion(id, op),
+                    // Accept/connect operations never carry a connection id to
+                    // the stale path; they cannot be in `stale_held` for `id`.
+                    _ => {}
                 }
             }
         }
@@ -559,6 +626,13 @@ impl<H: Handler> IocpReactor<H> {
         }
 
         let key = entry.lpOverlapped as usize;
+        #[cfg(test)]
+        if self.stale_held.contains_key(&key) {
+            // The kernel is done with this held operation; `deliver_stale` may
+            // now route it through the generation-checked dispatch path.
+            self.stale_completed.insert(key);
+            return Ok(());
+        }
         let Some(posted) = self.posted.remove(&key) else {
             // A canceled operation whose completion was already observed, or a
             // packet from another reactor sharing the process. Nothing is owned
@@ -1398,6 +1472,19 @@ impl<H: Handler> Drop for IocpReactor<H> {
             // boxes is the only memory-safe fallback if it never completes.
             std::mem::forget(std::mem::take(&mut self.posted));
         }
+        #[cfg(test)]
+        {
+            // Same rule for the test-only held operations: a completion that
+            // was never dequeued means the kernel may still touch its box.
+            let completed = std::mem::take(&mut self.stale_completed);
+            for (key, posted) in std::mem::take(&mut self.stale_held) {
+                if completed.contains(&key) {
+                    drop(posted);
+                } else {
+                    std::mem::forget(posted);
+                }
+            }
+        }
         self.conns.clear();
     }
 }
@@ -1512,10 +1599,13 @@ mod tests {
         let first = TcpStream::connect(addr).unwrap();
         assert!(control.wait_for_connections(1, std::time::Duration::from_secs(2)));
         let old = control.first_connection();
-        // Posts CancelIoEx but leaves the completion to be delivered.
-        control.close_no_wait(old);
-        // Test-only: free the slot while the completion is still pending.
-        control.mark_connection_reusable(old);
+        // One reactor command: cancel the posted recv and free the slot before
+        // the ACK, so the stale completion cannot be delivered before reuse.
+        let still_posted = control.close_no_wait(old);
+        assert!(
+            still_posted >= 1,
+            "old operation was delivered before the slot was freed"
+        );
         let mut second = TcpStream::connect(addr).unwrap();
         assert!(control.wait_for_connections(1, std::time::Duration::from_secs(2)));
         let new = control.last_connection();
@@ -1527,6 +1617,28 @@ mod tests {
         second.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"new", "stale completion affected the reused slot");
         drop(first);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn pause_stops_reads_until_resume_iocp() {
+        let (addr, shutdown, join, control) = spawn_echo_with_control();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(&vec![7u8; 64 * 1024]).unwrap();
+        assert!(control.wait_for_read_bytes(1, std::time::Duration::from_secs(2)));
+        control.pause();
+        let paused = control.total_read_bytes();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            control.total_read_bytes(),
+            paused,
+            "IOCP kept delivering reads while paused"
+        );
+        client.write_all(&vec![8u8; 16 * 1024]).unwrap();
+        control.resume();
+        assert!(control.wait_for_read_bytes(paused + 16 * 1024, std::time::Duration::from_secs(2)));
+        drop(client);
         shutdown.shutdown();
         join.join().unwrap().unwrap();
     }

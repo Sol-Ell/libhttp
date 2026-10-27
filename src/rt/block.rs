@@ -42,7 +42,10 @@ impl BlockInner {
             .try_into()
             .expect("allocation is exactly BLOCK_SIZE bytes");
         let storage = NonNull::new(Box::into_raw(storage)).expect("Box::into_raw is never null");
-        Arc::new(Self { storage, origin })
+        let inner = Arc::new(Self { storage, origin });
+        #[cfg(test)]
+        crate::rt::test_support::add_library_bytes(block_allocation_bytes() as isize);
+        inner
     }
 
     fn data(&self) -> *const u8 {
@@ -55,7 +58,18 @@ impl Drop for BlockInner {
         // SAFETY: `storage` was created by `Box::into_raw` in `new`; this is
         // the only place it is reconstructed, and it runs exactly once.
         unsafe { drop(Box::from_raw(self.storage.as_ptr())) };
+        // The allocation is counted from creation, not from the pool's book-
+        // keeping: a block may outlive the pool that produced it, and the
+        // counter must still fall when this last reference drops.
+        #[cfg(test)]
+        crate::rt::test_support::add_library_bytes(-(block_allocation_bytes() as isize));
     }
+}
+
+/// Bytes one block allocation owns: the storage plus its shared header.
+#[cfg(test)]
+fn block_allocation_bytes() -> usize {
+    BLOCK_SIZE + std::mem::size_of::<BlockInner>()
 }
 
 /// A refcounted range into a 16 KiB allocation.

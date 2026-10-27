@@ -369,10 +369,16 @@ impl TestControl {
         self.call(CommandKind::Close(id));
     }
 
-    /// Windows-only: closes and cancels posted operations without waiting.
+    /// Windows-only: cancels posted operations and frees the connection slot
+    /// before returning. Returns how many operations were still posted when the
+    /// slot was freed, so the stale-completion test can assert the race it
+    /// intends to cover.
     #[cfg(windows)]
-    pub(crate) fn close_no_wait(&self, id: ConnId) {
-        self.call(CommandKind::CloseNoWait(id));
+    pub(crate) fn close_no_wait(&self, id: ConnId) -> usize {
+        match self.call(CommandKind::CloseNoWait(id)) {
+            Reply::Count(count) => count,
+            Reply::Done | Reply::Connect(_) => 0,
+        }
     }
 
     /// Windows-only: frees the slab slot while canceled completions are still

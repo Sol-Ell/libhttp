@@ -244,6 +244,7 @@ impl<H: Handler> UnixReactor<H> {
             for event in events.drain(..) {
                 self.dispatch(event)?;
             }
+            self.retry_carried_output()?;
             self.fire_timers();
         }
     }
@@ -298,8 +299,22 @@ impl<H: Handler> UnixReactor<H> {
             for event in events.drain(..) {
                 self.dispatch(event)?;
             }
+            self.retry_carried_output()?;
             self.fire_timers();
         }
+    }
+
+    /// Retries carried handler output that the write path could not place.
+    ///
+    /// A retry after the queue drained may fail because the pool is temporarily
+    /// exhausted; read interest is cleared while backpressured, so without this
+    /// poll no further event would retry it. Called once per loop slice.
+    fn retry_carried_output(&mut self) -> io::Result<()> {
+        for id in self.core.retry_carry() {
+            self.flush_pending(id)?;
+            self.update_interest(id)?;
+        }
+        Ok(())
     }
 
     /// Applies every command the test control handle queued.
@@ -1004,11 +1019,13 @@ mod tests {
     use crate::rt::poller::{Interest, Poller};
     #[cfg(target_os = "linux")]
     use crate::rt::slab::ConnId;
+    #[cfg(unix)]
+    use crate::rt::test_support::spawn_echo_with_control;
     use crate::rt::test_support::{ConnectHandler, spawn_echo, spawn_echo_on};
     #[cfg(target_os = "linux")]
     use crate::rt::test_support::{
-        library_bytes, raise_nofile, spawn_echo_with_backlog, spawn_echo_with_control,
-        spawn_echo_with_control_on, wait_for_connections,
+        library_bytes, raise_nofile, spawn_echo_with_backlog, spawn_echo_with_control_on,
+        wait_for_connections,
     };
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -1165,7 +1182,7 @@ mod tests {
         assert_eq!(desired_interest(&conn), None);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn pause_stops_reads_until_resume() {
         let (addr, shutdown, join, control) = spawn_echo_with_control();
@@ -1188,7 +1205,7 @@ mod tests {
         join.join().unwrap().unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn close_cancels_pending_operation() {
         let (addr, shutdown, join, control) = spawn_echo_with_control();

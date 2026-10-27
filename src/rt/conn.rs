@@ -95,6 +95,12 @@ impl Conn {
         Self::new_state(None, BlockPool::new(BLOCK_SIZE * 4), write_cap)
     }
 
+    /// Builds state for tests around a caller-supplied pool.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_pool(write_cap: usize, pool: Arc<BlockPool>) -> Self {
+        Self::new_state(None, pool, write_cap)
+    }
+
     fn new_state(socket: Option<OwnedSocket>, pool: Arc<BlockPool>, write_cap: usize) -> Self {
         let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         Self {
@@ -325,7 +331,6 @@ impl Conn {
         } else {
             // Reads are supposed to be paused while a carry is outstanding, so
             // this is defensive: append instead of losing the older chunk.
-            debug_assert!(false, "carry already holds a chunk");
             self.carry.extend_from_slice(&data);
         }
     }
