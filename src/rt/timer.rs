@@ -1,22 +1,26 @@
 //! Generation-checked timer heap.
 //!
 //! One heap lives per reactor and is the only timer authority. Entries record
-//! the connection key (`slot`, `generation`, `exchange_seq`) plus a
-//! `timer_generation` that changes on every insert for the same key. A pop or
-//! cancel only acts on entries whose key still maps to the entry's timer
-//! generation, so a reinserted or cancelled timer's stale heap entry is
-//! silently skipped.
+//! the connection key (`slot`, `generation`, `exchange_seq`) and the timer
+//! `kind`, plus a `timer_generation` that changes on every insert for the same
+//! key. A pop or cancel only acts on entries whose key still maps to the
+//! entry's timer generation, so a reinserted or cancelled timer's stale heap
+//! entry is silently skipped. Because `kind` is part of the key, the header,
+//! body and write deadlines of one exchange coexist.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Instant;
 
-/// Identifies the connection (and, from M2, the exchange) a timer belongs to.
+/// Identifies the connection (and, from M2, the exchange) a timer belongs to,
+/// including which deadline (`kind`) it tracks. Separate kinds for the same
+/// exchange are independent timers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TimerKey {
     pub(crate) slot: u32,
     pub(crate) generation: u32,
     pub(crate) exchange_seq: u32,
+    pub(crate) kind: u16,
 }
 
 /// Handle to one inserted timer. Safe to pass around and cancel after it has
@@ -31,7 +35,6 @@ pub(crate) struct TimerToken {
 /// ordering is total and deterministic even when two deadlines are equal.
 struct TimerEntry {
     deadline: Instant,
-    kind: u16,
     token: TimerToken,
 }
 
@@ -61,12 +64,12 @@ impl Ord for TimerEntry {
                     .exchange_seq
                     .cmp(&other.token.key.exchange_seq)
             })
+            .then_with(|| self.token.key.kind.cmp(&other.token.key.kind))
             .then_with(|| {
                 self.token
                     .timer_generation
                     .cmp(&other.token.timer_generation)
             })
-            .then_with(|| self.kind.cmp(&other.kind))
     }
 }
 
@@ -91,18 +94,14 @@ impl TimerHeap {
     /// Inserts a deadline for `key`, replacing any timer currently live for
     /// that exact key. The returned token must be passed to [`Self::cancel`]
     /// to cancel it.
-    pub(crate) fn insert(&mut self, key: TimerKey, deadline: Instant, kind: u16) -> TimerToken {
+    pub(crate) fn insert(&mut self, key: TimerKey, deadline: Instant) -> TimerToken {
         self.next_timer_generation = self.next_timer_generation.wrapping_add(1);
         let token = TimerToken {
             key,
             timer_generation: self.next_timer_generation,
         };
         self.live.insert(key, token.timer_generation);
-        self.heap.push(Reverse(TimerEntry {
-            deadline,
-            kind,
-            token,
-        }));
+        self.heap.push(Reverse(TimerEntry { deadline, token }));
         token
     }
 
@@ -139,7 +138,7 @@ impl TimerHeap {
                 // The timer is no longer pending once it fires; drop its live
                 // marker so fired tokens do not accumulate in the map.
                 self.live.remove(&entry.token.key);
-                expired.push((entry.kind, entry.token));
+                expired.push((entry.token.key.kind, entry.token));
             }
         }
         expired
@@ -155,11 +154,12 @@ mod tests {
     use super::{TimerHeap, TimerKey};
     use std::time::{Duration, Instant};
 
-    fn key(slot: u32) -> TimerKey {
+    fn key(slot: u32, kind: u16) -> TimerKey {
         TimerKey {
             slot,
             generation: 0,
             exchange_seq: 0,
+            kind,
         }
     }
 
@@ -167,8 +167,8 @@ mod tests {
     fn pops_in_deadline_order() {
         let mut h = TimerHeap::new();
         let base = Instant::now();
-        let later = h.insert(key(1), base + Duration::from_millis(20), 1);
-        let sooner = h.insert(key(2), base + Duration::from_millis(10), 2);
+        let later = h.insert(key(1, 1), base + Duration::from_millis(20));
+        let sooner = h.insert(key(2, 2), base + Duration::from_millis(10));
         let got = h.pop_expired(base + Duration::from_millis(30));
         assert_eq!(got, vec![(2, sooner), (1, later)]);
     }
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn cancel_skips_the_entry() {
         let mut h = TimerHeap::new();
-        let t = h.insert(key(7), Instant::now(), 7);
+        let t = h.insert(key(7, 7), Instant::now());
         h.cancel(t);
         assert!(
             h.pop_expired(Instant::now() + Duration::from_secs(1))
@@ -187,8 +187,8 @@ mod tests {
     #[test]
     fn timer_reinsert_cancels_previous() {
         let mut h = TimerHeap::new();
-        let old = h.insert(key(7), Instant::now(), 7);
-        let new = h.insert(key(7), Instant::now() + Duration::from_secs(10), 7);
+        let old = h.insert(key(7, 7), Instant::now());
+        let new = h.insert(key(7, 7), Instant::now() + Duration::from_secs(10));
         let got = h.pop_expired(Instant::now() + Duration::from_secs(1));
         assert!(got.is_empty());
         let got = h.pop_expired(Instant::now() + Duration::from_secs(11));
@@ -199,9 +199,9 @@ mod tests {
     #[test]
     fn stale_timer_generation_is_skipped() {
         let mut h = TimerHeap::new();
-        let t = h.insert(key(7), Instant::now(), 7);
+        let t = h.insert(key(7, 7), Instant::now());
         h.cancel(t);
-        let newer = h.insert(key(7), Instant::now(), 7);
+        let newer = h.insert(key(7, 7), Instant::now());
         let got = h.pop_expired(Instant::now() + Duration::from_secs(1));
         assert_eq!(got, vec![(7, newer)]);
     }
@@ -210,8 +210,8 @@ mod tests {
     fn stale_token_cancel_does_not_cancel_the_reinsert() {
         let mut h = TimerHeap::new();
         let base = Instant::now();
-        let old = h.insert(key(7), base, 7);
-        let new = h.insert(key(7), base + Duration::from_secs(10), 7);
+        let old = h.insert(key(7, 7), base);
+        let new = h.insert(key(7, 7), base + Duration::from_secs(10));
         h.cancel(old);
         let got = h.pop_expired(base + Duration::from_secs(11));
         assert_eq!(got, vec![(7, new)]);
@@ -221,20 +221,41 @@ mod tests {
     fn cancelling_a_fired_token_does_not_cancel_a_newer_timer() {
         let mut h = TimerHeap::new();
         let base = Instant::now();
-        let fired = h.insert(key(7), base, 7);
+        let fired = h.insert(key(7, 7), base);
         assert_eq!(h.pop_expired(base), vec![(7, fired)]);
-        let newer = h.insert(key(7), base + Duration::from_secs(10), 7);
+        let newer = h.insert(key(7, 7), base + Duration::from_secs(10));
         h.cancel(fired);
         let got = h.pop_expired(base + Duration::from_secs(11));
         assert_eq!(got, vec![(7, newer)]);
     }
 
     #[test]
+    fn different_kinds_for_the_same_exchange_coexist() {
+        let mut h = TimerHeap::new();
+        let base = Instant::now();
+        let header = h.insert(key(7, 1), base + Duration::from_millis(10));
+        let body = h.insert(key(7, 2), base + Duration::from_millis(20));
+        let got = h.pop_expired(base + Duration::from_secs(1));
+        assert_eq!(got, vec![(1, header), (2, body)]);
+    }
+
+    #[test]
+    fn cancelling_one_kind_leaves_other_kinds_live() {
+        let mut h = TimerHeap::new();
+        let base = Instant::now();
+        let header = h.insert(key(7, 1), base + Duration::from_millis(10));
+        let body = h.insert(key(7, 2), base + Duration::from_millis(20));
+        h.cancel(header);
+        let got = h.pop_expired(base + Duration::from_secs(1));
+        assert_eq!(got, vec![(2, body)]);
+    }
+
+    #[test]
     fn next_deadline_skips_cancelled_entries_without_popping() {
         let mut h = TimerHeap::new();
         let base = Instant::now();
-        let sooner = h.insert(key(1), base + Duration::from_millis(10), 1);
-        let later = h.insert(key(2), base + Duration::from_millis(20), 2);
+        let sooner = h.insert(key(1, 1), base + Duration::from_millis(10));
+        let later = h.insert(key(2, 2), base + Duration::from_millis(20));
         assert_eq!(h.next_deadline(), Some(base + Duration::from_millis(10)));
         h.cancel(sooner);
         assert_eq!(h.next_deadline(), Some(base + Duration::from_millis(20)));
@@ -250,7 +271,7 @@ mod tests {
     fn next_deadline_is_none_when_nothing_is_live() {
         let mut h = TimerHeap::new();
         assert_eq!(h.next_deadline(), None);
-        let t = h.insert(key(3), Instant::now(), 3);
+        let t = h.insert(key(3, 3), Instant::now());
         h.cancel(t);
         assert_eq!(h.next_deadline(), None);
     }
