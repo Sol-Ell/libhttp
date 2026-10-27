@@ -392,14 +392,15 @@ path, and both move both sides atomically:
   response is never committed.
 - Dropping `DeferredResponse` without `send` runs the terminal fallback if the head is uncommitted
   (custom hook, or default `500`), otherwise resets/closes. Dropping `DeferredRequest` with an unread
-  body abandons it, applies the normal drain/close/reset rule, and may cancel the deferred response.
+  body applies the normal drain/close/reset rule and does not by itself cancel a live
+  `DeferredResponse`; if the response is also gone, the terminal fallback applies.
 - h1 parks that connection until completion (one deferred exchange per h1 connection; no next
   request); h2/h3 keep serving other streams and apply the normal per-stream flow control.
 - `Timeouts::deferred` defaults to 60 s and is measured from the successful defer; `total_request`
   (when set) also applies and the earlier deadline wins. Expiry is `Timeout(Deferred)` and cancels
-  the exchange; the terminal fallback then runs if the head is uncommitted and the peer is reachable.
-  Disconnect is `Canceled` with no fallback response; shutdown cancels deferred exchanges after grace
-  and runs the fallback if a response can still be committed.
+  the exchange; the terminal fallback then runs if the head is uncommitted and the connection's write
+  side is open. Disconnect is `Canceled` with no fallback response; shutdown cancels deferred exchanges
+  after grace and runs the fallback if a response can still be committed.
 - Capacity is a server-wide atomic reservation, not a per-reactor count: `Request::defer` reserves a
   detached slot first, checks the exchange terminal state, then publishes the handles into the owning
   reactor's table. A failed reservation or a terminal exchange returns `Overloaded`/`Canceled` with
@@ -413,19 +414,25 @@ path, and both move both sides atomically:
 **Terminal fallback.** `defer` and `defer_with_fallback` use the same move and capacity rules; on a
 failed defer the fallback closure is dropped and both sides are untouched, so the handler may take
 the synchronous path. On success, a later terminal transition with the head uncommitted and a
-reachable peer runs the fallback exactly once:
+write-side-open peer runs the fallback at most once (once if a worker admits the job; otherwise the
+library emits the default directly):
 
 - The library creates a fresh `Response`, sets the default status (`504` for any timeout, `503` for
   shutdown, `500` for application error/drop/internal), and passes it as `&mut Response` together with
   `&DeferredFailure` to the hook. The hook mutates the response and may copy failure fields; it cannot
   retain either reference. The library commits the response after the hook returns.
-- The hook does not receive the original request body or the tombstoned `Response`. It receives
-  owned request metadata inside `DeferredFailure` (`method`, `target`, `version`, `elapsed`,
-  body-consumed flag) and the reason. It must not block; it runs on a runtime worker, not a reactor.
-- A hook `Err` or panic discards its response and uses the default status/empty body. A failed
-  default commit resets or closes. There is no second fallback and no retry.
-- If the head is already committed or the peer is gone, the hook is not called; the exchange is
-  reset/closed. `Canceled` is never converted into a response for a peer that cannot receive one.
+- The hook does not receive the original request body or the tombstoned `Response`. It borrows
+  `&DeferredFailure`; the struct owns its fields (`method`, `target`, `version`, `elapsed`,
+  body-consumed flag) and is `Send + Sync`, but the reference cannot outlive the call. It must not
+  block; it runs on a runtime worker, not a reactor.
+- A hook `Err` or panic before any response byte is committed discards its response and uses the
+  default status/empty body. If the hook already committed the head or wrote body bytes, the default
+  cannot replace it: reset/close. A failed default commit resets or closes. There is no second
+  fallback and no retry.
+- If the head is already committed or the connection's write side is gone (peer RST, closed socket,
+  or reset h2/h3 stream), the hook is not called; the exchange is reset/closed. A read-side FIN with
+  the write side still open is not "gone": the fallback may still answer. `Canceled` is never
+  converted into a response for a peer that cannot receive one.
 - The hook never re-enters the handler and never makes the deferred handles usable again. It is a
   terminal response path, not replay/resume.
 - A terminal deferred body/send error before the head is committed enters the same fallback; once

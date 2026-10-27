@@ -296,11 +296,13 @@ take a worker parking reservation and never blocks a reactor or library worker.
   for handles and uses `DeferredFailureReason::Shutdown` for the fallback.
 - Shutdown unlinks deferred exchanges after the grace period and marks them terminal. Handles may
   outlive `Server::run`: they hold an `Arc` to the terminal shared state, so blocked reads/writes wake
-  with `Canceled`, `send` returns `Canceled`, and dropping them frees the last reference. Rings and
-  buffers are released at cancellation, not waiting for the handles.
-- Dropping `DeferredResponse` without `send` sends `500` if the head is uncommitted and the connection
-  permits it, otherwise resets/closes. Dropping `DeferredRequest` with an unread body applies the
-  normal drain/reset rule and may cancel the deferred response.
+  with `Canceled`, `send` returns `Canceled`, and dropping them frees the last reference. Request-side
+  rings and buffers are released at cancellation; the connection egress handle/buffer share is held
+  until the fallback commit/reset is resolved, not waiting for the handles.
+- Dropping `DeferredResponse` without `send` runs the terminal fallback if the head is uncommitted
+  (custom hook, or default `500`), otherwise resets/closes. Dropping `DeferredRequest` with an unread
+  body applies the normal drain/reset rule and does not by itself cancel a live `DeferredResponse`;
+  if the response is also gone, the terminal fallback applies.
 - This is per-request opt-in, not automatic migration: a handler already blocked inside a synchronous
   call cannot be detached by the library.
 
@@ -311,18 +313,22 @@ take a worker parking reservation and never blocks a reactor or library worker.
 exchange. `defer` stores no hook and uses the default. If the defer fails, the hook is dropped and
 neither side moves; the handler can continue synchronously.
 
-When a terminal transition wins and the response head is uncommitted and the peer is still reachable:
+When a terminal transition wins and the response head is uncommitted and the connection's write side
+is still open:
 
 1. The transition marks the exchange terminal, wakes blocked handle operations with `Canceled`, and
-   releases rings/blocks at cancellation as usual. The fallback does not revive the handles.
+   releases request-side rings/blocks. It retains a connection egress handle and its buffer share
+   until the fallback response is committed or the connection is reset/closed; the detached slot is
+   released only after that egress is resolved. The fallback does not revive the handles.
 2. A fresh `Response` is created with the default status: `504` for any timeout (`Deferred` or an
    earlier `Total`), `503` for shutdown, `500` for application error/drop/internal.
 3. A fallback job is admitted to the worker pool. The hook receives `&mut Response` and
    `&DeferredFailure`; it may mutate/commit the response and copy failure fields, but cannot retain
-   either reference. The hook runs exactly once.
-4. On `Ok(())` the library finishes the body and commits. On `Err` or panic the response is discarded
-   and the default status with an empty body is used. If even the default cannot be committed, the
-   connection is reset/closed.
+   either reference. The hook runs at most once.
+4. On `Ok(())` the library finishes the body and commits. On `Err` or panic **before any response
+   byte is committed**, the response is discarded and the default status with an empty body is used.
+   If the hook already committed the head or wrote body bytes, the default cannot replace it:
+   reset/close. If even the default cannot be committed, reset/close.
 
 A terminal deferred body/send error before the head is committed enters the same fallback. Once any
 response byte is committed, only reset/close is possible; the hook is not called.
@@ -333,15 +339,21 @@ response byte is committed, only reset/close is possible; the hook is not called
 copy fields, but the reference is scoped to the call. The hook is the observation point; v1 adds no
 separate `on_deferred_failure` observer.
 
-Fallback is not run when the head is committed or the peer is gone; those paths reset/close. It is
-not a second attempt at the handler: no replay, no re-entry, no retry, no fallback-to-synchronous.
-The hook must not block; it runs on a worker and is not preemptible, so a blocking hook holds that
-worker even though the exchange is already terminal. If no worker can admit the fallback job, the
-reactor emits the default response directly (or resets if the protocol state no longer permits it).
+Fallback is not run when the head is committed or the connection's write side is gone (peer RST,
+closed socket, or reset h2/h3 stream); those paths reset/close. A read-side FIN with the write side
+open is not "gone": the fallback may still answer. It is not a second attempt at the handler: no
+replay, no re-entry, no retry, no fallback-to-synchronous. The hook must not block; it runs on a
+worker and is not preemptible, so a blocking hook holds that worker even though the exchange is
+already terminal. If no worker can admit the fallback job, the reactor emits the default response
+directly (or resets if the protocol state no longer permits it).
 
-The same response map applies on every protocol: h1 sends the fallback response then closes; h2/h3
-END_STREAM the fallback response on that stream, and reset the stream if the request body is still
-unread. Other streams are unaffected.
+The same response map applies on every protocol: h1 sends the fallback response, applies the
+normal drain rule (≤64 KiB and ≤100 ms) for an unread request body, then closes. h2/h3 send the
+fallback response with END_STREAM; if the request body is still unread, h2 sends
+`RST_STREAM(NO_ERROR)` after the response and h3 sends
+`RESET_STREAM(H3_REQUEST_CANCELLED)`/`STOP_SENDING(H3_REQUEST_CANCELLED)` after the response. If the
+protocol cannot preserve the response after the reset, reset without a response instead. Other
+streams are unaffected.
 
 ---
 

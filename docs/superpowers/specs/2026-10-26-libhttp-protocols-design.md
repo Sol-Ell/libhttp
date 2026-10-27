@@ -43,13 +43,18 @@ security contracts of the three protocol engines. Engines are sans-I/O; they see
   cancellation. h1 keeps the connection parked; h2/h3 continue other streams. A failed defer
   (capacity/committed head) leaves the synchronous path intact and drops the fallback hook.
 - Terminal fallback is a normal response commit on a terminal exchange. If the response head is
-  uncommitted and the peer is reachable, `defer` emits `504` (timeout), `503` (shutdown) or `500`
-  (application/drop/internal); `defer_with_fallback` lets the hook replace that status/body. h1 sends
-  the fallback response with `Connection: close` and then closes; h2/h3 END_STREAM the response on
-  that stream and reset the stream if the request body is unread, leaving other streams alone. If the
-  head is committed or the peer is gone, there is no fallback response: reset/close. A hook failure
-  falls back to the default status/empty body; there is no second response, retry, or handler
-  re-entry.
+  uncommitted and the connection's write side is open, `defer` emits `504` (timeout), `503`
+  (shutdown) or `500` (application/drop/internal); `defer_with_fallback` lets the hook replace that
+  status/body. h1 sends the fallback response with `Connection: close`, applies the normal drain rule
+  (≤64 KiB and ≤100 ms) for an unread request body, then closes; h2/h3 END_STREAM the response on
+  that stream, then h2 sends `RST_STREAM(NO_ERROR)` and h3 sends
+  `RESET_STREAM(H3_REQUEST_CANCELLED)`/`STOP_SENDING(H3_REQUEST_CANCELLED)` after the response if
+  the request body is still unread. If that reset would discard the fallback response, reset without
+  a response instead. Other streams are unaffected. If the head is committed
+  or the write side is gone (peer RST/closed socket/reset stream), there is no fallback response:
+  reset/close. A read-side FIN with the write side open still permits a fallback. A hook failure
+  before any response byte is committed falls back to the default status/empty body; after a head/body
+  commit it can only reset/close. There is no second response, retry, or handler re-entry.
 
 ---
 
@@ -203,8 +208,10 @@ and framed by the reactor, exactly like a handler-produced response.
   a duplicate typed singleton field is a stream/connection error.
 - Content-length: if present, the sum of DATA must match; mismatch is a stream error. Trailers are a
   final HEADERS with `END_STREAM`, no pseudo-headers.
-- Unread request body: after the response, reset the stream (`RST_STREAM(CANCEL)`, h3
-  `RESET_STREAM`/`STOP_SENDING`) immediately and keep the connection; no drain is attempted.
+- Unread request body: after a non-fallback early final response, reset the stream
+  (`RST_STREAM(CANCEL)`, h3 `RESET_STREAM`/`STOP_SENDING`) immediately and keep the connection; no
+  drain is attempted. A terminal deferred fallback instead uses the NO_ERROR/h3 cancellation form in
+  §1 so the fallback response is not discarded.
 - Client response bodies: stream DATA is pulled by the caller on the `send`/`send_with` thread or by
   the `fetch`/`fetch_with` callback on its worker; dropping a response before EOF resets the stream.
 - 1xx: `100` interim responses are allowed before the final response; the client core consumes them
