@@ -166,9 +166,10 @@ fn split_shares_one_allocation() {
     block.as_mut_slice()[..6].copy_from_slice(b"abcdef");
     let (left, right) = block.split_at(3);
     assert_eq!(left.as_slice(), b"abc");
-    assert_eq!(right.as_slice(), b"def");
+    assert_eq!(right.len(), BLOCK_SIZE - 3);
+    assert_eq!(&right.as_slice()[..3], b"def");
     drop(left);
-    assert_eq!(right.as_slice(), b"def");
+    assert_eq!(&right.as_slice()[..3], b"def");
 }
 
 #[test]
