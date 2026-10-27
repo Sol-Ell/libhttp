@@ -460,6 +460,17 @@ git commit -m "feat(rt): sockets, generation slab and connection state"
 
 ```rust
 #[test]
+fn eof_with_queued_echo_defers_close_until_flush() {
+    let mut core = ReactorCore::new(EchoHandler);
+    let id = core.insert(Conn::new_for_test(64));
+    core.on_read_ready(id, b"hello").unwrap();
+    core.on_eof(id);
+    assert_eq!(core.len(), 1);
+    core.on_write_ready(id).unwrap();
+    assert_eq!(core.len(), 0);
+}
+
+#[test]
 fn echo_handler_writes_back_exactly_the_input() {
     let mut h = EchoHandler;
     let mut c = Conn::new_for_test(64);
@@ -468,10 +479,10 @@ fn echo_handler_writes_back_exactly_the_input() {
 }
 
 #[test]
-fn echo_handler_pauses_when_queue_full() {
+fn echo_handler_errors_when_queue_full() {
     let mut h = EchoHandler;
     let mut c = Conn::new_for_test(4);
-    h.on_read(&mut c, b"hello").unwrap();
+    assert!(h.on_read(&mut c, b"hello").is_err());
     assert!(c.is_paused());
 }
 ```
@@ -483,7 +494,7 @@ Expected: FAIL with unresolved `EchoHandler`.
 
 - [ ] **Step 3: Implement the handler and core loop**
 
-`EchoHandler::on_read` enqueues `data`; if `enqueue` fails because the queue is full, it leaves the conn paused and the reactor will resume after flushing. `ReactorCore` owns the slab, block pool, timer heap and handler; its `on_read_ready`/`on_write_ready` helpers encode the shared close/error/pause rules. Platform reactors own the OS loop and call these helpers. Do not add HTTP.
+`EchoHandler::on_read` enqueues `data`; on `QueueFull`/`PoolExhausted` it returns `io::ErrorKind::WouldBlock`, so `ReactorCore` closes/resets instead of silently truncating (Task 10 replaces this with carry/pause backpressure). `ReactorCore` owns the slab, block pool, timer heap and handler; `on_eof` with queued output sets `close_after_flush` and closes only when the write queue drains; `on_read_ready`/`on_write_ready` encode the shared close/error/pause rules. Platform reactors own the OS loop and call these helpers. Do not add HTTP.
 
 - [ ] **Step 4: Run tests and checks**
 
@@ -552,7 +563,7 @@ fn read_partial_then_eagain() {
 fn write_partial_then_writable() {
     let (addr, shutdown, join) = spawn_echo();
     let mut client = TcpStream::connect(addr).unwrap();
-    let payload = vec![0x5au8; 1 << 20];
+    let payload = vec![0x5au8; 32 * 1024];
     client.write_all(&payload).unwrap();
     let mut echo = vec![0u8; payload.len()];
     client.read_exact(&mut echo).unwrap();
@@ -726,7 +737,7 @@ git commit -m "feat(rt): IOCP reactor for Windows"
 ### Task 10: Backpressure, close/cancel and 10k-idle budget
 
 **Files:**
-- Modify: `src/rt/reactor/mod.rs`, `src/rt/reactor/unix.rs`, `src/rt/reactor/iocp.rs`, `src/rt/conn.rs` (separate `read_paused`, `backpressured`, `closed`; explicit resume does not clear backpressure/closed), `src/rt/test_support.rs` (allocator/counter instrumentation only; harness already exists from Task 7)
+- Modify: `src/rt/reactor/mod.rs`, `src/rt/reactor/unix.rs`, `src/rt/reactor/iocp.rs`, `src/rt/conn.rs` (separate `read_paused`, `backpressured`, `closed`; explicit resume does not clear backpressure/closed; EchoHandler carry/retry so overflow pauses instead of resetting), `src/rt/test_support.rs` (allocator/counter instrumentation only; harness already exists from Task 7)
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
