@@ -190,7 +190,7 @@ are builder discretion; signatures and semantics are the contract.
 | Module | Contents |
 |---|---|
 | `libhttp` | `Runtime`, `RuntimeBuilder`, `RuntimeHandle`, `RuntimeStats`, `Method`, `StatusCode`, `Version`, `HeaderName`, `HeaderValue`, `HeaderRef`, `HeaderMap`, `Header`, `HeaderError`, `Timeouts`, `CancelToken`, `BodyReader`, `BodyWriter`, `BodyChunk`, `Target`, `Uri`, `header`, `Error`, `TimeoutKind`, `ProtocolError`, `ProtocolErrorKind`, `TlsError` |
-| `libhttp::server` | `Server`, `ServerBuilder`, `ServerHandle`, `Handler`, `Request`, `Response`, `DeferredRequest`, `DeferredResponse`, `Limits`, `Stats`, and re-exports of `Timeouts` and the root body types |
+| `libhttp::server` | `Server`, `ServerBuilder`, `ServerHandle`, `Handler`, `Request`, `Response`, `DeferredRequest`, `DeferredResponse`, `DeferredFailure`, `DeferredFailureReason`, `Limits`, `Stats`, and re-exports of `Timeouts` and the root body types |
 | `libhttp::client` | `Client`, `ClientBuilder`, `ClientHandle`, `ClientRequest`, `ClientResponse`, `ClientStats`, `PoolConfig`; uses the root `Timeouts`/`CancelToken` |
 | `libhttp::tls` | `TlsServerConfig`, `TlsClientConfig` (PEM/roots/ALPN/client-auth); rustls types stay internal in v1 |
 
@@ -308,6 +308,32 @@ impl Request {
     /// uncommitted response into Send handles. On error nothing is moved.
     pub fn defer(&mut self, res: &mut Response)
         -> Result<(DeferredRequest, DeferredResponse), Error>;
+    /// Defer with a custom terminal fallback. Same atomic move as `defer`;
+    /// the callback runs once only if the exchange becomes unusable with an
+    /// uncommitted head and a reachable peer.
+    pub fn defer_with_fallback<F>(&mut self, res: &mut Response, fallback: F)
+        -> Result<(DeferredRequest, DeferredResponse), Error>
+    where
+        F: FnOnce(&mut Response, DeferredFailure) -> Result<(), Error>
+            + Send + 'static;
+}
+
+/// Owned terminal-failure context. The fallback hook may retain it.
+pub struct DeferredFailure {
+    pub reason: DeferredFailureReason,
+    pub method: Method,
+    pub target: String,             // raw request target, owned
+    pub version: Version,
+    pub elapsed: Duration,          // since successful defer
+    pub request_body_consumed: bool,
+}
+
+pub enum DeferredFailureReason {
+    Timeout(TimeoutKind),           // includes Timeout(Deferred) and an earlier Total
+    Shutdown,
+    ApplicationError,               // handler returned Err after deferring
+    Dropped,                        // DeferredResponse dropped without send
+    Internal,
 }
 
 impl DeferredRequest {
@@ -345,8 +371,8 @@ impl DeferredResponse {
 `DeferredResponse::send` finishes an in-progress body writer and commits; `send_body` is shorthand,
 and `BodyWriter::finish_with_trailers` is the trailer path. `DeferredRequest` and `DeferredResponse`
 are `Send`, not `Sync`; they can be moved to one application thread (or app executor) and used
-there. `Request::defer` is the only way to enter the
-deferred path, and it moves both sides atomically:
+there. `Request::defer` and `Request::defer_with_fallback` are the only ways to enter the deferred
+path, and both move both sides atomically:
 
 - It fails with `Overloaded` when `max_deferred_exchanges` is reached, leaving both sides untouched;
   the handler can then take the normal synchronous path.
@@ -360,17 +386,19 @@ deferred path, and it moves both sides atomically:
   writes or completes. The deferred path has the same capabilities as the synchronous one: typed and
   raw headers, streaming request and response bodies, trailers, deadlines, cancellation, h1
   keep-alive/ordering and h2/h3 stream multiplexing. It is not a reduced mode.
-- If the handler returns `Err` or panics after deferring, the deferred exchange is cancelled (no
-  tombstone response).
-- Dropping `DeferredResponse` without `send` sends `500` if the head is uncommitted and the connection
-  still permits it, otherwise resets/closes. Dropping `DeferredRequest` with an unread body abandons
-  it, applies the normal drain/close/reset rule, and may cancel the deferred response.
+- If the handler returns `Err` or panics after deferring, the deferred exchange is cancelled and the
+  terminal fallback runs if the head is uncommitted (custom hook, or default `500`); the tombstone
+  response is never committed.
+- Dropping `DeferredResponse` without `send` runs the terminal fallback if the head is uncommitted
+  (custom hook, or default `500`), otherwise resets/closes. Dropping `DeferredRequest` with an unread
+  body abandons it, applies the normal drain/close/reset rule, and may cancel the deferred response.
 - h1 parks that connection until completion (one deferred exchange per h1 connection; no next
   request); h2/h3 keep serving other streams and apply the normal per-stream flow control.
 - `Timeouts::deferred` defaults to 60 s and is measured from the successful defer; `total_request`
   (when set) also applies and the earlier deadline wins. Expiry is `Timeout(Deferred)` and cancels
-  the exchange; disconnect and shutdown are `Canceled`. Shutdown cancels deferred exchanges after
-  grace.
+  the exchange; the terminal fallback then runs if the head is uncommitted and the peer is reachable.
+  Disconnect is `Canceled` with no fallback response; shutdown cancels deferred exchanges after grace
+  and runs the fallback if a response can still be committed.
 - Capacity is a server-wide atomic reservation, not a per-reactor count: `Request::defer` reserves a
   detached slot first, checks the exchange terminal state, then publishes the handles into the owning
   reactor's table. A failed reservation or a terminal exchange returns `Overloaded`/`Canceled` with
@@ -378,8 +406,32 @@ deferred path, and it moves both sides atomically:
   marks it terminal, but the `DeferredRequest`/`DeferredResponse` handles keep a reference to the
   terminal state, so a blocked application read/write wakes with `Canceled` and a later `send` also
   returns `Canceled`. Handles may outlive `Server::run`; they cannot touch freed rings or buffers.
-- This is not automatic fallback: the library cannot take a handler that is already blocked inside a
-  synchronous RPC call. The handler must call `defer` before it blocks.
+- This is not automatic migration to the deferred path: the library cannot take a handler that is
+  already blocked inside a synchronous RPC call. The handler must call `defer` before it blocks.
+
+**Terminal fallback.** `defer` and `defer_with_fallback` use the same move and capacity rules; on a
+failed defer the fallback closure is dropped and both sides are untouched, so the handler may take
+the synchronous path. On success, a later terminal transition with the head uncommitted and a
+reachable peer runs the fallback exactly once:
+
+- The library creates a fresh `Response`, sets the default status (`504` for any timeout, `503` for
+  shutdown, `500` for application error/drop/internal), and passes it as `&mut Response` together with
+  the owned `DeferredFailure` to the hook. The hook mutates the response and may retain the failure;
+  it cannot retain the response. The library commits the response after the hook returns.
+- The hook does not receive the original request body or the tombstoned `Response`. It receives
+  owned request metadata (`method`, `target`, `version`, `elapsed`, body-consumed flag) and the
+  reason. It must not block; it runs on a runtime worker, not a reactor.
+- A hook `Err` or panic discards its response and uses the default status/empty body. A failed
+  default commit resets or closes. There is no second fallback and no retry.
+- If the head is already committed or the peer is gone, the hook is not called; the exchange is
+  reset/closed. `Canceled` is never converted into a response for a peer that cannot receive one.
+- The hook never re-enters the handler and never makes the deferred handles usable again. It is a
+  terminal response path, not replay/resume.
+- A terminal deferred body/send error before the head is committed enters the same fallback; once
+  any response byte is committed, only reset/close is possible.
+- `defer` without a hook still emits the same default statuses; `defer_with_fallback` only adds
+  customization. There is no `FallbackResponse` type and no separate `on_deferred_failure` observer
+  in v1; the fallback hook is the observation point for failures that can still answer.
 
 Contract points settled here (details in execution/protocol documents):
 
@@ -501,7 +553,7 @@ inline.
 Arena bytes are not free-standing: the per-head arena is charged to `max_connection_buffer_bytes` and
 to the server's `max_buffered_bytes`, exactly like body blocks. This covers active workers, detached
 exchanges and trailer maps. If the reservation would exceed the connection or global cap, typed
-decode fails with `431`/a stream error before the handler runs, and `Request::defer` fails with
+decode fails with `431`/a stream error before the handler runs, and both defer entries fail with
 `Overloaded`; there is no arena allocation outside the caps. `max_header_arena_bytes` is a per-head
 ceiling, not a global sum. Client-side response arenas are 64 KiB per in-flight response and are
 bounded by the client pool/stream caps and its request queue.
@@ -631,7 +683,7 @@ runtime is created by `Client::builder()`; a shared one by `Runtime::builder()..
 start lazily on the first server or `fetch`/`fetch_with`; resolvers on the first client. A client-only
 runtime using only blocking verbs has no workers. A server handler should use `fetch`/`fetch_with` and complete a
 `DeferredResponse` from the callback; a blocking `send`/`send_with` is for application threads or
-after `Request::defer`.
+after either defer entry.
 
 Protocol selection is explicit: `http1`, `http2`, `h2c` (prior knowledge), `http3` (opt-in, no
 Alt-Svc/fallback). Pool key is `(scheme, host, port, ALPN)`; no certificate coalescing. h1 opens up
@@ -924,5 +976,11 @@ and the performance gates (§8).
   `try_wait`, or `wait_timeout`. `Runtime` owns reactors/workers/resolver/block/timer pools and a
   separate `max_client_callbacks` budget; `Server`/`Client` are front-ends via
   `rt.server()`/`rt.client()`. Moved the Runtime API to the runtime design and the real-loopback
-  Removed `TimeoutKind::Wait`. No public test harness: tests use the normal API with port 0,
-  `local_addrs`, `ServerHandle::shutdown` and a client on the same runtime.
+  test pattern. Removed `TimeoutKind::Wait`. No public test harness: tests use the normal API with
+  port 0, `local_addrs`, `ServerHandle::shutdown` and a client on the same runtime.
+- **2026-10-27 (deferred terminal fallback):** added `Request::defer_with_fallback` and the owned
+  `DeferredFailure`/`DeferredFailureReason` metadata. The per-request hook receives
+  `(&mut Response, DeferredFailure)`, mutates a library-owned `Response`, and runs once only for a
+  terminal exchange with an uncommitted head and a reachable peer. Defaults are `504` timeout, `503`
+  shutdown, `500` application/drop/internal; committed/peer-gone paths reset/close. No
+  `FallbackResponse` type, no handler replay/resume, no separate `on_deferred_failure` observer.

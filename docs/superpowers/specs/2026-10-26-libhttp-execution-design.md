@@ -42,7 +42,7 @@ An exchange is one request/response pair:
 A handler runs on one worker for the whole exchange. A queued exchange holds **only its head**; its
 body is not read until a worker is assigned, so queue depth does not multiply body buffers.
 
-A **deferred exchange** has been moved out of the worker by `Request::defer`: the reactor holds its
+A **deferred exchange** has been moved out of the worker by either defer entry: the reactor holds its
 exchange state in a bounded detached table, and the `DeferredRequest`/`DeferredResponse` handles are
 owned by an application thread. It is not an executing exchange, does not occupy a worker, and uses
 the same inbound/outbound rings and flow control as a handler-held exchange. Completion or a body
@@ -264,8 +264,9 @@ bounds their count, not their bytes.
 
 ## 9. Deferred completion
 
-`Request::defer(&mut self, &mut Response) -> Result<(DeferredRequest, DeferredResponse), Error>` is
-the only entry to the deferred path. It is atomic and non-blocking:
+`Request::defer(&mut self, &mut Response)` and
+`Request::defer_with_fallback(&mut self, &mut Response, hook)` are the only entries to the deferred
+path. They are atomic and non-blocking; the latter registers a per-request terminal fallback:
 
 1. Reserve a detached slot from the server-wide `max_deferred_exchanges` counter (atomic CAS). Failure
    is `Overloaded`; neither side moves.
@@ -291,7 +292,8 @@ take a worker parking reservation and never blocks a reactor or library worker.
   other streams running under normal flow control and count the detached exchange as open for buffer
   shares.
 - `Timeouts::deferred` defaults to 60 s from the successful defer; an earlier `total_request` wins.
-  Expiry is `Timeout(Deferred)`; disconnect and shutdown are `Canceled`.
+  Expiry is `Timeout(Deferred)`; peer disconnect is `Canceled` with no response; shutdown is terminal
+  for handles and uses `DeferredFailureReason::Shutdown` for the fallback.
 - Shutdown unlinks deferred exchanges after the grace period and marks them terminal. Handles may
   outlive `Server::run`: they hold an `Arc` to the terminal shared state, so blocked reads/writes wake
   with `Canceled`, `send` returns `Canceled`, and dropping them frees the last reference. Rings and
@@ -301,6 +303,44 @@ take a worker parking reservation and never blocks a reactor or library worker.
   normal drain/reset rule and may cancel the deferred response.
 - This is per-request opt-in, not automatic migration: a handler already blocked inside a synchronous
   call cannot be detached by the library.
+
+### 9.1 Terminal fallback
+
+`defer_with_fallback` stores
+`FnOnce(&mut Response, DeferredFailure) -> Result<(), Error> + Send + 'static` in the detached
+exchange. `defer` stores no hook and uses the default. If the defer fails, the hook is dropped and
+neither side moves; the handler can continue synchronously.
+
+When a terminal transition wins and the response head is uncommitted and the peer is still reachable:
+
+1. The transition marks the exchange terminal, wakes blocked handle operations with `Canceled`, and
+   releases rings/blocks at cancellation as usual. The fallback does not revive the handles.
+2. A fresh `Response` is created with the default status: `504` for any timeout (`Deferred` or an
+   earlier `Total`), `503` for shutdown, `500` for application error/drop/internal.
+3. A fallback job is admitted to the worker pool. The hook receives `&mut Response` and the **owned**
+   `DeferredFailure`; it may mutate/commit the response and may retain the failure metadata. It
+   cannot retain the response. The hook runs exactly once.
+4. On `Ok(())` the library finishes the body and commits. On `Err` or panic the response is discarded
+   and the default status with an empty body is used. If even the default cannot be committed, the
+   connection is reset/closed.
+
+A terminal deferred body/send error before the head is committed enters the same fallback. Once any
+response byte is committed, only reset/close is possible; the hook is not called.
+
+`DeferredFailure` is owned and `Send + Sync`: `reason` (`Timeout(TimeoutKind)`, `Shutdown`,
+`ApplicationError`, `Dropped`, `Internal`), `method`, owned raw `target`, `version`, `elapsed` from
+the defer, and `request_body_consumed`. It contains no headers or body, so it is safe to log and
+retain. The hook is the observation point; v1 adds no separate `on_deferred_failure` observer.
+
+Fallback is not run when the head is committed or the peer is gone; those paths reset/close. It is
+not a second attempt at the handler: no replay, no re-entry, no retry, no fallback-to-synchronous.
+The hook must not block; it runs on a worker and is not preemptible, so a blocking hook holds that
+worker even though the exchange is already terminal. If no worker can admit the fallback job, the
+reactor emits the default response directly (or resets if the protocol state no longer permits it).
+
+The same response map applies on every protocol: h1 sends the fallback response then closes; h2/h3
+END_STREAM the fallback response on that stream, and reset the stream if the request body is still
+unread. Other streams are unaffected.
 
 ---
 

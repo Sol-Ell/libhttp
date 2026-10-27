@@ -27,8 +27,10 @@ runtime, not a hidden per-component pool.
 The same reactor hosts server and client connections; role and protocol live on the connection.
 Client `send`/`send_with` block the calling thread and consume no reactor or library worker of their
 own. `fetch`/`fetch_with` return after enqueue and use a runtime worker only for the upload/callback
-job. If a blocking verb is called on a handler worker, that worker is blocked; the documented
-`Request::defer` pattern frees it and does the blocking call on the application thread.
+job. Deferred terminal fallback hooks also run as worker jobs (never on a reactor); if no worker can
+admit the job, the reactor emits the default response or resets. If a blocking verb is called on a
+handler worker, that worker is blocked; the documented defer pattern frees it and does the blocking
+call on a thread owned by the application.
 
 ## Runtime public API
 

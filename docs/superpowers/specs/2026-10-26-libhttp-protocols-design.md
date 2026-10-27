@@ -37,10 +37,19 @@ security contracts of the three protocol engines. Engines are sans-I/O; they see
   exception is an application `encode` panic on a deferred application thread, which the library
   cannot catch (that thread unwinds and the deferred drop rule applies).
 - The same `Handler` may opt into deferred completion with
-  `Request::defer(&mut self, &mut Response) -> Result<(DeferredRequest, DeferredResponse), Error>`. The move is
-  atomic; the deferred handles support typed/raw headers, streaming request and response bodies,
-  trailers, deadlines and cancellation. h1 keeps the connection parked; h2/h3 continue other streams.
-  A failed defer (capacity/committed head) leaves the synchronous path intact.
+  `Request::defer(&mut self, &mut Response)` or
+  `Request::defer_with_fallback(&mut self, &mut Response, hook)`. The move is atomic; the deferred
+  handles support typed/raw headers, streaming request and response bodies, trailers, deadlines and
+  cancellation. h1 keeps the connection parked; h2/h3 continue other streams. A failed defer
+  (capacity/committed head) leaves the synchronous path intact and drops the fallback hook.
+- Terminal fallback is a normal response commit on a terminal exchange. If the response head is
+  uncommitted and the peer is reachable, `defer` emits `504` (timeout), `503` (shutdown) or `500`
+  (application/drop/internal); `defer_with_fallback` lets the hook replace that status/body. h1 sends
+  the fallback response with `Connection: close` and then closes; h2/h3 END_STREAM the response on
+  that stream and reset the stream if the request body is unread, leaving other streams alone. If the
+  head is committed or the peer is gone, there is no fallback response: reset/close. A hook failure
+  falls back to the default status/empty body; there is no second response, retry, or handler
+  re-entry.
 
 ---
 
