@@ -1,1 +1,667 @@
+//! Linux readiness reactor: edge-triggered epoll, accept/read/write/close.
+//!
+//! The reactor owns a [`ReactorCore`] (slab, pool, timers, handler) and an
+//! [`EpollPoller`]. Its loop performs every socket syscall on the owning
+//! thread and then hands the shared lifecycle decisions to the core:
+//!
+//! - readable: drain the socket to `EAGAIN`, passing each chunk to the
+//!   handler; `0` bytes is peer EOF;
+//! - writable: gather queued blocks into `writev`, then record the written
+//!   prefix with [`Conn::consume_written`] so a partial write keeps both its
+//!   remainder and write interest;
+//! - a drained queue calls [`ReactorCore::on_write_ready`] immediately, which
+//!   completes a deferred EOF close even without a new readiness edge;
+//! - any handler error (including an echo `WouldBlock` overflow) is terminal
+//!   for that connection only; the loop continues serving the others.
+//!
+//! Readiness is edge-triggered, so a read is never retried without a new edge,
+//! and only one interest set is registered per connection at a time.
 
+#![cfg(target_os = "linux")]
+
+use std::collections::HashMap;
+use std::io::{self, Read};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::rt::block::BLOCK_SIZE;
+use crate::rt::conn::Conn;
+#[cfg(test)]
+use crate::rt::handler::EchoHandler;
+use crate::rt::handler::Handler;
+use crate::rt::poller::epoll::EpollPoller;
+use crate::rt::poller::{Interest, PollEvent, Poller};
+use crate::rt::reactor::ReactorCore;
+use crate::rt::slab::ConnId;
+use crate::rt::socket::OwnedSocket;
+#[cfg(test)]
+use crate::rt::test_support::Shutdown;
+use crate::rt::wake::Wake;
+
+/// Per-connection outbound cap. The echo handler reports `WouldBlock` beyond
+/// it, which Task 10 replaces with carry/pause backpressure.
+const WRITE_CAP: usize = BLOCK_SIZE * 16;
+
+/// Sentinel id for the listening socket; the slab cannot produce this slot.
+const LISTEN_ID: ConnId = ConnId {
+    slot: u32::MAX - 1,
+    generation: u32::MAX,
+};
+
+/// Sentinel id for the shutdown wake descriptor.
+const WAKE_ID: ConnId = ConnId {
+    slot: u32::MAX,
+    generation: u32::MAX,
+};
+
+/// Upper bound on one `epoll_wait`, short enough for shutdown responsiveness.
+const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// Blocks gathered into one `writev` call.
+const MAX_IOVECS: usize = 64;
+
+/// The poller interest that matches a connection's current permission.
+///
+/// A partial write leaves `has_pending_write()` true, so the result keeps
+/// write interest armed until the retained remainder is gone.
+fn desired_interest(conn: &Conn) -> Option<Interest> {
+    match (conn.is_paused(), conn.has_pending_write()) {
+        // Reading is paused but output still needs to flush.
+        (true, true) => Some(Interest::Write),
+        // Reading is paused and the queue is empty: remove interest entirely
+        // until an explicit resume.
+        (true, false) => None,
+        (false, true) => Some(Interest::Both),
+        (false, false) => Some(Interest::Read),
+    }
+}
+
+/// Readiness reactor for Linux.
+pub(crate) struct UnixReactor<H: Handler> {
+    core: ReactorCore<H>,
+    /// Created lazily so `new` cannot fail; `listen`, `connect` and
+    /// `run_until` all establish it before registering anything.
+    poller: Option<EpollPoller>,
+    listener: Option<TcpListener>,
+    /// The interest currently registered for each id. `None` means the id was
+    /// removed while paused; a later resume re-adds it.
+    registrations: HashMap<ConnId, Interest>,
+}
+
+impl<H: Handler> UnixReactor<H> {
+    /// Builds a reactor with an empty slab, pool, timer heap and poller.
+    pub(crate) fn new(handler: H) -> Self {
+        Self {
+            core: ReactorCore::new(handler),
+            poller: None,
+            listener: None,
+            registrations: HashMap::new(),
+        }
+    }
+
+    /// Binds a nonblocking listener to `addr` and registers it for accepting.
+    pub(crate) fn listen(&mut self, addr: &str) -> io::Result<()> {
+        if self.listener.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "reactor already has a listener",
+            ));
+        }
+
+        let listener = TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        let fd = listener.as_raw_fd();
+        self.register(LISTEN_ID, fd, Interest::Read)?;
+        self.listener = Some(listener);
+        Ok(())
+    }
+
+    /// Opens an outbound connection and reports it to the handler.
+    ///
+    /// M1 has one connection established before the loop runs; the
+    /// nonblocking `connect` path arrives with the client surface in Task 11.
+    pub(crate) fn connect(&mut self, addr: &str) -> io::Result<ConnId> {
+        let stream = TcpStream::connect(addr)?;
+        let socket = OwnedSocket::new(stream)?;
+        let conn = Conn::new(socket, Arc::clone(self.core.pool()), WRITE_CAP)?;
+        let id = self.core.insert(conn);
+
+        let fd = self
+            .conn_fd(id)
+            .expect("connection was just inserted into the slab");
+        if let Err(err) = self.register(id, fd, Interest::Read) {
+            self.core.close(id);
+            return Err(err);
+        }
+
+        if let Err(err) = self.core.on_connect(id) {
+            // The core already reported the close; the socket is gone, so the
+            // kernel dropped the registration with it.
+            self.registrations.remove(&id);
+            return Err(err);
+        }
+
+        self.update_interest(id)?;
+        Ok(id)
+    }
+
+    /// The bound listener address.
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        match &self.listener {
+            Some(listener) => listener.local_addr(),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "reactor is not listening",
+            )),
+        }
+    }
+
+    /// Runs the readiness loop until `shutdown` is signalled.
+    ///
+    /// The wake descriptor is edge-triggered and intentionally left readable:
+    /// this reactor is single-use, and dropping it closes every connection.
+    pub(crate) fn run_until(&mut self, shutdown: &Wake) -> io::Result<()> {
+        let wake_fd = shutdown.raw_fd();
+        self.register(WAKE_ID, wake_fd, Interest::Read)?;
+
+        let mut events = Vec::with_capacity(64);
+        loop {
+            let timeout = self.poll_timeout();
+            self.poller_mut()?.wait(Some(timeout), &mut events)?;
+
+            if events.iter().any(|event| event.id == WAKE_ID) {
+                return Ok(());
+            }
+
+            for event in events.drain(..) {
+                self.dispatch(event)?;
+            }
+            self.fire_timers();
+        }
+    }
+
+    /// Returns the poller, creating it on first use.
+    fn poller_mut(&mut self) -> io::Result<&mut EpollPoller> {
+        if self.poller.is_none() {
+            self.poller = Some(EpollPoller::new()?);
+        }
+        Ok(self.poller.as_mut().expect("poller was just initialized"))
+    }
+
+    /// The socket descriptor for a live connection.
+    fn conn_fd(&self, id: ConnId) -> Option<RawFd> {
+        self.core.conn(id).map(|conn| conn.socket().as_raw_fd())
+    }
+
+    /// Registers `fd` under `id` unless an interest is already recorded.
+    fn register(&mut self, id: ConnId, fd: RawFd, interest: Interest) -> io::Result<()> {
+        if self.registrations.contains_key(&id) {
+            return Ok(());
+        }
+        self.poller_mut()?.add(fd, id, interest)?;
+        self.registrations.insert(id, interest);
+        Ok(())
+    }
+
+    /// Time until the next timer, capped at [`MAX_WAIT`].
+    fn poll_timeout(&self) -> Duration {
+        let now = Instant::now();
+        match self.core.timers().next_deadline() {
+            Some(deadline) => deadline.saturating_duration_since(now).min(MAX_WAIT),
+            None => MAX_WAIT,
+        }
+    }
+
+    /// Discards expired timers. M1 has no timer callbacks yet.
+    fn fire_timers(&mut self) {
+        let _ = self.core.timers_mut().pop_expired(Instant::now());
+    }
+
+    /// Applies one readiness notification.
+    fn dispatch(&mut self, event: PollEvent) -> io::Result<()> {
+        let id = event.id;
+        if id == WAKE_ID {
+            return Ok(());
+        }
+        if id == LISTEN_ID {
+            return self.accept_ready();
+        }
+
+        if event.error.is_some() {
+            // Terminal at the readiness layer: retrying the socket would only
+            // surface the same error, so close without another syscall.
+            self.close_conn(id);
+            return Ok(());
+        }
+
+        if event.readable {
+            self.handle_readable(id)?;
+        }
+        if event.writable && self.core.conn(id).is_some() {
+            self.flush_pending(id)?;
+        }
+        self.update_interest(id)?;
+        Ok(())
+    }
+
+    /// Accepts every connection queued on the listener, then re-arms.
+    fn accept_ready(&mut self) -> io::Result<()> {
+        loop {
+            let accepted = match self.listener.as_ref() {
+                Some(listener) => listener.accept(),
+                None => return Ok(()),
+            };
+            let (stream, _peer) = match accepted {
+                Ok(pair) => pair,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+
+            let socket = match OwnedSocket::new(stream) {
+                Ok(socket) => socket,
+                Err(_) => continue,
+            };
+            let conn = match Conn::new(socket, Arc::clone(self.core.pool()), WRITE_CAP) {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            let id = self.core.insert(conn);
+
+            let fd = self
+                .conn_fd(id)
+                .expect("connection was just inserted into the slab");
+            self.register(id, fd, Interest::Read)?;
+
+            // A handler accept failure is terminal for this connection only:
+            // the core has closed it and bumped the slot generation.
+            if self.core.on_accept(id).is_err() {
+                self.registrations.remove(&id);
+                continue;
+            }
+            self.update_interest(id)?;
+        }
+    }
+
+    /// Drains a readable connection until `EAGAIN`, echoing as it goes.
+    fn handle_readable(&mut self, id: ConnId) -> io::Result<()> {
+        let mut buf = [0u8; BLOCK_SIZE];
+
+        loop {
+            let read = {
+                let Some(conn) = self.core.conn_mut(id) else {
+                    return Ok(());
+                };
+                if conn.is_paused() {
+                    return Ok(());
+                }
+                conn.socket_mut().read(&mut buf)
+            };
+
+            match read {
+                Ok(0) => {
+                    // Peer EOF: close now, or after the queued echo flushes.
+                    self.core.on_eof(id);
+                    self.flush_pending(id)?;
+                    return Ok(());
+                }
+                Ok(n) => {
+                    if self.core.on_read_ready(id, &buf[..n]).is_err() {
+                        // Handler failure (echo overflow included) is fatal
+                        // for this connection; nothing is retried.
+                        return Ok(());
+                    }
+                    self.flush_pending(id)?;
+                    if self.core.conn(id).is_none_or(|conn| conn.is_paused()) {
+                        return Ok(());
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.close_conn(id);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Writes queued blocks until the socket would block or the queue drains.
+    ///
+    /// A partial write is recorded in [`Conn`] so the unwritten remainder stays
+    /// queued; only a fully drained queue calls
+    /// [`ReactorCore::on_write_ready`], which may complete a deferred close.
+    fn flush_pending(&mut self, id: ConnId) -> io::Result<()> {
+        loop {
+            let has_pending = self
+                .core
+                .conn(id)
+                .is_some_and(|conn| conn.has_pending_write());
+            if !has_pending {
+                // The queue is empty, including on entry: this is the point
+                // where a deferred EOF close runs and paused reads resume.
+                self.core.on_write_ready(id)?;
+                return Ok(());
+            }
+
+            let mut iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; MAX_IOVECS];
+            let (fd, iovec_len, batch_len) = {
+                let conn = self
+                    .core
+                    .conn(id)
+                    .expect("pending write implies a live connection");
+                let fd = conn.socket().as_raw_fd();
+                let mut iovec_len = 0;
+                let mut batch_len = 0;
+                for block in conn.pending_blocks() {
+                    if iovec_len == MAX_IOVECS {
+                        break;
+                    }
+                    iovecs[iovec_len] = libc::iovec {
+                        iov_base: block.as_slice().as_ptr().cast_mut().cast(),
+                        iov_len: block.len(),
+                    };
+                    iovec_len += 1;
+                    batch_len += block.len();
+                }
+                (fd, iovec_len, batch_len)
+            };
+            debug_assert!(iovec_len > 0, "pending bytes imply a non-empty block");
+
+            // SAFETY: every iovec points at a live, disjoint block range owned
+            // by the connection, and the queue is not mutated between building
+            // the vectors and this call, so the pointers stay valid. `writev`
+            // only reads the memory, `fd` is the connection's live socket, and
+            // `iovec_len` is within the initialized prefix of `iovecs`.
+            let written = unsafe { libc::writev(fd, iovecs.as_ptr(), iovec_len as libc::c_int) };
+            if written < 0 {
+                let err = io::Error::last_os_error();
+                match err.kind() {
+                    io::ErrorKind::WouldBlock => return Ok(()),
+                    io::ErrorKind::Interrupted => continue,
+                    _ => {
+                        self.close_conn(id);
+                        return Ok(());
+                    }
+                }
+            }
+
+            let written = written as usize;
+            if written == 0 {
+                // No progress; wait for the next writable edge instead of
+                // spinning on a ready-looking socket.
+                return Ok(());
+            }
+
+            let drained = match self.core.conn_mut(id) {
+                Some(conn) => {
+                    conn.consume_written(written);
+                    !conn.has_pending_write()
+                }
+                None => return Ok(()),
+            };
+
+            if drained {
+                self.core.on_write_ready(id)?;
+                return Ok(());
+            }
+            if written < batch_len {
+                // Partial write: the remainder stays queued and write interest
+                // stays armed until the next writable edge.
+                return Ok(());
+            }
+            // The whole gathered batch went out; loop for any blocks beyond
+            // MAX_IOVECS.
+        }
+    }
+
+    /// Closes a connection after clearing its poller interest.
+    fn close_conn(&mut self, id: ConnId) {
+        if let Some(fd) = self.conn_fd(id) {
+            if self.registrations.remove(&id).is_some() {
+                if let Some(poller) = self.poller.as_mut() {
+                    // The socket is about to close, so a kernel-side removal
+                    // (EBADF/ENOENT) is not actionable.
+                    let _ = poller.remove(fd);
+                }
+            }
+        } else {
+            self.registrations.remove(&id);
+        }
+        self.core.close(id);
+    }
+
+    /// Reconciles the registered interest with the connection's state.
+    fn update_interest(&mut self, id: ConnId) -> io::Result<()> {
+        let desired = match self.core.conn(id) {
+            Some(conn) => desired_interest(conn),
+            None => {
+                self.registrations.remove(&id);
+                return Ok(());
+            }
+        };
+
+        let current = self.registrations.get(&id).copied();
+        if current == desired {
+            return Ok(());
+        }
+
+        let fd = match self.conn_fd(id) {
+            Some(fd) => fd,
+            None => {
+                self.registrations.remove(&id);
+                return Ok(());
+            }
+        };
+
+        match (current, desired) {
+            (None, Some(interest)) => {
+                self.poller_mut()?.add(fd, id, interest)?;
+                self.registrations.insert(id, interest);
+            }
+            (Some(_), None) => {
+                self.registrations.remove(&id);
+                if let Some(poller) = self.poller.as_mut() {
+                    let _ = poller.remove(fd);
+                }
+            }
+            (Some(_), Some(interest)) => {
+                self.poller_mut()?.modify(fd, id, interest)?;
+                self.registrations.insert(id, interest);
+            }
+            (None, None) => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<H: Handler + Send + 'static> UnixReactor<H> {
+    /// Binds `addr`, then moves the reactor onto a background thread.
+    ///
+    /// The returned [`Shutdown`] wakes the loop; the join handle carries the
+    /// loop's result.
+    pub(crate) fn spawn_for_test_on(
+        mut self,
+        addr: &str,
+    ) -> io::Result<(
+        SocketAddr,
+        Shutdown,
+        std::thread::JoinHandle<io::Result<()>>,
+    )> {
+        self.listen(addr)?;
+        let local = self.local_addr()?;
+        let wake = Arc::new(Wake::new()?);
+        let shutdown = Shutdown::new(Arc::clone(&wake));
+        let join = std::thread::spawn(move || self.run_until(&wake));
+        Ok((local, shutdown, join))
+    }
+}
+
+#[cfg(test)]
+impl UnixReactor<EchoHandler> {
+    /// Starts an echo reactor on an ephemeral loopback port.
+    pub(crate) fn spawn_for_test() -> (
+        SocketAddr,
+        Shutdown,
+        std::thread::JoinHandle<io::Result<()>>,
+    ) {
+        Self::new(EchoHandler)
+            .spawn_for_test_on("127.0.0.1:0")
+            .expect("bind loopback echo listener")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::desired_interest;
+    use crate::rt::poller::epoll::EpollPoller;
+    use crate::rt::poller::{Interest, Poller};
+    use crate::rt::slab::ConnId;
+    use crate::rt::test_support::{spawn_echo, spawn_echo_on};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn echo_over_loopback() {
+        let (addr, shutdown, join) = spawn_echo();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(b"hello").unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_partial_then_eagain() {
+        let (addr, shutdown, join) = spawn_echo();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(b"abc").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        client.write_all(b"de").unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abcde");
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_partial_then_writable() {
+        let (addr, shutdown, join) = spawn_echo();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let payload = vec![0x5au8; 32 * 1024];
+        client.write_all(&payload).unwrap();
+        let mut echo = vec![0u8; payload.len()];
+        client.read_exact(&mut echo).unwrap();
+        assert_eq!(echo, payload);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spurious_read_event_is_harmless() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let mut poller = EpollPoller::new().unwrap();
+        poller
+            .add(
+                a.as_raw_fd(),
+                ConnId {
+                    slot: 0,
+                    generation: 0,
+                },
+                Interest::Read,
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        poller
+            .wait(Some(Duration::from_millis(5)), &mut events)
+            .unwrap();
+        assert!(events.is_empty());
+        b.write_all(b"x").unwrap();
+        poller
+            .wait(Some(Duration::from_millis(100)), &mut events)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let mut buf = [0u8; 1];
+        assert_eq!(a.read(&mut buf).unwrap(), 1);
+        poller
+            .wait(Some(Duration::from_millis(5)), &mut events)
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_with_pending_read() {
+        let (addr, shutdown, join) = spawn_echo();
+        let mut first = TcpStream::connect(addr).unwrap();
+        first.set_nonblocking(true).unwrap();
+        first.write_all(b"x").unwrap();
+        drop(first);
+        let mut second = TcpStream::connect(addr).unwrap();
+        second.write_all(b"ok").unwrap();
+        let mut buf = [0u8; 2];
+        second.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ok");
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_echo_on_binds_the_requested_loopback_address() {
+        let (addr, shutdown, join) = spawn_echo_on("127.0.0.1:0").unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0);
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partial_write_keeps_write_interest_armed() {
+        use crate::rt::block::BLOCK_SIZE;
+        use crate::rt::conn::Conn;
+
+        let mut conn = Conn::new_for_test(BLOCK_SIZE * 2);
+        conn.enqueue(b"abc").unwrap();
+        assert_eq!(desired_interest(&conn), Some(Interest::Both));
+
+        conn.consume_written(2);
+        assert!(conn.has_pending_write(), "a partial write retains the tail");
+        assert_eq!(
+            desired_interest(&conn),
+            Some(Interest::Both),
+            "EPOLLOUT must stay armed while the remainder is queued"
+        );
+
+        conn.consume_written(1);
+        assert_eq!(desired_interest(&conn), Some(Interest::Read));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paused_with_a_drained_queue_drops_interest() {
+        use crate::rt::conn::Conn;
+
+        let mut conn = Conn::new_for_test(64);
+        conn.pause_read();
+        assert_eq!(desired_interest(&conn), None);
+    }
+}

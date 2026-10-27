@@ -195,6 +195,59 @@ impl Conn {
         Some(bytes)
     }
 
+    /// The queued outbound blocks, in the order they must be written.
+    ///
+    /// The reactor gathers these ranges into `writev` without copying. It must
+    /// not hold the returned borrow across a call that can mutate the queue.
+    pub(crate) fn pending_blocks(&self) -> &VecDeque<Block> {
+        &self.pending_write
+    }
+
+    /// Records that the first `n` queued bytes were written to the socket.
+    ///
+    /// A partial block is split so only the written prefix is released; the
+    /// unwritten tail stays at the front of the queue. `pending_bytes` shrinks
+    /// by exactly `n`, and [`Self::has_pending_write`] stays true while any
+    /// tail remains.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` exceeds the number of queued bytes. The reactor derives
+    /// `n` from the `writev` return value, so a larger value is a bug.
+    pub(crate) fn consume_written(&mut self, n: usize) {
+        assert!(
+            n <= self.pending_bytes,
+            "consume_written({n}) exceeds {} queued bytes",
+            self.pending_bytes
+        );
+        if n == 0 {
+            return;
+        }
+
+        let mut remaining = n;
+        while remaining > 0 {
+            let front = self
+                .pending_write
+                .front_mut()
+                .expect("queued bytes but no block");
+            let len = front.len();
+            if remaining >= len {
+                remaining -= len;
+                self.pending_write.pop_front();
+            } else {
+                let block = self
+                    .pending_write
+                    .pop_front()
+                    .expect("front block was just observed");
+                let (written, tail) = block.split_at(remaining);
+                drop(written);
+                self.pending_write.push_front(tail);
+                remaining = 0;
+            }
+        }
+        self.pending_bytes -= n;
+    }
+
     /// Whether any outbound bytes are queued.
     pub(crate) fn has_pending_write(&self) -> bool {
         self.pending_bytes != 0
@@ -340,6 +393,71 @@ mod tests {
 
         assert!(c.is_close_after_flush());
         assert!(!c.is_closed(), "the connection must stay open to flush");
+    }
+
+    #[test]
+    fn pending_blocks_expose_the_queue_in_fifo_order() {
+        let mut c = Conn::new_for_test(BLOCK_SIZE * 2);
+        c.enqueue(b"abc").unwrap();
+        c.enqueue(b"def").unwrap();
+
+        let blocks: Vec<&[u8]> = c.pending_blocks().iter().map(Block::as_slice).collect();
+        assert_eq!(blocks, vec![&b"abc"[..], &b"def"[..]]);
+        assert_eq!(c.pending_bytes, 6);
+    }
+
+    #[test]
+    fn consume_written_retains_the_unwritten_tail() {
+        let mut c = Conn::new_for_test(BLOCK_SIZE * 2);
+        c.enqueue(b"abcdefghij").unwrap();
+
+        c.consume_written(4);
+
+        assert_eq!(c.pending_bytes, 6);
+        assert!(c.has_pending_write());
+        assert_eq!(c.pending_blocks().len(), 1);
+        assert_eq!(c.pending_blocks()[0].as_slice(), b"efghij");
+        assert_eq!(c.take_pending_write(), Some(b"efghij".to_vec()));
+        assert!(!c.has_pending_write());
+    }
+
+    #[test]
+    fn consume_written_spans_blocks_and_updates_accounting() {
+        let mut c = Conn::new_for_test(BLOCK_SIZE * 2);
+        let data: Vec<u8> = (0..BLOCK_SIZE + 5).map(|i| i as u8).collect();
+        c.enqueue(&data).unwrap();
+        assert_eq!(c.pending_blocks().len(), 2);
+
+        c.consume_written(BLOCK_SIZE + 2);
+
+        assert_eq!(c.pending_bytes, 3);
+        assert!(c.pending_bytes <= c.write_cap);
+        assert_eq!(c.pending_blocks().len(), 1);
+        assert_eq!(c.pending_blocks()[0].as_slice(), &data[BLOCK_SIZE + 2..]);
+
+        c.consume_written(3);
+        assert_eq!(c.pending_bytes, 0);
+        assert!(!c.has_pending_write());
+        assert!(c.pending_blocks().is_empty());
+    }
+
+    #[test]
+    fn consume_written_zero_is_a_noop() {
+        let mut c = Conn::new_for_test(16);
+        c.enqueue(b"abcdefghij").unwrap();
+
+        c.consume_written(0);
+
+        assert_eq!(c.pending_bytes, 10);
+        assert_eq!(c.pending_blocks().len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "consume_written")]
+    fn consume_written_past_the_queue_panics() {
+        let mut c = Conn::new_for_test(16);
+        c.enqueue(b"abc").unwrap();
+        c.consume_written(4);
     }
 
     #[test]

@@ -1,6 +1,7 @@
-// Blocks, pools, sockets, connection state, the timer heap and the reactor
-// wakeup are staged for the reactor/handler tasks; they have no non-test
-// consumers yet. Remove these allows once those tasks wire them up.
+// The platform reactor (Task 7) and handler now consume these modules, but the
+// crate still has no public API: nothing reachable from `lib.rs` uses them in a
+// non-test build, so every internal item is dead code. Remove these allows when
+// the public runtime surface lands.
 #[allow(dead_code)]
 pub(crate) mod block;
 #[allow(dead_code)]
