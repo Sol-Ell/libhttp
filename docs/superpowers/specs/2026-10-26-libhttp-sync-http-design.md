@@ -11,7 +11,7 @@ proxy, portability, performance, and the §8 failure lessons — remains binding
 no prior git revision was read.
 
 **Document map:** this file is the top-level design: scope, public API, the twelve §10 decisions,
-performance gates, packaging, milestones and risks. The binding contracts live in five companion
+performance gates, packaging, milestones and risks. The binding contracts live in four companion
 documents, all in this directory:
 
 | Document | Binds |
@@ -20,7 +20,6 @@ documents, all in this directory:
 | [execution design](2026-10-26-libhttp-execution-design.md) | worker pool, exchanges, queues, admission, deadline ownership, parking caps, per-stream isolation, cancellation, shutdown, limit reactions |
 | [protocol design](2026-10-26-libhttp-protocols-design.md) | HTTP/1.1, HTTP/2, HTTP/3 wire behavior, parser strictness, HPACK/QPACK, flow control, QUIC backend choice, security tests |
 | [client design](2026-10-26-libhttp-client-design.md) | client verbs, pool/queue semantics, DNS, retries, timeouts, limits |
-| [testing design](2026-10-26-libhttp-testing-design.md) | feature-gated `TestServer` harness, readiness, teardown, testing matrix |
 
 ---
 
@@ -194,7 +193,6 @@ are builder discretion; signatures and semantics are the contract.
 | `libhttp::server` | `Server`, `ServerBuilder`, `ServerHandle`, `Handler`, `Request`, `Response`, `DeferredRequest`, `DeferredResponse`, `BodyReader`, `BodyWriter`, `BodyChunk`, `Limits`, `Stats`, and a `Timeouts` re-export |
 | `libhttp::client` | `Client`, `ClientBuilder`, `ClientHandle`, `ClientRequest`, `ClientResponse`, `ClientStats`, `PoolConfig`; uses the root `Timeouts`/`CancelToken` |
 | `libhttp::tls` | `TlsServerConfig`, `TlsClientConfig` (PEM/roots/ALPN/client-auth); rustls types stay internal in v1 |
-| `libhttp::testing` | `TestServer`, `TestServerBuilder` (feature `testing`, off by default; see the [testing design](2026-10-26-libhttp-testing-design.md)) |
 
 ### 6.2 Server and handler
 
@@ -221,7 +219,7 @@ server.run(my_handler)?;                      // blocks until shutdown
 ```
 
 - `ServerHandle`: `shutdown()`, `shutdown_with_deadline(Duration)`, `stats() -> Stats`,
-  `runtime() -> Runtime`, `wait_ready(Duration)`, `local_addrs() -> Vec<SocketAddr>` (TCP),
+  `runtime() -> Runtime`, `local_addrs() -> Vec<SocketAddr>` (TCP),
   `local_udp_addrs() -> Vec<SocketAddr>`.
 - `Server::builder()`/`Client::builder()` create a private `Runtime`. To share one, build
   `Runtime::builder()...build()?` and use `rt.server()`/`rt.client()`; worker/reactor/resolver
@@ -236,6 +234,11 @@ server.run(my_handler)?;                      // blocks until shutdown
   `Runtime`: a private runtime is joined when its last handle drops; a shared runtime stays alive
   and other components continue.
 - `run` consumes `Server`; the calling thread is neither reactor nor worker.
+- **Testing pattern:** no public test harness. Tests use the normal API: build a shared `Runtime`,
+  `bind("127.0.0.1:0")`, read `local_addrs()`, start `Server::run` on a thread, build the client from
+  `rt.client()`, and call `ServerHandle::shutdown` then join. This keeps production surface unchanged
+  and tests the real reactor/TLS/h1/h2/h3 paths. External crates can wrap this if a framework-level
+  test client is wanted.
 - `register_header::<T: Header>()` on the server (and client) builder adds an application-defined
   typed header to the input decoder registry. Standard headers are registered internally. A name
   collision with a standard or already-registered header is `InvalidConfig`. Registration is only
@@ -651,17 +654,6 @@ production pure-Rust TLS provider exists. `aws-lc-rs` is not offered in v1.
 
 ---
 
-### 6.8 Testing API
-
-Feature `testing` (off by default; requires `server` and `client`) exposes
-`libhttp::testing::{TestServer, TestServerBuilder}`. `TestServer` starts the normal `Server` on
-loopback TCP port 0 (and the same UDP port for h3), waits for readiness, exposes `addr()`,
-`udp_addr()`, `handle()` and deterministic `shutdown()`. Tests use a normal `Client` on the same
-runtime via `handle().runtime().client()`. There is no `TestClient`, no fake transport, and no
-generated certificate; TLS fixtures are caller-supplied. The harness removes only ephemeral-port,
-readiness and teardown boilerplate, so the real reactors, TLS, ALPN and h1/h2/h3 are exercised.
-Full contract in the [testing design](2026-10-26-libhttp-testing-design.md).
-
 ## 7. The twelve §10 decisions
 
 Every §10 question is settled. The contracts behind each decision are in the companion documents.
@@ -739,14 +731,13 @@ extrapolated.
 
 - **One published crate** `libhttp`; workspace members `bench/` and `fuzz/` are unpublished and never
   dependencies of it. Public modules as in §6.1; everything else private.
-- **Features:** `server`, `client`, `http1`, `http2`, `http3`, `tls`, `testing`. Default: the first
-  six. `testing` is off by default and requires `server` and `client`; it exposes only the
-  `TestServer` harness. `http3` requires `tls`, and at least one of `server`/`client` and one of
+- **Features:** `server`, `client`, `http1`, `http2`, `http3`, `tls`. Default: all six. `http3`
+  requires `tls`, and at least one of `server`/`client` and one of
   `http1`/`http2`/`http3` is required; enforced with `compile_error!`. `h2c` requires `http2`
   (rejected at build with `InvalidConfig`). There is no provider feature in v1 (only `ring`), so
   `cargo build --all-features` has no ambiguity and a no-TLS build drops rustls and QUIC entirely.
-  The CI feature matrix includes server-only h1, client-only h2, no-TLS, h3, `testing`,
-  `--all-features`, and a build with every protocol disabled (must fail at compile time).
+  The CI feature matrix includes server-only h1, client-only h2, no-TLS, h3, `--all-features`, and a
+  build with every protocol disabled (must fail at compile time).
 - **MSRV:** 1.85.0 (`rust-version = "1.85"`), edition 2024, resolver v3, tested with the actual 1.85
   toolchain on all CI platforms (Linux, macOS, Windows; FreeBSD VM). Raising MSRV requires a minor release and a note; the lockfile is
   MSRV-checked.
@@ -777,8 +768,8 @@ close/cancel, no blocking socket calls on reactors, Windows handoff. Exit: echo 
 
 **M2 — HTTP/1.1 server and client, Runtime and workers.** Shared `Runtime` (reactors/workers/resolver/
 lazy pools), parser/serializer, streaming bodies, dispatch, queues, deadlines, cancellation,
-keep-alive, pipelining, h1c, smuggling corpus, fuzz targets, blocking `send`/`send_with`, nonblocking `fetch`/`fetch_with` callbacks, and the `testing`
-`TestServer` harness. Exit: **G1** passes; deferred completion
+keep-alive, pipelining, h1c, smuggling corpus, fuzz targets, blocking `send`/`send_with`, nonblocking `fetch`/`fetch_with` callbacks, and a combined
+server/client test on one runtime. Exit: **G1** passes; deferred completion
 works with streaming bodies, typed headers, trailers and h1/h2 ordering; client interoperates with
 external servers; server and client share one runtime in a combined test.
 
@@ -928,4 +919,5 @@ and the performance gates (§8).
   `try_wait`, or `wait_timeout`. `Runtime` owns reactors/workers/resolver/block/timer pools and a
   separate `max_client_callbacks` budget; `Server`/`Client` are front-ends via
   `rt.server()`/`rt.client()`. Moved the Runtime API to the runtime design and the real-loopback
-  `TestServer` to a separate testing design under feature `testing`. Removed `TimeoutKind::Wait`.
+  Removed `TimeoutKind::Wait`. No public test harness: tests use the normal API with port 0,
+  `local_addrs`, `ServerHandle::shutdown` and a client on the same runtime.

@@ -58,7 +58,6 @@ impl RuntimeHandle {
 
 impl ServerHandle {
     pub fn runtime(&self) -> Runtime;
-    pub fn wait_ready(&self, timeout: Duration) -> Result<(), Error>;
 }
 impl ClientHandle { pub fn runtime(&self) -> Runtime; }
 ```

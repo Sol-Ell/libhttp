@@ -3,7 +3,7 @@
 **Status:** part of the design for approval. **Date:** 2026-10-26.
 **Parent:** [2026-10-26-libhttp-sync-http-design.md](2026-10-26-libhttp-sync-http-design.md).
 **Companions:** [runtime](2026-10-26-libhttp-runtime-design.md), [execution](2026-10-26-libhttp-execution-design.md),
-[protocols](2026-10-26-libhttp-protocols-design.md), [testing](2026-10-26-libhttp-testing-design.md).
+[protocols](2026-10-26-libhttp-protocols-design.md).
 
 The client is a set of blocking and callback verbs over the same `Runtime` as the server. A call is
 an exchange, not a completion object: the reactor performs protocol I/O, a blocking verb waits on
