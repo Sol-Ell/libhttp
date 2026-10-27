@@ -1,7 +1,8 @@
-//! Linux readiness reactor: edge-triggered epoll, accept/read/write/close.
+//! Unix readiness reactor: edge-triggered epoll/kqueue, accept/read/write/close.
 //!
-//! The reactor owns a [`ReactorCore`] (slab, pool, timers, handler) and an
-//! [`EpollPoller`]. Its loop performs every socket syscall on the owning
+//! The reactor owns a [`ReactorCore`] (slab, pool, timers, handler) and a
+//! native [`Poller`] (`EpollPoller` on Linux, `KqueuePoller` on macOS and
+//! FreeBSD). Its loop performs every socket syscall on the owning
 //! thread and then hands the shared lifecycle decisions to the core:
 //!
 //! - readable: drain the socket to `EAGAIN`, passing each chunk to the
@@ -17,7 +18,7 @@
 //! Readiness is edge-triggered, so a read is never retried without a new edge,
 //! and only one interest set is registered per connection at a time.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -31,7 +32,10 @@ use crate::rt::conn::Conn;
 #[cfg(test)]
 use crate::rt::handler::EchoHandler;
 use crate::rt::handler::Handler;
+#[cfg(target_os = "linux")]
 use crate::rt::poller::epoll::EpollPoller;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+use crate::rt::poller::kqueue::KqueuePoller;
 use crate::rt::poller::{Interest, PollEvent, Poller};
 use crate::rt::reactor::ReactorCore;
 use crate::rt::slab::ConnId;
@@ -62,6 +66,13 @@ const MAX_WAIT: Duration = Duration::from_secs(1);
 /// Blocks gathered into one `writev` call.
 const MAX_IOVECS: usize = 64;
 
+/// The readiness backend this target builds.
+#[cfg(target_os = "linux")]
+type NativePoller = EpollPoller;
+/// The readiness backend this target builds.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+type NativePoller = KqueuePoller;
+
 /// The poller interest that matches a connection's current permission.
 ///
 /// A partial write leaves `has_pending_write()` true, so the result keeps
@@ -83,7 +94,7 @@ pub(crate) struct UnixReactor<H: Handler> {
     core: ReactorCore<H>,
     /// Created lazily so `new` cannot fail; `listen`, `connect` and
     /// `run_until` all establish it before registering anything.
-    poller: Option<EpollPoller>,
+    poller: Option<NativePoller>,
     listener: Option<TcpListener>,
     /// The interest currently registered for each id. `None` means the id was
     /// removed while paused; a later resume re-adds it.
@@ -183,9 +194,9 @@ impl<H: Handler> UnixReactor<H> {
     }
 
     /// Returns the poller, creating it on first use.
-    fn poller_mut(&mut self) -> io::Result<&mut EpollPoller> {
+    fn poller_mut(&mut self) -> io::Result<&mut NativePoller> {
         if self.poller.is_none() {
-            self.poller = Some(EpollPoller::new()?);
+            self.poller = Some(NativePoller::new()?);
         }
         Ok(self.poller.as_mut().expect("poller was just initialized"))
     }
@@ -519,20 +530,40 @@ impl UnixReactor<EchoHandler> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use super::desired_interest;
+    #[cfg(target_os = "linux")]
     use crate::rt::poller::epoll::EpollPoller;
+    #[cfg(target_os = "linux")]
     use crate::rt::poller::{Interest, Poller};
+    #[cfg(target_os = "linux")]
     use crate::rt::slab::ConnId;
     use crate::rt::test_support::{spawn_echo, spawn_echo_on};
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixStream;
+    #[cfg(target_os = "linux")]
     use std::time::Duration;
 
     #[cfg(target_os = "linux")]
     #[test]
     fn echo_over_loopback() {
+        let (addr, shutdown, join) = spawn_echo();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(b"hello").unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        shutdown.shutdown();
+        join.join().unwrap().unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn echo_over_loopback_kqueue() {
         let (addr, shutdown, join) = spawn_echo();
         let mut client = TcpStream::connect(addr).unwrap();
         client.write_all(b"hello").unwrap();
@@ -623,7 +654,6 @@ mod tests {
         join.join().unwrap().unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn spawn_echo_on_binds_the_requested_loopback_address() {
         let (addr, shutdown, join) = spawn_echo_on("127.0.0.1:0").unwrap();

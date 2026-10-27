@@ -63,5 +63,5 @@ pub(crate) trait Poller {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod epoll;
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) mod kqueue;

@@ -1,10 +1,10 @@
-//! Test-only loopback harness for the Linux readiness reactor.
+//! Test-only loopback harness for the Unix readiness reactors.
 //!
 //! `spawn_echo` starts a reactor on a background thread and returns its bound
 //! address, a [`Shutdown`] handle and the thread's join handle. The harness is
 //! `cfg(test)` only: M1 has no public runtime API.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 
 use std::io;
 use std::net::SocketAddr;
