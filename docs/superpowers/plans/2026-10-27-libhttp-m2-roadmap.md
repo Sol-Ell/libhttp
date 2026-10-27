@@ -60,7 +60,8 @@ Planned tasks:
 - M2a depends only on M1 (`src/rt`) and the approved design docs.
 - M2b depends on M2a's public primitives, Runtime, body types and server for
   combined/interop tests.
-- G1 is measured only after both halves exist; a G1 miss blocks M2, never relaxes
+- M2a gates on a **server-only G1** with an external load generator; M2b gates on
+  the final combined client+server G1. A G1 miss blocks the phase, never relaxes
   correctness.
 
 ## Next step
