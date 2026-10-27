@@ -5,10 +5,12 @@
 pub(crate) mod block;
 #[allow(dead_code)]
 pub(crate) mod conn;
+#[allow(dead_code)]
 pub(crate) mod handler;
 pub(crate) mod poller;
 #[allow(dead_code)]
 pub(crate) mod pool;
+#[allow(dead_code)]
 pub(crate) mod reactor;
 #[allow(dead_code)]
 pub(crate) mod slab;
