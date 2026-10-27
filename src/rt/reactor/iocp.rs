@@ -1574,6 +1574,34 @@ mod tests {
         client_join.join().unwrap().unwrap();
     }
 
+    /// The peer deliberately delivers the four-byte echo in two completions;
+    /// `WSARecv` is allowed to split it.
+    #[test]
+    fn connect_handles_a_split_echo_iocp() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pi").unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            stream.write_all(b"ng").unwrap();
+        });
+
+        let (handle, client_shutdown, client_join) =
+            IocpReactor::<ConnectHandler>::spawn_client_for_test();
+        handle.connect(addr).unwrap();
+        assert!(handle.wait_until(Duration::from_secs(2), |s| s.echoed));
+        assert!(handle.wait_until(Duration::from_secs(2), |s| s.connections == 0));
+
+        client_shutdown.shutdown();
+        server.join().unwrap();
+        client_join.join().unwrap().unwrap();
+    }
+
     #[test]
     fn connect_then_echo_ipv6_iocp() {
         let Ok((addr, shutdown, join)) = spawn_echo_on("[::1]:0") else {

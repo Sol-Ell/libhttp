@@ -77,6 +77,12 @@ const CONNECT_GENERATION: u32 = u32::MAX - 2;
 /// Upper bound on one poller wait, short enough for shutdown responsiveness.
 const MAX_WAIT: Duration = Duration::from_secs(1);
 
+/// Deadline for the pre-loop [`UnixReactor::connect`] helper.
+///
+/// The deadline covers the whole call, so a hostname that resolves to several
+/// addresses cannot keep the caller waiting once the first ones fail.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default listen backlog, matching the standard library's bind.
 const DEFAULT_BACKLOG: usize = 1_024;
 
@@ -221,13 +227,42 @@ impl<H: Handler> UnixReactor<H> {
     /// is driven by the poller's WRITE readiness, exactly like the reactor
     /// loop. This pre-loop helper waits for that completion on its own; the
     /// test client uses the same path asynchronously.
+    ///
+    /// Every address `addr` resolves to is tried in order, and the whole call
+    /// is bounded by [`CONNECT_TIMEOUT`] so a black-holed target cannot hang
+    /// the reactor setup forever.
     pub(crate) fn connect(&mut self, addr: &str) -> io::Result<ConnId> {
-        let peer = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "address resolved to nothing")
-        })?;
-        let (wait, completed) = mpsc::channel();
-        self.start_connect(peer, ConnectSink::Sync(wait));
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        first_success(addr.to_socket_addrs()?, |peer| {
+            if Instant::now() >= deadline {
+                return Err(timeout_error());
+            }
+            self.connect_peer(peer, deadline)
+        })
+    }
 
+    /// Connects to one resolved address, waiting for its completion.
+    ///
+    /// A timeout or loop error discards the still-pending socket so the next
+    /// address (or the caller) sees no leaked registration.
+    fn connect_peer(&mut self, peer: SocketAddr, deadline: Instant) -> io::Result<ConnId> {
+        let (wait, completed) = mpsc::channel();
+        let pending = self.start_connect(peer, ConnectSink::Sync(wait));
+        let result = self.wait_for_connect(&completed, deadline);
+        if result.is_err() {
+            if let Some(id) = pending {
+                self.discard_connect(id);
+            }
+        }
+        result
+    }
+
+    /// Drives the poller until the connect settles or `deadline` passes.
+    fn wait_for_connect(
+        &mut self,
+        completed: &mpsc::Receiver<io::Result<ConnId>>,
+        deadline: Instant,
+    ) -> io::Result<ConnId> {
         let mut events = Vec::with_capacity(64);
         loop {
             match completed.try_recv() {
@@ -240,7 +275,13 @@ impl<H: Handler> UnixReactor<H> {
                     ));
                 }
             }
-            self.poller_mut()?.wait(Some(MAX_WAIT), &mut events)?;
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(timeout_error());
+            }
+            let timeout = (deadline - now).min(MAX_WAIT);
+            self.poller_mut()?.wait(Some(timeout), &mut events)?;
             for event in events.drain(..) {
                 self.dispatch(event)?;
             }
@@ -355,7 +396,7 @@ impl<H: Handler> UnixReactor<H> {
                 CommandKind::Connect(addr) => {
                     // Completion replies through the acknowledgement channel
                     // once the WRITE edge reports the result.
-                    self.start_connect(addr, ConnectSink::Test(command.ack));
+                    let _ = self.start_connect(addr, ConnectSink::Test(command.ack));
                     continue;
                 }
             };
@@ -410,23 +451,42 @@ impl<H: Handler> UnixReactor<H> {
     /// Starts a nonblocking connect and arranges for `sink` to receive it.
     ///
     /// The reactor thread never blocks on the socket: a pending `EINPROGRESS`
-    /// is registered for WRITE and completed from the readiness loop.
-    fn start_connect(&mut self, addr: SocketAddr, sink: ConnectSink) {
+    /// is registered for WRITE and completed from the readiness loop. Returns
+    /// the synthetic id while the connect is still pending, so a sync waiter
+    /// can discard it on timeout; an inline result returns `None`.
+    fn start_connect(&mut self, addr: SocketAddr, sink: ConnectSink) -> Option<ConnId> {
         let attempt = match nonblocking_connect(addr) {
             Ok(attempt) => attempt,
-            Err(err) => return sink.send(Err(err)),
+            Err(err) => {
+                sink.send(Err(err));
+                return None;
+            }
         };
         match attempt {
-            ConnectAttempt::Connected(stream) => self.adopt_connect(stream, sink),
+            ConnectAttempt::Connected(stream) => {
+                self.adopt_connect(stream, sink);
+                None
+            }
             ConnectAttempt::Pending(stream) => {
                 let fd = stream.as_raw_fd();
                 let id = self.next_connect_id();
                 if let Err(err) = self.register(id, fd, Interest::Write) {
                     // Dropping `stream` closes the failed socket.
-                    return sink.send(Err(err));
+                    sink.send(Err(err));
+                    return None;
                 }
                 self.connecting.insert(id, PendingConnect { stream, sink });
+                Some(id)
             }
+        }
+    }
+
+    /// Abandons a still-pending connect after the sync deadline expired.
+    fn discard_connect(&mut self, id: ConnId) {
+        if let Some(pending) = self.connecting.remove(&id) {
+            let fd = pending.stream.as_raw_fd();
+            self.unregister(id, fd);
+            // Dropping `pending` closes the socket and its unused sink.
         }
     }
 
@@ -480,6 +540,16 @@ impl<H: Handler> UnixReactor<H> {
         {
             self.close_conn(id);
             return sink.send(Err(err));
+        }
+
+        // The flush path runs handler callbacks (`on_output_ready`), so the
+        // connection can already be gone by the time it returns. Reporting the
+        // dead id as success would hand the caller a stale slot.
+        if self.core.conn(id).is_none() {
+            return sink.send(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection closed during on_connect",
+            )));
         }
 
         sink.send(Ok(id));
@@ -839,6 +909,31 @@ impl<H: Handler + Send + 'static> UnixReactor<H> {
     }
 }
 
+/// Tries each resolved address in order and returns the first success.
+///
+/// The last error is kept so a caller that exhausted every address reports why
+/// instead of a generic failure; an empty resolution is an input error.
+fn first_success<T>(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    mut attempt: impl FnMut(SocketAddr) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut last_error = None;
+    for addr in addrs {
+        match attempt(addr) {
+            Ok(value) => return Ok(value),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "address resolved to nothing")
+    }))
+}
+
+/// The pre-loop connect deadline error.
+fn timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "outbound connect timed out")
+}
+
 /// Creates a nonblocking socket and starts `connect(2)` on it.
 ///
 /// A successful handshake is reported as [`ConnectAttempt::Connected`];
@@ -1009,10 +1104,11 @@ impl UnixReactor<EchoHandler> {
 
 #[cfg(test)]
 mod tests {
-    use super::UnixReactor;
     #[cfg(target_os = "linux")]
     use super::desired_interest;
-    use crate::rt::handler::EchoHandler;
+    use super::{UnixReactor, first_success};
+    use crate::rt::conn::Conn;
+    use crate::rt::handler::{EchoHandler, Handler};
     #[cfg(target_os = "linux")]
     use crate::rt::poller::epoll::EpollPoller;
     #[cfg(target_os = "linux")]
@@ -1021,19 +1117,48 @@ mod tests {
     use crate::rt::slab::ConnId;
     #[cfg(unix)]
     use crate::rt::test_support::spawn_echo_with_control;
-    use crate::rt::test_support::{ConnectHandler, spawn_echo, spawn_echo_on};
+    use crate::rt::test_support::{
+        ClientState, ConnectHandler, SpawnClient, spawn_echo, spawn_echo_on,
+    };
     #[cfg(target_os = "linux")]
     use crate::rt::test_support::{
         library_bytes, raise_nofile, spawn_echo_with_backlog, spawn_echo_with_control_on,
         wait_for_connections,
     };
     use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    /// Handler that fails the write-ready callback, which runs inside
+    /// connect adoption when the handler queued no output.
+    struct FailsOnOutputReady;
+
+    impl Handler for FailsOnOutputReady {
+        fn on_accept(&mut self, _conn: &mut Conn) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn on_read(&mut self, _conn: &mut Conn, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn on_output_ready(&mut self, _conn: &mut Conn) -> io::Result<()> {
+            Err(io::Error::other("output-ready failure"))
+        }
+
+        fn on_close(&mut self, _id: crate::rt::slab::ConnId) {}
+    }
+
+    impl SpawnClient for FailsOnOutputReady {
+        fn new_client() -> (Self, Arc<ClientState>) {
+            (Self, Arc::new(ClientState::default()))
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -1293,6 +1418,35 @@ mod tests {
         client_join.join().unwrap().unwrap();
     }
 
+    /// The peer deliberately delivers the four-byte echo in two reads; the
+    /// handler must not treat the first chunk as a protocol error.
+    #[cfg(unix)]
+    #[test]
+    fn connect_handles_a_split_echo() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pi").unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            stream.write_all(b"ng").unwrap();
+        });
+
+        let (handle, client_shutdown, client_join) =
+            UnixReactor::<ConnectHandler>::spawn_client_for_test();
+        handle.connect(addr).unwrap();
+        assert!(handle.wait_until(Duration::from_secs(2), |s| s.echoed));
+        assert!(handle.wait_until(Duration::from_secs(2), |s| s.connections == 0));
+
+        client_shutdown.shutdown();
+        server.join().unwrap();
+        client_join.join().unwrap().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn connect_then_echo_ipv6() {
@@ -1337,6 +1491,51 @@ mod tests {
         drop(reactor);
         shutdown.shutdown();
         join.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_success_tries_every_resolved_address() {
+        let first = SocketAddr::from(([127, 0, 0, 1], 1));
+        let second = SocketAddr::from(([127, 0, 0, 1], 2));
+        let mut tried = Vec::new();
+
+        let chosen = first_success([first, second], |peer| {
+            tried.push(peer);
+            if peer == first {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "first address refused",
+                ))
+            } else {
+                Ok(peer)
+            }
+        })
+        .unwrap();
+
+        assert_eq!(chosen, second);
+        assert_eq!(tried, vec![first, second], "every address must be tried");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_reports_abort_when_adoption_closes_the_connection() {
+        let (addr, shutdown, join) = spawn_echo();
+        let (handle, client_shutdown, client_join) =
+            UnixReactor::<FailsOnOutputReady>::spawn_client_for_test();
+
+        let err = handle.connect(addr).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            handle.stats().connections,
+            0,
+            "the aborted connection must be reclaimed"
+        );
+        shutdown.shutdown();
+        client_shutdown.shutdown();
+        join.join().unwrap().unwrap();
+        client_join.join().unwrap().unwrap();
     }
 
     #[cfg(target_os = "linux")]

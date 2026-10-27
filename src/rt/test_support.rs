@@ -498,6 +498,12 @@ impl SpawnClient for EchoHandler {
 /// marker and requires exactly that marker back before it reports `echoed`.
 pub(crate) struct ConnectHandler {
     state: Arc<ClientState>,
+    /// Bytes of the expected echo received so far.
+    ///
+    /// A stream read may deliver the four-byte marker split across
+    /// completions (notably with `WSARecv`), so the handler must accumulate
+    /// instead of matching each chunk.
+    received: Vec<u8>,
 }
 
 impl SpawnClient for ConnectHandler {
@@ -506,6 +512,7 @@ impl SpawnClient for ConnectHandler {
         (
             Self {
                 state: Arc::clone(&state),
+                received: Vec::new(),
             },
             state,
         )
@@ -518,16 +525,22 @@ impl Handler for ConnectHandler {
     }
 
     fn on_connect(&mut self, conn: &mut Conn) -> io::Result<()> {
+        self.received.clear();
         conn.enqueue(b"ping")
             .map_err(|_| io::Error::other("client outbound queue rejected the request bytes"))
     }
 
     fn on_read(&mut self, _conn: &mut Conn, data: &[u8]) -> io::Result<()> {
-        if data != b"ping" {
+        self.received.extend_from_slice(data);
+        if !b"ping".starts_with(&self.received) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("expected the echoed ping, received {data:?}"),
+                format!("expected the echoed ping, received {:?}", self.received),
             ));
+        }
+        if self.received.len() < b"ping".len() {
+            // A partial read is normal on a stream; wait for the rest.
+            return Ok(());
         }
         self.state.echoed.store(true, Ordering::SeqCst);
         // The handler has no graceful close hook, and a deferred close would
@@ -670,5 +683,46 @@ pub(crate) fn spawn_echo_with_backlog(backlog: usize) -> Spawned {
         IocpReactor::<EchoHandler>::new(EchoHandler)
             .spawn_with_backlog_on("127.0.0.1:0", backlog)
             .expect("bind loopback echo listener")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_handler_accumulates_a_split_echo() {
+        let (mut handler, state) = ConnectHandler::new_client();
+        let mut conn = Conn::new_for_test(64);
+        handler.on_connect(&mut conn).unwrap();
+
+        // The stream may deliver the four-byte echo in any chunking.
+        assert!(handler.on_read(&mut conn, b"pi").is_ok());
+        assert!(handler.on_read(&mut conn, b"n").is_ok());
+        assert!(!state.echoed.load(Ordering::SeqCst));
+        assert!(handler.on_read(&mut conn, b"g").is_err());
+        assert!(state.echoed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn connect_handler_rejects_unexpected_bytes() {
+        let (mut handler, state) = ConnectHandler::new_client();
+        let mut conn = Conn::new_for_test(64);
+        handler.on_connect(&mut conn).unwrap();
+
+        let err = handler.on_read(&mut conn, b"pong").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!state.echoed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn connect_handler_rejects_extra_bytes_after_the_marker() {
+        let (mut handler, state) = ConnectHandler::new_client();
+        let mut conn = Conn::new_for_test(64);
+        handler.on_connect(&mut conn).unwrap();
+
+        let err = handler.on_read(&mut conn, b"ping!").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!state.echoed.load(Ordering::SeqCst));
     }
 }
