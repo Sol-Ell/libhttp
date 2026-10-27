@@ -318,7 +318,7 @@ git commit -m "feat(rt): generation-checked timer heap"
   - `Wake::wake(&self) -> io::Result<()>`
   - `Wake::drain(&mut self) -> io::Result<bool>` (true if at least one wake was pending)
   - `#[cfg(unix)] Wake::raw_fd(&self) -> RawFd`
-  - Windows uses the IOCP sentinel in Task 9; this task compiles only on Unix.
+  - Windows uses the IOCP sentinel in Task 9; `mod wake` is `#[cfg(unix)]`, so this task compiles only on Unix.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -342,9 +342,9 @@ fn many_wakes_coalesce() {
 #[test]
 fn wake_before_poll_is_seen() {
     let mut w = Wake::new().unwrap();
-    let fd = w.raw_fd();
-    let t = std::thread::spawn(move || unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) });
-    t.join().unwrap();
+    std::thread::scope(|s| {
+        s.spawn(|| w.wake().unwrap());
+    });
     assert!(w.drain().unwrap());
 }
 ```
