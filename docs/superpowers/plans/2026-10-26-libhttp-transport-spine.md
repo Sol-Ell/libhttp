@@ -616,7 +616,7 @@ Expected: FAIL with unresolved `UnixReactor`.
 
 - [ ] **Step 3: Implement epoll poller and Unix reactor**
 
-`epoll_create1(EPOLL_CLOEXEC)`, `epoll_ctl` add/mod/del, `epoll_wait` with timeout computed from the timer heap capped at 1 s; `Wake` fd is registered as a special event. On readable: loop `read` into the connection's block until `EAGAIN` or block full; `0` closes; errors close. On writable: write pending blocks with `writev`/`write`, partial writes retained. Close order per runtime design. Remove interest while paused.
+`epoll_create1(EPOLL_CLOEXEC)`, `epoll_ctl` add/mod/del, `epoll_wait` with timeout computed from the timer heap capped at 1 s; `Wake` fd is registered as a special event. On readable: loop `read` into the connection's block until `EAGAIN` or block full; `0` EOF calls `on_eof`; errors close. On writable: write pending blocks with `writev`/`write`; after a partial write call `consume_written(n)` so the remainder stays in `Conn`, `has_pending_write()` remains true and EPOLLOUT interest is not dropped. After the queue drains, call `on_write_ready` even if there is no new event; this closes a deferred-EOF connection and resumes only the appropriate pause state. Treat an `EchoHandler` `WouldBlock` as fatal-close (overflow resets; do not retry/keep-alive). Close order per runtime design. Remove interest while paused.
 
 - [ ] **Step 4: Run tests and checks**
 
