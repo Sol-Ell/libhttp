@@ -20,7 +20,6 @@ pub(crate) mod socket;
 #[allow(dead_code)]
 pub(crate) mod timer;
 #[allow(dead_code)]
-#[cfg(unix)]
 pub(crate) mod wake;
 
 #[cfg(test)]

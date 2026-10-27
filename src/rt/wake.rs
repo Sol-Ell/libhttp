@@ -1,20 +1,37 @@
 //! Cross-thread reactor wakeup.
 //!
-//! The reactor polls [`Wake::raw_fd`]; other threads call [`Wake::wake`]. Linux
-//! uses a nonblocking, close-on-exec eventfd; the other Unix platforms use a
-//! nonblocking, close-on-exec pipe. Pending wakes coalesce into one readable
-//! state, so [`Wake::drain`] reports whether anything was pending and leaves
-//! the descriptor empty.
+//! On Unix the reactor polls [`Wake::raw_fd`]; other threads call
+//! [`Wake::wake`]. Linux uses a nonblocking, close-on-exec eventfd; the other
+//! Unix platforms use a nonblocking, close-on-exec pipe. Pending wakes coalesce
+//! into one readable state, so [`Wake::drain`] reports whether anything was
+//! pending and leaves the descriptor empty.
 //!
-//! The descriptors are owned by [`std::fs::File`], which closes them on drop.
-//! `wake` and `drain` are thin wrappers over `write(2)` and `read(2)`; no
+//! On Windows a wake is a completion packet posted to the reactor's IOCP with a
+//! dedicated completion key. The reactor stops when it dequeues that sentinel;
+//! no separate OS handle is involved.
+//!
+//! The Unix descriptors are owned by [`std::fs::File`], which closes them on
+//! drop. `wake` and `drain` are thin wrappers over `write(2)` and `read(2)`; no
 //! allocation happens per wake.
 
+#[cfg(unix)]
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
+
+#[cfg(windows)]
+use crate::rt::poller::iocp::WAKE_KEY;
 
 /// Cross-thread wake channel for a reactor.
+#[cfg(unix)]
 pub(crate) struct Wake {
     /// Pollable descriptor: the eventfd, or the pipe's read end.
     read: File,
@@ -24,6 +41,7 @@ pub(crate) struct Wake {
     write: File,
 }
 
+#[cfg(unix)]
 impl Wake {
     pub(crate) fn new() -> io::Result<Self> {
         #[cfg(target_os = "linux")]
@@ -91,7 +109,35 @@ impl Wake {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows wake channel: a sentinel packet on the reactor's completion port.
+#[cfg(windows)]
+pub(crate) struct Wake {
+    /// Raw `HANDLE` of the owning reactor's completion port.
+    port: usize,
+}
+
+#[cfg(windows)]
+impl Wake {
+    /// Wraps the completion port the reactor waits on.
+    pub(crate) fn new(port: usize) -> io::Result<Self> {
+        Ok(Self { port })
+    }
+
+    /// Posts the wake sentinel. Repeated calls simply queue more sentinels.
+    pub(crate) fn wake(&self) -> io::Result<()> {
+        // SAFETY: the port handle belongs to the reactor that owns this wake
+        // channel; the sentinel has no overlapped structure.
+        let posted = unsafe {
+            PostQueuedCompletionStatus(self.port as HANDLE, 0, WAKE_KEY, std::ptr::null())
+        };
+        if posted == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn pipe() -> io::Result<(File, File)> {
     let mut fds = [0 as libc::c_int; 2];
 
@@ -113,7 +159,7 @@ fn pipe() -> io::Result<(File, File)> {
     Ok((read, write))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn set_nonblocking_cloexec(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
 
@@ -141,7 +187,7 @@ fn set_nonblocking_cloexec(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::thread;
@@ -176,5 +222,26 @@ mod tests {
         });
 
         assert!(w.drain().unwrap());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::rt::poller::iocp::{Iocp, MAX_COMPLETIONS, WAKE_KEY};
+    use windows_sys::Win32::System::IO::OVERLAPPED_ENTRY;
+
+    #[test]
+    fn wake_posts_the_sentinel_packet() {
+        let iocp = Iocp::new().unwrap();
+        let wake = Wake::new(iocp.raw_handle()).unwrap();
+
+        wake.wake().unwrap();
+
+        let mut entries = [OVERLAPPED_ENTRY::default(); MAX_COMPLETIONS];
+        let count = iocp.wait(None, &mut entries).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(entries[0].lpCompletionKey, WAKE_KEY);
+        assert!(entries[0].lpOverlapped.is_null());
     }
 }

@@ -1,13 +1,15 @@
-//! Readiness-poller seam shared by the Unix reactors.
+//! Backend seam shared by the platform reactors.
 //!
-//! A [`Poller`] maps an OS descriptor to the generation-checked [`ConnId`] the
-//! reactor uses for its slab entry, then reports readiness as [`PollEvent`]s.
-//! The poller is deliberately thin: it performs no socket I/O and makes no
-//! connection-lifecycle decisions. The reactor owns both.
+//! On Unix a [`Poller`] maps an OS descriptor to the generation-checked
+//! [`ConnId`] the reactor uses for its slab entry, then reports readiness as
+//! [`PollEvent`]s. The poller is deliberately thin: it performs no socket I/O
+//! and makes no connection-lifecycle decisions. The reactor owns both.
 //!
-//! Every backend registers descriptors edge-triggered and arms only the
-//! interests the reactor asks for. A readable event must therefore be drained
-//! to `EAGAIN` by the caller; the kernel will not report the same edge twice.
+//! Every readiness backend registers descriptors edge-triggered and arms only
+//! the interests the reactor asks for. A readable event must therefore be
+//! drained to `EAGAIN` by the caller; the kernel will not report the same edge
+//! twice. Windows uses the completion backend in [`iocp`] instead: there is no
+//! readiness edge, only a posted operation and its completion.
 
 #[cfg(unix)]
 use std::io;
@@ -63,5 +65,7 @@ pub(crate) trait Poller {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod epoll;
+#[cfg(windows)]
+pub(crate) mod iocp;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) mod kqueue;

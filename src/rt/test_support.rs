@@ -1,10 +1,15 @@
-//! Test-only loopback harness for the Unix readiness reactors.
+//! Test-only loopback harness for the platform reactors.
 //!
 //! `spawn_echo` starts a reactor on a background thread and returns its bound
 //! address, a [`Shutdown`] handle and the thread's join handle. The harness is
 //! `cfg(test)` only: M1 has no public runtime API.
 
-#![cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+#![cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
 
 use std::io;
 use std::net::SocketAddr;
@@ -12,6 +17,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::rt::handler::EchoHandler;
+#[cfg(windows)]
+use crate::rt::reactor::iocp::IocpReactor;
+#[cfg(unix)]
 use crate::rt::reactor::unix::UnixReactor;
 use crate::rt::wake::Wake;
 
@@ -34,12 +42,26 @@ impl Shutdown {
 
 /// Starts an echo reactor on an ephemeral `127.0.0.1` port.
 pub(crate) fn spawn_echo() -> (SocketAddr, Shutdown, JoinHandle<io::Result<()>>) {
-    UnixReactor::<EchoHandler>::spawn_for_test()
+    #[cfg(unix)]
+    {
+        UnixReactor::<EchoHandler>::spawn_for_test()
+    }
+    #[cfg(windows)]
+    {
+        IocpReactor::<EchoHandler>::spawn_for_test()
+    }
 }
 
 /// Starts an echo reactor bound to `addr`.
 pub(crate) fn spawn_echo_on(
     addr: &str,
 ) -> io::Result<(SocketAddr, Shutdown, JoinHandle<io::Result<()>>)> {
-    UnixReactor::<EchoHandler>::new(EchoHandler).spawn_for_test_on(addr)
+    #[cfg(unix)]
+    {
+        UnixReactor::<EchoHandler>::new(EchoHandler).spawn_for_test_on(addr)
+    }
+    #[cfg(windows)]
+    {
+        IocpReactor::<EchoHandler>::new(EchoHandler).spawn_for_test_on(addr)
+    }
 }
