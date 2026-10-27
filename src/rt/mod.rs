@@ -1,6 +1,6 @@
-// Blocks, pools and the timer heap are staged for the reactor/handler tasks;
-// they have no non-test consumers yet. Remove these allows once those tasks
-// wire them up.
+// Blocks, pools, the timer heap and the reactor wakeup are staged for the
+// reactor/handler tasks; they have no non-test consumers yet. Remove these
+// allows once those tasks wire them up.
 #[allow(dead_code)]
 pub(crate) mod block;
 pub(crate) mod conn;
@@ -13,6 +13,8 @@ pub(crate) mod slab;
 pub(crate) mod socket;
 #[allow(dead_code)]
 pub(crate) mod timer;
+#[allow(dead_code)]
+#[cfg(unix)]
 pub(crate) mod wake;
 
 #[cfg(test)]
