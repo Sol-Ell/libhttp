@@ -503,7 +503,7 @@ git commit -m "feat(rt): handler seam and shared reactor core"
 
 **Files:**
 - Create: `src/rt/poller/mod.rs`, `src/rt/poller/epoll.rs`, `src/rt/reactor/unix.rs`, `src/rt/test_support.rs`
-- Modify: `src/rt/mod.rs`
+- Modify: `src/rt/mod.rs`, `src/rt/conn.rs` (block-level flush: `pending_blocks`, `consume_written`, retained remainder/accounting)
 
 **Interfaces:**
 - Produces:
@@ -511,6 +511,7 @@ git commit -m "feat(rt): handler seam and shared reactor core"
   - `pub(crate) struct PollEvent { pub id: ConnId, pub readable: bool, pub writable: bool, pub error: Option<io::Error> }`
   - `pub(crate) trait Poller { fn add(&mut self, fd: RawFd, id: ConnId, interest: Interest) -> io::Result<()>; fn modify(...); fn remove(...); fn wait(&mut self, timeout: Option<Duration>, events: &mut Vec<PollEvent>) -> io::Result<()>; }`
   - `pub(crate) struct UnixReactor<H: Handler>` with `new(handler)`, `listen(addr)`, `connect(addr) -> io::Result<ConnId>`, `run_until(&mut self, shutdown: &Wake)`, `local_addr()`, and `spawn_for_test() -> (SocketAddr, Shutdown, JoinHandle<io::Result<()>>)`
+  - `Conn::pending_blocks(&self)` and `Conn::consume_written(&mut self, n: usize)`; partial socket writes leave the remainder in `Conn` and keep `has_pending_write()` true; `pending_bytes` stays within the cap.
   - `EpollPoller::new() -> io::Result<Self>`, `KqueuePoller::new() -> io::Result<Self>`
   - Test helpers in `src/rt/test_support.rs`: `spawn_echo()`, `spawn_echo_on(addr: &str) -> io::Result<(SocketAddr, Shutdown, JoinHandle<io::Result<()>>)>`, and `struct Shutdown`. The control/backlog variants are added in Task 10.
 - Edge-triggered epoll (`EPOLLET | EPOLLIN | EPOLLOUT | EPOLLRDHUP`), full drain to `EAGAIN`, one read buffer per conn, write flush on writable, close on EOF/error.
@@ -725,7 +726,7 @@ git commit -m "feat(rt): IOCP reactor for Windows"
 ### Task 10: Backpressure, close/cancel and 10k-idle budget
 
 **Files:**
-- Modify: `src/rt/reactor/mod.rs`, `src/rt/reactor/unix.rs`, `src/rt/reactor/iocp.rs`, `src/rt/conn.rs`, `src/rt/test_support.rs` (allocator/counter instrumentation only; harness already exists from Task 7)
+- Modify: `src/rt/reactor/mod.rs`, `src/rt/reactor/unix.rs`, `src/rt/reactor/iocp.rs`, `src/rt/conn.rs` (separate `read_paused`, `backpressured`, `closed`; explicit resume does not clear backpressure/closed), `src/rt/test_support.rs` (allocator/counter instrumentation only; harness already exists from Task 7)
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
