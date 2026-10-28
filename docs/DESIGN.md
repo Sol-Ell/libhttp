@@ -134,6 +134,7 @@ pub trait Header: Sized + Send + Sync + 'static {
     fn encode(&self) -> Result<HeaderValue, HeaderError>;
 }
 pub enum Target<'a> { Origin { .. }, Absolute { .. }, Authority(&'a [u8]), Asterisk }
+pub struct OwnedTarget;   // owned, validated Target for deferred metadata
 pub struct Uri;                              // owned absolute URI for clients
 pub struct Timeouts; pub struct CancelToken;
 pub struct BodyReader; pub struct BodyWriter; pub struct BodyChunk;
@@ -261,11 +262,11 @@ Deferred completion:
 Request::defer(&mut self, &mut Response) -> Result<(DeferredRequest, DeferredResponse), Error>
 Request::defer_with_fallback<F>(&mut self, &mut Response, fallback: F)
     -> Result<(DeferredRequest, DeferredResponse), Error>
-where F: FnOnce(&mut Response, &DeferredFailure) -> Result<(), Error> + Send + 'static;
+where F: FnOnce(&mut Response, DeferredFailure) -> Result<(), Error> + Send + 'static;
 
 pub struct DeferredFailure {
     pub reason: DeferredFailureReason,
-    pub method: Method, pub target: String, pub version: Version,
+    pub method: Method, pub target: OwnedTarget, pub version: Version,
     pub elapsed: Duration, pub request_body_consumed: bool,
 }
 pub enum DeferredFailureReason {
@@ -279,7 +280,7 @@ pub enum DeferredFailureReason {
 handler must return promptly after success; a later return value or panic cancels the exchange
 and never commits the tombstone. Defaults for a terminal uncommitted response: `504` timeout,
 `503` shutdown, `500` application error/drop/internal. A fallback hook runs at most once on a
-worker, receives a fresh `Response` and `&DeferredFailure`, and its committed bytes win; a hook
+worker, receives a fresh `Response` and a `DeferredFailure` **by value**, and its committed bytes win; a hook
 error/panic before commit falls back to the default. If the head is committed or the peer is
 gone, the hook is not called and the exchange resets/closes. h1 parks the connection while a
 deferred exchange is live. `Timeouts::deferred` defaults to 60 s. Handles may outlive
@@ -487,3 +488,7 @@ These close the ten blocking findings from the design review. They are part of t
 
 **Locked.** Any further change is a scope change and must be recorded in `STATUS.md` with the
 reason. Implementation choices not named here are the builder's.
+
+- **2026-10-28 (deferred failure polish):** `defer_with_fallback` now passes `DeferredFailure` by
+  value, so a fallback may retain it; `DeferredFailure::target` is the owned, validated
+  `OwnedTarget` rather than a lossy `String`. `DeferredFailureReason` is `Copy`.

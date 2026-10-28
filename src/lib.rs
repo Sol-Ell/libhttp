@@ -52,7 +52,7 @@ pub use method::{InvalidMethod, Method, MethodExt};
 pub use runtime::{Runtime, RuntimeBuilder, RuntimeHandle, RuntimeStats};
 pub use server::{Handler, Server, ServerBuilder, ServerHandle};
 pub use status::{InvalidStatusCode, StatusCode};
-pub use target::Target;
+pub use target::{OwnedTarget, Target};
 pub use tls::{TlsClientConfig, TlsServerConfig};
 pub use uri::{InvalidUri, Uri};
 pub use version::{InvalidVersion, Version};

@@ -225,9 +225,13 @@ fn rejects_a_body_over_the_configured_limit() {
 
 #[test]
 fn deferred_fallback_runs_on_drop() {
+    let (failure_tx, failure_rx) = std::sync::mpsc::channel();
+    let failure_tx = std::sync::Arc::new(failure_tx);
     let (handle, runtime, join, port) = start(
-        |req: &mut libhttp::server::Request, res: &mut libhttp::server::Response| {
-            let (request, response) = req.defer_with_fallback(res, |response, _failure| {
+        move |req: &mut libhttp::server::Request, res: &mut libhttp::server::Response| {
+            let tx = failure_tx.clone();
+            let (request, response) = req.defer_with_fallback(res, move |response, failure| {
+                tx.send(failure).expect("failure receiver");
                 response.set_status(StatusCode::SERVICE_UNAVAILABLE);
                 response.set_body("fallback");
                 Ok(())
@@ -243,6 +247,16 @@ fn deferred_fallback_runs_on_drop() {
     );
     assert!(response.starts_with("HTTP/1.1 503"), "{response}");
     assert!(response.ends_with("fallback"), "{response}");
+    let failure = failure_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("fallback metadata");
+    assert_eq!(failure.method, libhttp::Method::Get);
+    assert_eq!(failure.target.as_bytes(), b"/");
+    assert_eq!(
+        failure.reason,
+        libhttp::server::DeferredFailureReason::Dropped
+    );
+    assert!(failure.request_body_consumed);
     handle.shutdown();
     join.join().unwrap().unwrap();
     runtime.handle().shutdown();
@@ -358,6 +372,29 @@ fn large_chunked_request_is_streamed() {
     request_bytes.extend_from_slice(b"\r\n0\r\n\r\n");
     let response = request(port, &request_bytes);
     assert!(response.ends_with("100000"), "{}", response.len());
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}
+
+#[test]
+fn panicking_fallback_degrades_to_500() {
+    let (handle, runtime, join, port) = start(
+        |req: &mut libhttp::server::Request, res: &mut libhttp::server::Response| {
+            let (request, response) = req.defer_with_fallback(res, |_response, _failure| {
+                panic!("fallback panic");
+            })?;
+            drop(request);
+            drop(response);
+            Ok(())
+        },
+    );
+    let response = request(
+        port,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
     handle.shutdown();
     join.join().unwrap().unwrap();
     runtime.handle().shutdown();

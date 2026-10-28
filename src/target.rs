@@ -219,6 +219,122 @@ fn find_scheme_separator(bytes: &[u8]) -> Option<usize> {
     }
 }
 
+/// An owned, validated HTTP request target.
+///
+/// This is the owned counterpart of [`Target`]; it is used where a target must outlive the
+/// request buffers, such as [`crate::server::DeferredFailure`]. The raw bytes are preserved
+/// exactly as received.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct OwnedTarget {
+    raw: Box<[u8]>,
+}
+
+impl OwnedTarget {
+    /// Validates and owns a request target.
+    pub fn parse(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        Target::parse(bytes)?;
+        Ok(Self::from_validated(bytes.to_vec()))
+    }
+
+    pub(crate) fn from_validated(bytes: Vec<u8>) -> Self {
+        Self {
+            raw: bytes.into_boxed_slice(),
+        }
+    }
+
+    /// The raw target bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// The target as a UTF-8 string, if it is valid UTF-8.
+    pub fn to_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.raw)
+    }
+
+    /// Re-parses the owned bytes as a borrowed target.
+    pub fn as_target(&self) -> Result<Target<'_>, ProtocolError> {
+        Target::parse(&self.raw)
+    }
+
+    /// The path bytes, or an empty slice if the stored target is not origin/absolute form.
+    pub fn path(&self) -> &[u8] {
+        self.as_target()
+            .map(|target| target.path())
+            .unwrap_or_default()
+    }
+
+    /// The query bytes, without the leading `?`.
+    pub fn query(&self) -> Option<&[u8]> {
+        self.as_target().ok().and_then(|target| target.query())
+    }
+
+    /// The authority bytes for absolute or authority forms.
+    pub fn authority(&self) -> Option<&[u8]> {
+        self.as_target().ok().and_then(|target| target.authority())
+    }
+
+    /// The scheme bytes for absolute form.
+    pub fn scheme(&self) -> Option<&[u8]> {
+        self.as_target().ok().and_then(|target| target.scheme())
+    }
+
+    /// Whether this is origin-form.
+    pub fn is_origin_form(&self) -> bool {
+        self.as_target().is_ok_and(|target| target.is_origin_form())
+    }
+
+    /// Whether this is absolute-form.
+    pub fn is_absolute_form(&self) -> bool {
+        self.as_target()
+            .is_ok_and(|target| target.is_absolute_form())
+    }
+
+    /// Whether this is authority-form.
+    pub fn is_authority_form(&self) -> bool {
+        self.as_target()
+            .is_ok_and(|target| target.is_authority_form())
+    }
+
+    /// Whether this is asterisk-form.
+    pub fn is_asterisk(&self) -> bool {
+        self.as_target().is_ok_and(|target| target.is_asterisk())
+    }
+}
+
+impl std::fmt::Debug for OwnedTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("OwnedTarget")
+            .field(&String::from_utf8_lossy(&self.raw))
+            .finish()
+    }
+}
+
+impl std::fmt::Display for OwnedTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&String::from_utf8_lossy(&self.raw))
+    }
+}
+
+impl AsRef<[u8]> for OwnedTarget {
+    fn as_ref(&self) -> &[u8] {
+        &self.raw
+    }
+}
+
+impl<'a> From<Target<'a>> for OwnedTarget {
+    fn from(target: Target<'a>) -> Self {
+        Self::from_validated(target.as_bytes().to_vec())
+    }
+}
+
+impl<'a> Target<'a> {
+    /// Copies this parsed target into an owned, validated value.
+    pub fn to_owned_target(self) -> OwnedTarget {
+        OwnedTarget::from(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +374,30 @@ mod tests {
             Target::parse_for_request(b"example.com:443", &Method::CONNECT, Version::Http11)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn owned_target_preserves_bytes_and_views() {
+        let owned = OwnedTarget::parse(b"/a/b?x=1").unwrap();
+        assert_eq!(owned.as_bytes(), b"/a/b?x=1");
+        assert_eq!(owned.path(), b"/a/b");
+        assert_eq!(owned.query(), Some(&b"x=1"[..]));
+        assert!(owned.is_origin_form());
+        assert_eq!(
+            Target::parse(b"/a").unwrap().to_owned_target().path(),
+            b"/a"
+        );
+
+        let absolute = OwnedTarget::parse(b"http://example.com:8080/x").unwrap();
+        assert_eq!(absolute.scheme(), Some(&b"http"[..]));
+        assert_eq!(absolute.authority(), Some(&b"example.com:8080"[..]));
+        assert!(absolute.is_absolute_form());
+    }
+
+    #[test]
+    fn owned_target_rejects_invalid_bytes() {
+        assert!(OwnedTarget::parse(b"").is_err());
+        assert!(OwnedTarget::parse(b"ftp://example.com/").is_err());
     }
 
     #[test]

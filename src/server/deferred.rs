@@ -1,17 +1,18 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 use crate::body::{BodyReader, BodyWriter};
 use crate::header::{AsHeaderName, Header, HeaderMap, HeaderRef};
 use crate::runtime::Exchange;
-use crate::{Error, Method, Target, TimeoutKind, Version};
+use crate::{Error, Method, OwnedTarget, Target, TimeoutKind, Version};
 
 use super::response::Response;
 
 pub(crate) type FallbackHook =
-    Box<dyn FnOnce(&mut Response, &DeferredFailure) -> Result<(), Error> + Send + 'static>;
+    Box<dyn FnOnce(&mut Response, DeferredFailure) -> Result<(), Error> + Send + 'static>;
 
 pub(crate) struct DeferredParts {
     pub(crate) status: crate::StatusCode,
@@ -21,7 +22,7 @@ pub(crate) struct DeferredParts {
 }
 
 /// Why a deferred exchange reached a terminal state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DeferredFailureReason {
     Timeout(TimeoutKind),
     Shutdown,
@@ -30,12 +31,15 @@ pub enum DeferredFailureReason {
     Internal,
 }
 
-/// Metadata passed to a deferred terminal fallback.
-#[derive(Clone, Debug)]
+/// Metadata passed by value to a deferred terminal fallback.
+///
+/// The value is owned and `Send`; a fallback may retain it or move it to another thread. The
+/// target preserves the raw request-target bytes in an [`OwnedTarget`].
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeferredFailure {
     pub reason: DeferredFailureReason,
     pub method: Method,
-    pub target: String,
+    pub target: OwnedTarget,
     pub version: Version,
     pub elapsed: std::time::Duration,
     pub request_body_consumed: bool,
@@ -117,7 +121,7 @@ pub struct DeferredResponse {
     pub(crate) response: Response,
     fallback: Option<FallbackHook>,
     method: Method,
-    target: String,
+    target: OwnedTarget,
     version: Version,
     finished: bool,
     released: bool,
@@ -130,7 +134,7 @@ impl DeferredResponse {
         parts: DeferredParts,
         fallback: Option<FallbackHook>,
         method: Method,
-        target: String,
+        target: OwnedTarget,
         version: Version,
     ) -> Self {
         Self {
@@ -258,10 +262,12 @@ impl Drop for DeferredResponse {
                     elapsed: exchange.started.elapsed(),
                     request_body_consumed: exchange.request_body_consumed(),
                 };
-                if hook(&mut response, &failure).is_err() {
-                    let _ = exchange.reset_for_error();
-                } else {
-                    response.finalize(Ok(()));
+                let hooked = catch_unwind(AssertUnwindSafe(|| hook(&mut response, failure)));
+                match hooked {
+                    Ok(Ok(())) => response.finalize(Ok(())),
+                    _ => {
+                        let _ = exchange.reset_for_error();
+                    }
                 }
             } else if !exchange.is_committed() {
                 let _ = exchange.reset_for_error();
@@ -270,5 +276,16 @@ impl Drop for DeferredResponse {
             }
         }
         self.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeferredFailure;
+
+    #[test]
+    fn failure_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DeferredFailure>();
     }
 }

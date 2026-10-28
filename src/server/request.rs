@@ -7,7 +7,7 @@ use crate::body::BodyReader;
 use crate::h1::RequestHead;
 use crate::header::{AsHeaderName, Header, HeaderMap, HeaderRef};
 use crate::runtime::Exchange;
-use crate::{Error, Method, Target, Version};
+use crate::{Error, Method, OwnedTarget, Target, Version};
 
 use super::deferred::{DeferredFailure, DeferredRequest, DeferredResponse};
 use super::response::Response;
@@ -129,7 +129,7 @@ impl Request {
         fallback: F,
     ) -> Result<(DeferredRequest, DeferredResponse), Error>
     where
-        F: FnOnce(&mut Response, &DeferredFailure) -> Result<(), Error> + Send + 'static,
+        F: FnOnce(&mut Response, DeferredFailure) -> Result<(), Error> + Send + 'static,
     {
         self.defer_inner(response, Some(Box::new(fallback)))
     }
@@ -159,7 +159,7 @@ impl Request {
         let exchange = self.exchange.clone();
         let trailers = self.trailers.clone();
         let method = head.method.clone();
-        let target = String::from_utf8_lossy(&head.target).into_owned();
+        let target = OwnedTarget::from_validated(head.target.clone());
         let version = head.version;
         let request = DeferredRequest {
             head,
