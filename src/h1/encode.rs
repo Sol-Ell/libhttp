@@ -29,6 +29,7 @@ const REQUEST_SKIP: &[&str] = &["host", "content-length", "transfer-encoding", "
 const RESPONSE_SKIP: &[&str] = &["content-length", "transfer-encoding", "connection"];
 
 /// Serializes a request head. The library owns Host, framing, and Connection.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_request_head(
     out: &mut Vec<u8>,
     method: &Method,

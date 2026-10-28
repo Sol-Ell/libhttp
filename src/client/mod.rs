@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! The synchronous HTTP/1.1 client.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -143,7 +144,12 @@ impl ClientInner {
             local,
             secure,
         };
-        conn.spawn_body_pump(channel, trailers, self.clone());
+        conn.spawn_body_pump(
+            channel,
+            trailers,
+            self.clone(),
+            self.max_response_body_bytes,
+        );
         response
     }
 
@@ -203,20 +209,27 @@ impl ClientInner {
         let shared = Arc::new(Mutex::new(conn));
         let sink = Arc::new(RequestSink::new(shared.clone()));
         let mut writer = BodyWriter::new(sink);
+        let mut upload_error = None;
         if let Err(error) = upload(&mut writer) {
-            drop(writer);
-            let _ = shared;
-            return Err(error);
-        }
-        if let Err(error) = writer.finish() {
-            drop(writer);
-            return Err(error);
+            upload_error = Some(error);
+        } else if let Err(error) = writer.finish() {
+            upload_error = Some(error);
         }
         drop(writer);
         let mut conn = match Arc::try_unwrap(shared) {
             Ok(lock) => lock.into_inner().unwrap(),
             Err(_) => return Err(Error::Closed),
         };
+        if let Some(error) = upload_error {
+            // A server may answer before the upload completes. Give the response a short
+            // chance to arrive; a real early response wins over the upload error.
+            let _ = conn.set_read_timeout(Duration::from_millis(150));
+            if let Ok(head) = conn.read_response_head(&self.registry) {
+                return Ok(self.build_response(conn, head));
+            }
+            self.release(conn);
+            return Err(error);
+        }
         match conn.read_response_head(&self.registry) {
             Ok(head) => Ok(self.build_response(conn, head)),
             Err(error) => {

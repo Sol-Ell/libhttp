@@ -117,12 +117,6 @@ impl<T> Slab<T> {
             })
             .collect()
     }
-
-    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.slots
-            .iter_mut()
-            .filter_map(|entry| entry.value.as_mut())
-    }
 }
 
 #[cfg(test)]

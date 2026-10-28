@@ -62,13 +62,6 @@ impl HeaderError {
             message: detail.into(),
         }
     }
-
-    pub(crate) fn encode(detail: impl Into<Cow<'static, str>>) -> Self {
-        Self {
-            kind: HeaderErrorKind::Encode,
-            message: detail.into(),
-        }
-    }
 }
 
 impl fmt::Display for HeaderErrorKind {

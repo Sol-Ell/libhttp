@@ -19,18 +19,15 @@ use super::pool::PoolKey;
 
 pub(crate) enum ClientStream {
     Plain(TcpStream),
-    // TLS is added by the TLS milestone; keeping the variant makes the body pump stable.
-    #[allow(dead_code)]
-    Tls(Box<dyn ReadWrite + Send>),
+    #[cfg(feature = "tls")]
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
-
-pub(crate) trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
 
 impl ClientStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(stream) => stream.read(buffer),
+            #[cfg(feature = "tls")]
             Self::Tls(stream) => stream.read(buffer),
         }
     }
@@ -38,6 +35,7 @@ impl ClientStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(stream) => stream.write(buffer),
+            #[cfg(feature = "tls")]
             Self::Tls(stream) => stream.write(buffer),
         }
     }
@@ -47,7 +45,20 @@ impl ClientStream {
             Self::Plain(stream) => {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             }
-            Self::Tls(_) => {}
+            #[cfg(feature = "tls")]
+            Self::Tls(stream) => {
+                stream.conn.send_close_notify();
+                let _ = stream.flush();
+                let _ = stream.get_ref().shutdown(std::net::Shutdown::Write);
+            }
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.set_read_timeout(timeout),
+            #[cfg(feature = "tls")]
+            Self::Tls(stream) => stream.get_ref().set_read_timeout(timeout),
         }
     }
 }
@@ -168,6 +179,12 @@ impl ClientConnection {
 
     pub(crate) fn is_secure(&self) -> bool {
         self.secure
+    }
+
+    pub(crate) fn set_read_timeout(&self, timeout: Duration) -> Result<(), Error> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(Error::Io)
     }
 
     pub(crate) fn write_all(&mut self, data: &[u8], timeout: TimeoutKind) -> Result<(), Error> {
@@ -298,10 +315,11 @@ impl ClientConnection {
         channel: Arc<BodyChannel>,
         trailers: Arc<std::sync::OnceLock<HeaderMap>>,
         client: Arc<ClientInner>,
+        max_body: Option<u64>,
     ) {
         let _ = std::thread::Builder::new()
             .name("libhttp-client-body".to_owned())
-            .spawn(move || pump_body(self, channel, trailers, client));
+            .spawn(move || pump_body(self, channel, trailers, client, max_body));
     }
 
     fn read_body_bytes(&mut self, buffer: &mut [u8], timeout: TimeoutKind) -> Result<usize, Error> {
@@ -341,7 +359,9 @@ fn pump_body(
     channel: Arc<BodyChannel>,
     trailers: Arc<std::sync::OnceLock<HeaderMap>>,
     client: Arc<ClientInner>,
+    max_body: Option<u64>,
 ) {
+    let mut total = 0_u64;
     let result = (|| -> Result<(), Error> {
         match conn.framing {
             BodyFraming::None => {}
@@ -353,6 +373,12 @@ fn pump_body(
                         return Err(Error::Closed);
                     }
                     let take = read.min(conn.remaining as usize);
+                    total = total.saturating_add(take as u64);
+                    if max_body.is_some_and(|limit| total > limit) {
+                        return Err(Error::BodyTooLarge {
+                            limit: max_body.unwrap(),
+                        });
+                    }
                     channel.write(&buffer[..take])?;
                     conn.remaining -= take as u64;
                 }
@@ -368,6 +394,12 @@ fn pump_body(
                 let mut decoder = conn.chunked.take().unwrap_or_else(ChunkedDecoder::new);
                 loop {
                     while let Some(chunk) = decoded.take() {
+                        total = total.saturating_add(chunk.len() as u64);
+                        if max_body.is_some_and(|limit| total > limit) {
+                            return Err(Error::BodyTooLarge {
+                                limit: max_body.unwrap(),
+                            });
+                        }
                         channel.write(&chunk)?;
                     }
                     if decoder.is_done() {
@@ -391,6 +423,12 @@ fn pump_body(
                     }
                 }
                 while let Some(chunk) = decoded.take() {
+                    total = total.saturating_add(chunk.len() as u64);
+                    if max_body.is_some_and(|limit| total > limit) {
+                        return Err(Error::BodyTooLarge {
+                            limit: max_body.unwrap(),
+                        });
+                    }
                     channel.write(&chunk)?;
                 }
             }
@@ -400,6 +438,12 @@ fn pump_body(
                     let read = conn.read_body_bytes(&mut buffer, TimeoutKind::BodyIdle)?;
                     if read == 0 {
                         break;
+                    }
+                    total = total.saturating_add(read as u64);
+                    if max_body.is_some_and(|limit| total > limit) {
+                        return Err(Error::BodyTooLarge {
+                            limit: max_body.unwrap(),
+                        });
                     }
                     channel.write(&buffer[..read])?;
                 }
@@ -419,6 +463,8 @@ fn pump_body(
         Err(error) => {
             let terminal = match &error {
                 Error::Timeout(kind) => Terminal::Timeout(*kind),
+                Error::BodyTooLarge { limit } => Terminal::BodyTooLarge { limit: *limit },
+                Error::Protocol(protocol) => Terminal::Protocol(*protocol),
                 Error::Canceled | Error::Closed => Terminal::Canceled,
                 _ => Terminal::Canceled,
             };

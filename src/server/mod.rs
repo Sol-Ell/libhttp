@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! The synchronous HTTP/1.1 server.
 
 use std::net::{SocketAddr, ToSocketAddrs};

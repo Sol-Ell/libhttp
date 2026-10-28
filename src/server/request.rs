@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use crate::body::BodyReader;
 use crate::h1::RequestHead;
@@ -156,6 +155,7 @@ impl Request {
         let parts = response.take_for_deferred();
         self.deferred = true;
         self.exchange.meta.lock().unwrap().deferred = true;
+        self.exchange.wake_reactor();
         let exchange = self.exchange.clone();
         let trailers = self.trailers.clone();
         let method = head.method.clone();
@@ -170,14 +170,6 @@ impl Request {
         };
         let response = DeferredResponse::new(exchange, parts, fallback, method, target, version);
         Ok((request, response))
-    }
-
-    pub(crate) fn exchange(&self) -> &Arc<Exchange> {
-        &self.exchange
-    }
-
-    pub(crate) fn started(&self) -> Instant {
-        self.exchange.started
     }
 }
 

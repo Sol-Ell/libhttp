@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use bytes::{Buf, BytesMut};
 use crossbeam_channel::{Receiver, Sender};
 use mio::event::Event;
-use mio::net::{TcpListener, TcpStream};
+use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::body::Terminal;
@@ -17,7 +17,7 @@ use crate::h1::{BodyFraming, ChunkedDecoder, ChunkedStatus, parse_request_head};
 use crate::net;
 use crate::server::stream::ServerStream;
 use crate::server::{Request, Response, ServerShared};
-use crate::{Error, Method, ProtocolErrorKind, StatusCode, TimeoutKind, Version};
+use crate::{Error, Method, ProtocolErrorKind, StatusCode, TimeoutKind};
 
 use super::RuntimeStatsInner;
 use super::exchange::Exchange;
@@ -213,14 +213,16 @@ impl ReactorState {
                         Ok(local) => local,
                         Err(_) => continue,
                     };
-                    if self.conns.len() >= entry.shared.limits.max_connections_per_reactor {
+                    if self.conns.len() >= entry.shared.limits.max_connections_per_reactor
+                        || entry.shared.active.load(Ordering::Acquire)
+                            >= entry.shared.limits.max_connections
+                    {
                         continue;
                     }
                     if let Err(error) = net::configure(&stream) {
                         entry.shared.report(&Error::Io(error));
                         continue;
                     }
-                    let secure = entry.shared.tls.is_some();
                     #[cfg(feature = "tls")]
                     let stream = if let Some(tls) = &entry.shared.tls {
                         match ServerStream::tls(stream, tls.rustls_config()) {
@@ -234,10 +236,7 @@ impl ReactorState {
                         ServerStream::plain(stream)
                     };
                     #[cfg(not(feature = "tls"))]
-                    let stream = {
-                        let _ = secure;
-                        ServerStream::plain(stream)
-                    };
+                    let stream = ServerStream::plain(stream);
                     entry.shared.connection_open();
                     self.stats
                         .active_connections
@@ -511,8 +510,8 @@ impl ReactorState {
                 }
                 TimerKind::Deferred => {
                     if let Some(exchange) = &conn.exchange {
-                        if exchange.seq == entry.seq {
-                            exchange.timeout(TimeoutKind::Deferred);
+                        if exchange.seq == entry.seq && !exchange.is_finished() {
+                            exchange.fail_overloaded(StatusCode::GATEWAY_TIMEOUT);
                             self.drive_conn(entry.conn);
                         }
                     }
@@ -641,10 +640,8 @@ impl ServerConn {
             close = true;
         }
 
-        if !close && !self.read_eof {
-            if self.read_socket().is_err() {
-                close = true;
-            }
+        if !close && !self.read_eof && self.read_socket().is_err() {
+            close = true;
         }
 
         if !close {
@@ -710,6 +707,9 @@ impl ServerConn {
                 }
                 Phase::Active => {
                     self.process_active(timers, close);
+                    if self.phase == Phase::ReadingHead && !self.read_buf.is_empty() {
+                        continue;
+                    }
                     return;
                 }
                 Phase::Closing => return,
@@ -843,6 +843,25 @@ impl ServerConn {
         let Some(exchange) = self.exchange.clone() else {
             return;
         };
+        let defer_deadline = {
+            let mut meta = exchange.meta.lock().unwrap();
+            if meta.deferred && !meta.deferred_timer_armed {
+                meta.deferred_timer_armed = true;
+                self.shared
+                    .timeouts
+                    .deferred
+                    .map(|timeout| Instant::now() + timeout)
+            } else {
+                None
+            }
+        };
+        if let Some(deadline) = defer_deadline {
+            timers.push(TimerRequest {
+                deadline,
+                kind: TimerKind::Deferred,
+                seq: self.seq,
+            });
+        }
         if exchange.is_terminal() {
             self.phase = Phase::Closing;
             self.close_after_write = true;
@@ -913,33 +932,31 @@ impl ServerConn {
                     *close = true;
                     return;
                 };
-                loop {
-                    if exchange.in_body.available() >= limit {
-                        break;
-                    }
-                    match decoder.feed(
+                let status = if exchange.in_body.available() < limit {
+                    decoder.feed(
                         &mut self.read_buf,
                         &exchange.in_body,
                         self.shared.limits.max_trailer_bytes,
-                    ) {
-                        Ok(ChunkedStatus::Done) => {
-                            exchange.set_trailers(decoder.trailers().clone());
-                            self.body_done = true;
-                            exchange.mark_request_body_eof();
-                            self.touch_body(timers);
-                            break;
-                        }
-                        Ok(ChunkedStatus::NeedMore) => {
-                            self.chunked = Some(decoder);
-                            self.touch_body(timers);
-                            break;
-                        }
-                        Err(_) => {
-                            exchange.terminal(Terminal::InvalidRequest("invalid chunked body"));
-                            self.body_done = true;
-                            *close = true;
-                            return;
-                        }
+                    )
+                } else {
+                    Ok(ChunkedStatus::NeedMore)
+                };
+                match status {
+                    Ok(ChunkedStatus::Done) => {
+                        exchange.set_trailers(decoder.trailers().clone());
+                        self.body_done = true;
+                        exchange.mark_request_body_eof();
+                        self.touch_body(timers);
+                    }
+                    Ok(ChunkedStatus::NeedMore) => {
+                        self.chunked = Some(decoder);
+                        self.touch_body(timers);
+                    }
+                    Err(_) => {
+                        exchange.terminal(Terminal::InvalidRequest("invalid chunked body"));
+                        self.body_done = true;
+                        *close = true;
+                        return;
                     }
                 }
             }
@@ -953,6 +970,16 @@ impl ServerConn {
                     }
                     self.touch_body(timers);
                 }
+            }
+        }
+        if let Some(limit) = self.shared.limits.max_body_bytes {
+            if exchange.in_body.written_bytes() > limit {
+                exchange.fail_overloaded(StatusCode::PAYLOAD_TOO_LARGE);
+                self.phase = Phase::Closing;
+                self.close_after_write = true;
+                self.body_done = true;
+                *close = true;
+                return;
             }
         }
         if self.read_eof && !self.body_done {

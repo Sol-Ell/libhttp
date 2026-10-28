@@ -1,7 +1,6 @@
 //! Small platform shims over nonblocking `mio` sockets.
 
 use std::io::{self, Read};
-use std::net::Shutdown;
 
 use mio::net::TcpStream;
 
@@ -63,24 +62,7 @@ pub(crate) fn send(stream: &TcpStream, buffer: &[u8]) -> io::Result<usize> {
     }
 }
 
-/// Half-closes the write side.
-pub(crate) fn shutdown_write(stream: &TcpStream) -> io::Result<()> {
-    stream.shutdown(Shutdown::Write)
-}
-
 /// Whether an I/O error means "try again later".
 pub(crate) fn is_would_block(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::TimedOut
-}
-
-/// Whether an I/O error is a normal disconnect.
-pub(crate) fn is_disconnect(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::UnexpectedEof
-    )
 }

@@ -1,5 +1,3 @@
-use bytes::Bytes;
-
 use crate::header::{Header, HeaderMap, HeaderName, HeaderRef, HeaderValue, Host};
 use crate::{Error, Limits, Method, ProtocolErrorKind, StatusCode, Target, Version};
 

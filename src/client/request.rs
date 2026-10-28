@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use crate::body::{IntoRequestBody, RequestBody};
-use crate::header::{
-    Header, HeaderError, HeaderMap, HeaderName, HeaderValue, IntoHeaderName, IntoHeaderValue,
-};
+use crate::header::{Header, HeaderError, HeaderMap, IntoHeaderName, IntoHeaderValue};
 use crate::{CancelToken, Error, Method, Uri};
 
 /// A client request consumed by [`super::Client`] verbs.

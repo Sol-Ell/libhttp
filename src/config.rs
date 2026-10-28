@@ -345,20 +345,26 @@ mod tests {
 
     #[test]
     fn zero_limits_are_rejected() {
-        let mut limits = Limits::default();
-        limits.max_head_bytes = 0;
+        let limits = Limits {
+            max_head_bytes: 0,
+            ..Limits::default()
+        };
         assert!(matches!(limits.validate(), Err(Error::InvalidConfig(_))));
 
-        let mut limits = Limits::default();
-        limits.max_inflight_exchanges = Some(0);
+        let limits = Limits {
+            max_inflight_exchanges: Some(0),
+            ..Limits::default()
+        };
         assert!(limits.resolved(1).is_err());
     }
 
     #[test]
     fn timeouts_validate() {
         assert!(Timeouts::default().validate().is_ok());
-        let mut timeouts = Timeouts::default();
-        timeouts.header_read = Duration::ZERO;
+        let timeouts = Timeouts {
+            header_read: Duration::ZERO,
+            ..Timeouts::default()
+        };
         assert!(timeouts.validate().is_err());
     }
 }

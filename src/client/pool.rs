@@ -123,11 +123,6 @@ impl Pool {
         self.idle_count += 1;
     }
 
-    pub(crate) fn drop_connection(&mut self, key: &PoolKey) {
-        self.active = self.active.saturating_sub(1);
-        self.drop_host(key);
-    }
-
     pub(crate) fn active(&self) -> usize {
         self.active
     }

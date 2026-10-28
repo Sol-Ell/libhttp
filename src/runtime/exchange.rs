@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -53,6 +54,7 @@ pub(crate) struct ExchangeMeta {
     pub(crate) request_aborted: bool,
     pub(crate) continue_sent: bool,
     pub(crate) invalid: Option<&'static str>,
+    pub(crate) deferred_timer_armed: bool,
 }
 
 pub(crate) struct ExchangeWaker {
@@ -67,6 +69,7 @@ impl ChannelWaker for ExchangeWaker {
 }
 
 impl Exchange {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         seq: u64,
         conn: ConnId,
@@ -125,6 +128,7 @@ impl Exchange {
                 request_aborted: false,
                 continue_sent: false,
                 invalid: None,
+                deferred_timer_armed: false,
             }),
             cond: Condvar::new(),
             started: Instant::now(),

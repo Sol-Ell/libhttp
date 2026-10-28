@@ -2,7 +2,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use super::{Header, HeaderError, HeaderMap, HeaderName, HeaderRef, TypedHeader};
+use super::{Header, HeaderError, HeaderName, HeaderRef, TypedHeader};
 
 type DecodeFn = fn(HeaderRef<'_>) -> Result<std::sync::Arc<dyn TypedHeader>, HeaderError>;
 
@@ -145,7 +145,7 @@ impl super::HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::{Header, HeaderName, HeaderRef, HeaderValue, Host};
+    use crate::header::{Header, HeaderMap, HeaderName, HeaderRef, HeaderValue, Host};
 
     #[derive(Debug, PartialEq)]
     struct XCustom(String);

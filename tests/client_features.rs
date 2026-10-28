@@ -1,0 +1,75 @@
+use libhttp::client::ClientRequest;
+use libhttp::header::HeaderMap;
+use libhttp::server::Response;
+use libhttp::{Runtime, Uri};
+
+fn start(
+    handler: impl libhttp::Handler,
+) -> (
+    libhttp::ServerHandle,
+    Runtime,
+    std::thread::JoinHandle<Result<(), libhttp::Error>>,
+    u16,
+) {
+    let runtime = Runtime::builder().reactors(1).workers(2).build().unwrap();
+    let server = runtime
+        .server()
+        .bind("127.0.0.1:0")
+        .unwrap()
+        .build()
+        .unwrap();
+    let handle = server.handle();
+    let port = handle.local_addrs()[0].port();
+    let join = std::thread::spawn(move || server.run(handler));
+    (handle, runtime, join, port)
+}
+
+#[test]
+fn client_reads_chunked_body_and_trailers() {
+    let (handle, runtime, join, port) =
+        start(|_req: &mut libhttp::server::Request, res: &mut Response| {
+            res.body().write_all(b"part one ")?;
+            res.body().write_all(b"part two")?;
+            let mut trailers = HeaderMap::new();
+            trailers.append_raw("x-check", "ok").unwrap();
+            res.body().finish_with_trailers(trailers)?;
+            Ok(())
+        });
+    let client = runtime.client().build().unwrap();
+    let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
+    let mut response = client.send(ClientRequest::get(uri)).unwrap();
+    let body = response.body().read_to_end(1024).unwrap();
+    assert_eq!(body, b"part one part two");
+    let trailers = response.trailers().expect("trailers");
+    assert_eq!(trailers.get_raw("x-check").unwrap().as_bytes(), b"ok");
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}
+
+#[test]
+fn client_rejects_oversized_response_body() {
+    let (handle, runtime, join, port) =
+        start(|_req: &mut libhttp::server::Request, res: &mut Response| {
+            res.body().write_all(b"0123456789")?;
+            res.body().finish()?;
+            Ok(())
+        });
+    let client = runtime
+        .client()
+        .max_response_body_bytes(Some(4))
+        .build()
+        .unwrap();
+    let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
+    let mut response = client.send(ClientRequest::get(uri)).unwrap();
+    let error = response.body().read_to_end(1024).unwrap_err();
+    assert!(
+        matches!(error, libhttp::Error::BodyTooLarge { .. }),
+        "{error:?}"
+    );
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}

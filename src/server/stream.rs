@@ -1,3 +1,4 @@
+#[cfg(feature = "tls")]
 use std::io::{Read, Write};
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ pub(crate) struct ReadResult {
 pub(crate) enum ServerStream {
     Plain(TcpStream),
     #[cfg(feature = "tls")]
-    Tls(TlsServerStream),
+    Tls(Box<TlsServerStream>),
 }
 
 impl ServerStream {
@@ -31,10 +32,10 @@ impl ServerStream {
                 error,
             ))
         })?;
-        Ok(Self::Tls(TlsServerStream {
+        Ok(Self::Tls(Box::new(TlsServerStream {
             tcp: stream,
             connection,
-        }))
+        })))
     }
 
     pub(crate) fn read_plain(&mut self, out: &mut BytesMut) -> Result<ReadResult, Error> {
@@ -100,14 +101,6 @@ impl ServerStream {
             }
             #[cfg(feature = "tls")]
             Self::Tls(stream) => stream.shutdown(),
-        }
-    }
-
-    pub(crate) fn tcp(&self) -> &TcpStream {
-        match self {
-            Self::Plain(stream) => stream,
-            #[cfg(feature = "tls")]
-            Self::Tls(stream) => &stream.tcp,
         }
     }
 

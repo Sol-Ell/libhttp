@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
-use std::time::Instant;
 
 use crate::Error;
 use crate::server::{ServerBuilder, ServerShared};
@@ -15,13 +14,12 @@ mod slab;
 mod timer;
 mod worker;
 
-pub(crate) use exchange::{Exchange, ResponseSink, response_writer};
+pub(crate) use exchange::{Exchange, ResponseSink};
 pub(crate) use reactor::{Command, ReactorHandle};
-pub(crate) use slab::ConnId;
-pub(crate) use worker::Job as RuntimeJob;
 
 /// Runtime-wide configuration.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct RuntimeConfig {
     pub(crate) reactors: usize,
     pub(crate) workers: usize,
@@ -44,12 +42,6 @@ pub struct RuntimeStats {
     pub requests: u64,
 }
 
-impl RuntimeStats {
-    fn snapshot(&self) -> Self {
-        *self
-    }
-}
-
 /// The thread-owning runtime shared by servers and clients.
 #[derive(Clone)]
 pub struct Runtime {
@@ -64,7 +56,6 @@ pub(crate) struct RuntimeInner {
     pub(crate) shutdown: AtomicBool,
     pub(crate) next_server: AtomicU64,
     pub(crate) stats: Arc<RuntimeStatsInner>,
-    pub(crate) started: Instant,
 }
 
 impl Runtime {
@@ -128,14 +119,6 @@ impl Runtime {
         for reactor in &self.inner.reactors {
             reactor.send(Command::StopServer { server, grace });
         }
-    }
-
-    pub(crate) fn workers(&self) -> Option<&worker::WorkerPool> {
-        self.inner.workers.as_ref()
-    }
-
-    pub(crate) fn shutdown_flag(&self) -> &AtomicBool {
-        &self.inner.shutdown
     }
 }
 
@@ -225,10 +208,7 @@ impl RuntimeBuilder {
             .iter()
             .map(|reactor| reactor.waker.clone())
             .collect();
-        let workers = match worker_rx {
-            Some(rx) => Some(worker::WorkerPool::new(config.workers, rx, wakers)),
-            None => None,
-        };
+        let workers = worker_rx.map(|rx| worker::WorkerPool::new(config.workers, rx, wakers));
         Ok(Runtime {
             inner: Arc::new(RuntimeInner {
                 config,
@@ -238,7 +218,6 @@ impl RuntimeBuilder {
                 shutdown: AtomicBool::new(false),
                 next_server: AtomicU64::new(1),
                 stats,
-                started: Instant::now(),
             }),
         })
     }

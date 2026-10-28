@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};

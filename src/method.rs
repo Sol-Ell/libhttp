@@ -167,7 +167,7 @@ mod tests {
     fn custom_tokens_round_trip() {
         let method = Method::from_bytes(b"PURGE").unwrap();
         assert_eq!(method.to_string(), "PURGE");
-        assert!(Method::from_bytes(b"X").unwrap().is_idempotent() == false);
+        assert!(!Method::from_bytes(b"X").unwrap().is_idempotent());
     }
 
     #[test]

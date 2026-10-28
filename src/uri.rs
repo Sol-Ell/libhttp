@@ -100,11 +100,6 @@ impl Uri {
             _ => host.to_owned(),
         }
     }
-
-    /// The origin text (`scheme://host[:port]`), used as a pool key.
-    pub(crate) fn origin(&self) -> String {
-        format!("{}://{}", self.scheme(), self.host_header())
-    }
 }
 
 impl std::str::FromStr for Uri {

@@ -112,13 +112,6 @@ pub struct TlsError {
 }
 
 impl TlsError {
-    pub(crate) fn new(message: impl Into<Cow<'static, str>>) -> Self {
-        Self {
-            message: message.into(),
-            source: None,
-        }
-    }
-
     pub(crate) fn with_source(
         message: impl Into<Cow<'static, str>>,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -196,10 +189,6 @@ impl Error {
         Self::Protocol(ProtocolError::new(version, kind, detail))
     }
 
-    pub(crate) fn timeout(kind: TimeoutKind) -> Self {
-        Self::Timeout(kind)
-    }
-
     /// Whether this is a cancellation or a closed handle.
     pub fn is_canceled(&self) -> bool {
         matches!(self, Self::Canceled | Self::Closed)
@@ -226,8 +215,8 @@ mod tests {
     #[test]
     fn tls_error_displays_message() {
         use std::error::Error as _;
-        let error = TlsError::new("handshake failed");
+        let error = TlsError::with_source("handshake failed", std::io::Error::other("inner"));
         assert_eq!(error.to_string(), "handshake failed");
-        assert!(error.source().is_none());
+        assert!(error.source().is_some());
     }
 }

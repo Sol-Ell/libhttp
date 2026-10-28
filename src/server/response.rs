@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
-use crate::body::{BodySink, BodyWriter, IntoResponseBody, ResponseBody, Terminal};
+use crate::body::{BodySink, BodyWriter, IntoResponseBody, Terminal};
 use crate::header::{
-    AsHeaderName, Header, HeaderError, HeaderMap, HeaderName, HeaderValue, IntoHeaderName,
-    IntoHeaderValue,
+    AsHeaderName, Header, HeaderError, HeaderMap, IntoHeaderName, IntoHeaderValue,
 };
-use crate::runtime::{Exchange, response_writer};
+use crate::runtime::Exchange;
 use crate::{Error, StatusCode};
 
-use super::deferred::{DeferredParts, DeferredResponse};
+use super::deferred::DeferredParts;
 
 /// A response being built by a handler.
 pub struct Response {
@@ -210,12 +209,6 @@ impl Response {
         self.body.take()
     }
 
-    pub(crate) fn is_committed(&self) -> bool {
-        self.exchange
-            .as_ref()
-            .is_some_and(|exchange| exchange.is_committed())
-    }
-
     pub(crate) fn can_defer(&self) -> bool {
         if self.tombstone || self.body_set || self.body_writer_started || self.exchange.is_none() {
             return false;
@@ -268,7 +261,7 @@ impl Response {
             if exchange.commit_fixed_locked(&mut meta, body).is_err() {
                 meta.close = true;
             }
-        } else if let Err(_) = exchange.ensure_head_for_empty() {
+        } else if exchange.ensure_head_for_empty().is_err() {
             let _ = exchange.reset_for_error();
         }
         if let Some(reason) = self.invalid {
@@ -327,6 +320,7 @@ impl BodySink for ErrorSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HeaderValue;
 
     #[test]
     fn detached_response_keeps_headers() {
