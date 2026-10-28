@@ -24,10 +24,13 @@ use libhttp::Runtime;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::builder().build()?;
     let server = runtime.server().bind("127.0.0.1:8080")?.build()?;
-    server.run(|req, res| {
-        res.set_body("hello\n");
-        Ok(())
-    })?;
+    server.run(
+        |_req: &mut libhttp::server::Request,
+         res: &mut libhttp::server::Response| {
+            res.set_body("hello\n");
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 ```

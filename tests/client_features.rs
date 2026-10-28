@@ -107,3 +107,28 @@ fn client_header_timeout_is_reported() {
     runtime.handle().shutdown();
     runtime.handle().wait().unwrap();
 }
+
+#[test]
+fn client_streams_a_large_upload() {
+    let (handle, runtime, join, port) =
+        start(|req: &mut libhttp::server::Request, res: &mut Response| {
+            let body = req.body().read_to_end(200_000)?;
+            res.set_body(body.len().to_string());
+            Ok(())
+        });
+    let client = runtime.client().build().unwrap();
+    let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
+    let payload = vec![b'z'; 100_000];
+    let mut response = client
+        .send_with(ClientRequest::post(uri), move |body| {
+            body.write_all(&payload)?;
+            body.finish()
+        })
+        .unwrap();
+    let body = response.body().read_to_end(64).unwrap();
+    assert_eq!(body, b"100000");
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}

@@ -338,3 +338,28 @@ fn handler_set_1xx_is_rejected_as_a_final_response() {
     runtime.handle().shutdown();
     runtime.handle().wait().unwrap();
 }
+
+#[test]
+fn large_chunked_request_is_streamed() {
+    let (handle, runtime, join, port) = start(
+        |req: &mut libhttp::server::Request, res: &mut libhttp::server::Response| {
+            let body = req.body().read_to_end(200_000)?;
+            res.set_body(body.len().to_string());
+            Ok(())
+        },
+    );
+    let body = "a".repeat(100_000);
+    let mut request_bytes = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request_bytes.extend_from_slice(body.as_bytes());
+    request_bytes.extend_from_slice(b"\r\n0\r\n\r\n");
+    let response = request(port, &request_bytes);
+    assert!(response.ends_with("100000"), "{}", response.len());
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}

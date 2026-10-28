@@ -749,6 +749,17 @@ impl ServerConn {
             self.local,
         );
 
+        if let (Some(limit), BodyFraming::ContentLength(length)) =
+            (self.shared.limits.max_body_bytes, head.framing)
+        {
+            if length > limit {
+                exchange.fail_overloaded(StatusCode::PAYLOAD_TOO_LARGE);
+                self.exchange = Some(exchange);
+                self.phase = Phase::Closing;
+                self.close_after_write = true;
+                return false;
+            }
+        }
         if head.expect_unsupported {
             exchange.fail_overloaded(StatusCode::EXPECTATION_FAILED);
             self.exchange = Some(exchange);

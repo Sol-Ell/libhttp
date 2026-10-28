@@ -698,7 +698,14 @@ impl ChunkedDecoder {
                     if input.is_empty() {
                         return Ok(ChunkedStatus::NeedMore);
                     }
-                    let take = self.remaining.min(input.len() as u64) as usize;
+                    let capacity = out.limit().saturating_sub(out.available());
+                    if capacity == 0 {
+                        return Ok(ChunkedStatus::NeedMore);
+                    }
+                    let take = self.remaining.min(input.len() as u64).min(capacity as u64) as usize;
+                    if take == 0 {
+                        return Ok(ChunkedStatus::NeedMore);
+                    }
                     let data = input.split_to(take).freeze();
                     if !out.push(data) {
                         return Err(Error::protocol(
