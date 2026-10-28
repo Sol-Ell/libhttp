@@ -1,5 +1,7 @@
 # libhttp
 
+[![CI](https://github.com/Sol-Ell/libhttp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Sol-Ell/libhttp/actions/workflows/ci.yml)
+
 A synchronous Rust HTTP/1.1 server and client library. Not a framework, not an async runtime.
 
 `libhttp` runs ordinary functions as handlers on a bounded worker pool. Reactor threads own

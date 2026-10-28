@@ -60,3 +60,46 @@ fn deferred_response_is_sent_later() {
     runtime.handle().shutdown();
     runtime.handle().wait().unwrap();
 }
+
+#[test]
+fn deferred_timeout_sends_gateway_timeout() {
+    let runtime = Runtime::builder().reactors(1).workers(2).build().unwrap();
+    let server = runtime
+        .server()
+        .bind("127.0.0.1:0")
+        .unwrap()
+        .timeouts(libhttp::Timeouts {
+            deferred: Some(Duration::from_millis(100)),
+            ..libhttp::Timeouts::default()
+        })
+        .build()
+        .unwrap();
+    let handle = server.handle();
+    let port = handle.local_addrs()[0].port();
+    let join = std::thread::spawn(move || {
+        server.run(
+            |req: &mut libhttp::server::Request, res: &mut libhttp::server::Response| {
+                let (_request, response) = req.defer(res)?;
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let _ = response.send_body("too late");
+                });
+                Ok(())
+            },
+        )
+    });
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}

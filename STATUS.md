@@ -17,7 +17,7 @@
 
 ## Current verification
 
-- `cargo test --all-targets --all-features` — 89 tests (unit + loopback server/client/TLS/
+- `cargo test --all-targets --all-features` — 90 tests (unit + loopback server/client/TLS/
   deferred/feature integration tests).
 - `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo doc --no-deps --all-features` — clean.
