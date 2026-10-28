@@ -925,3 +925,19 @@ mod tests {
         assert!(!head.keep_alive);
     }
 }
+
+#[cfg(test)]
+mod fuzz_like_tests {
+    use super::{parse_request_head, parse_response_head};
+    use crate::{Limits, Method};
+
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_head_bytes_never_panic(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048)
+        ) {
+            let _ = parse_request_head(&bytes, &Limits::default());
+            let _ = parse_response_head(&bytes, &Limits::default(), &Method::Get);
+        }
+    }
+}
