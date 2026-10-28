@@ -1,0 +1,51 @@
+[package]
+name = "libhttp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "A synchronous HTTP/1.1 server and client library with a sans-I/O core, no async runtime, and bounded costs."
+repository = "https://github.com/Sol-Ell/libhttp"
+keywords = ["http", "server", "client", "tls", "sync"]
+categories = [
+    "network-programming",
+    "web-programming::http-server",
+    "web-programming::http-client",
+]
+
+[features]
+default = ["server", "client", "tls"]
+server = []
+client = []
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
+
+[dependencies]
+bytes = "1"
+crossbeam-channel = "0.5"
+http = "1"
+httpdate = "1"
+httparse = "1"
+mio = { version = "1", features = ["os-poll", "net"] }
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = "2"
+url = "2"
+
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "ring",
+    "logging",
+], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "1", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+proptest = "1"
+rcgen = "0.14"
+tempfile = "3"
+
+[package.metadata.docs.rs]
+all-features = true
