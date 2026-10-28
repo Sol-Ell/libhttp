@@ -13,11 +13,11 @@
       100-continue, deferred completion, shutdown
 - [x] M5 — h1 client: pool, blocking verbs, callback verbs, streaming upload, retry
 - [x] M6 — TLS server/client, ALPN http/1.1, truncation/close-notify
-- [ ] M7 — hardening, examples, rustdoc, benchmark, CI release gate
+- [x] M7 — hardening, examples, rustdoc, CI release gate (performance harness post-1.0)
 
 ## Current verification
 
-- `cargo test --all-targets --all-features` — 90 tests (unit + loopback server/client/TLS/
+- `cargo test --all-targets --all-features` — 92 tests (unit + loopback server/client/TLS/
   deferred/feature integration tests).
 - `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo doc --no-deps --all-features` — clean.
@@ -50,4 +50,4 @@ These are deliberate v1.0 choices; they do not change the public API.
   not queues.
 - DNS resolution uses the platform resolver on the caller/worker thread, bounded by socket
   timeouts; Happy Eyeballs and the separate resolver pool are post-1.0.
-- Performance is measured by examples/benchmarks, but hyper-relative gates are post-1.0.
+- No benchmark harness is shipped in v1.0; hyper-relative performance gates are post-1.0.
