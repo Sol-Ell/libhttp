@@ -300,3 +300,41 @@ fn header_read_timeout_closes_idle_connection() {
     runtime.handle().shutdown();
     runtime.handle().wait().unwrap();
 }
+
+#[test]
+fn http10_request_gets_a_close_delimited_response() {
+    let (handle, runtime, join, port) = start(
+        |_req: &mut libhttp::server::Request, res: &mut libhttp::server::Response| {
+            res.set_body("legacy");
+            Ok(())
+        },
+    );
+    let response = request(port, b"GET / HTTP/1.0\r\n\r\n");
+    assert!(response.starts_with("HTTP/1.0 200 OK"), "{response}");
+    assert!(response.contains("Connection: close"), "{response}");
+    assert!(response.ends_with("legacy"), "{response}");
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}
+
+#[test]
+fn handler_set_1xx_is_rejected_as_a_final_response() {
+    let (handle, runtime, join, port) = start(
+        |_req: &mut libhttp::server::Request, res: &mut libhttp::server::Response| {
+            res.set_status(StatusCode::CONTINUE);
+            res.set_body("not interim");
+            Ok(())
+        },
+    );
+    let response = request(
+        port,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}

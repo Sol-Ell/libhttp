@@ -74,6 +74,12 @@ impl ClientInner {
         }
     }
 
+    pub(crate) fn drop_connection(&self, conn: ClientConnection) {
+        let key = conn.key().clone();
+        self.pool.lock().unwrap().release(&key);
+        drop(conn);
+    }
+
     pub(crate) fn return_connection(&self, conn: ClientConnection) {
         if self.shutdown.load(Ordering::Acquire) {
             return;

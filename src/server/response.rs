@@ -257,9 +257,12 @@ impl Response {
                 .body
                 .clone()
                 .unwrap_or_default();
-            let mut meta = exchange.meta.lock().unwrap();
-            if exchange.commit_fixed_locked(&mut meta, body).is_err() {
-                meta.close = true;
+            let failed = {
+                let mut meta = exchange.meta.lock().unwrap();
+                exchange.commit_fixed_locked(&mut meta, body).is_err()
+            };
+            if failed {
+                let _ = exchange.reset_for_error();
             }
         } else if exchange.ensure_head_for_empty().is_err() {
             let _ = exchange.reset_for_error();

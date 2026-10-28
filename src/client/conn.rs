@@ -73,6 +73,8 @@ pub(crate) struct ClientConnection {
     remaining: u64,
     chunked: Option<ChunkedDecoder>,
     pub(crate) keep_alive: bool,
+    header_timeout: Duration,
+    body_timeout: Duration,
     peer: Option<SocketAddr>,
     local: Option<SocketAddr>,
     secure: bool,
@@ -159,6 +161,8 @@ impl ClientConnection {
             remaining: 0,
             chunked: None,
             keep_alive: false,
+            header_timeout: timeouts.header_read,
+            body_timeout: timeouts.body_idle,
             peer,
             local,
             secure,
@@ -260,6 +264,7 @@ impl ClientConnection {
         registry: &crate::header::HeaderRegistry,
     ) -> Result<ResponseHead, Error> {
         let limits = Limits::default();
+        let _ = self.stream.set_read_timeout(Some(self.header_timeout));
         loop {
             match parse_response_head(&self.read_buf, &limits, &self.method) {
                 Ok(Some((mut head, consumed))) => {
@@ -277,6 +282,7 @@ impl ClientConnection {
                     };
                     self.chunked =
                         matches!(head.framing, BodyFraming::Chunked).then(ChunkedDecoder::new);
+                    let _ = self.stream.set_read_timeout(Some(self.body_timeout));
                     return Ok(head);
                 }
                 Ok(None) => {
@@ -470,6 +476,7 @@ fn pump_body(
             };
             channel.mark_terminal(terminal);
             conn.stream.shutdown();
+            client.drop_connection(conn);
             client.report(&error);
         }
     }

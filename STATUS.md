@@ -17,7 +17,7 @@
 
 ## Current verification
 
-- `cargo test --all-targets --all-features` — 82 tests (unit + loopback server/client/TLS/
+- `cargo test --all-targets --all-features` — 89 tests (unit + loopback server/client/TLS/
   deferred/feature integration tests).
 - `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo doc --no-deps --all-features` — clean.
@@ -34,6 +34,10 @@ These are deliberate v1.0 choices; they do not change the public API.
   are accepted but not yet used as separate pools.
 - Ordered h1 pipelining is processed sequentially per connection; no concurrent handler
   execution on one connection.
+- An unread request body closes the connection after the response instead of draining up to
+  64 KiB. `max_body_bytes` still returns 413 before the response head is committed.
+- Deferred timeout sends 504; shutdown closes rather than running the custom fallback hook.
+  The hook runs on drop before commit.
 - HTTP/1.0 responses and streamed h1.0 bodies use close-delimited framing; 1.1 uses chunked.
 - Header values/names are copied into owned storage at handoff; no zero-copy head parsing.
 - Static response bodies are held as `Bytes::from_static` but are copied into the outbound

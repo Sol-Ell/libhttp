@@ -13,11 +13,7 @@ pub(crate) fn configure(stream: &TcpStream) -> io::Result<()> {
         target_os = "ios",
         target_os = "tvos",
         target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
+        target_os = "visionos"
     ))]
     {
         socket.set_nosigpipe(true)?;

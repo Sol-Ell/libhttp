@@ -73,3 +73,37 @@ fn client_rejects_oversized_response_body() {
     runtime.handle().shutdown();
     runtime.handle().wait().unwrap();
 }
+
+#[test]
+fn client_header_timeout_is_reported() {
+    let (handle, runtime, join, port) =
+        start(|_req: &mut libhttp::server::Request, res: &mut Response| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            res.set_body("late");
+            Ok(())
+        });
+    let client = runtime
+        .client()
+        .timeouts(libhttp::Timeouts {
+            header_read: std::time::Duration::from_millis(100),
+            ..libhttp::Timeouts::default()
+        })
+        .build()
+        .unwrap();
+    let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
+    let error = match client.send(ClientRequest::get(uri)) {
+        Ok(_) => panic!("response should time out"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            libhttp::Error::Timeout(libhttp::TimeoutKind::HeaderRead)
+        ),
+        "{error:?}"
+    );
+    handle.shutdown();
+    join.join().unwrap().unwrap();
+    runtime.handle().shutdown();
+    runtime.handle().wait().unwrap();
+}

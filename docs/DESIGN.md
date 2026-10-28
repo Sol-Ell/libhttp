@@ -4,6 +4,12 @@
 **Supersedes:** the archived 2026-10-26/27 design set on
 `archive/pre-rewrite-2026-10-28`. That branch is reference only; this file is the contract.
 
+
+> **Implementation note (2026-10-28):** the frozen public API is delivered. The v1.0 client
+> uses blocking sockets on the caller/worker thread with one body-pump thread per in-flight
+> response; the reactor-driven client path in §2/§3.4 is post-1.0. Every deviation is recorded
+> in `STATUS.md`; the public signatures and semantics are unchanged.
+
 This is deliberately short. It exists to stop design drift: if an implementation question is
 not answered here, choose the simplest option that preserves the public API and record the
 choice in `STATUS.md`; do not reopen the architecture.
